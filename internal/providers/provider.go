@@ -37,8 +37,6 @@ type Instance struct {
 	PrivateIP    string
 	SSHKeys      []string
 	CreatedAt    time.Time
-	JupyterURL   string // If available
-	JupyterToken string // If available
 }
 
 // ContainerConfig represents Docker container configuration

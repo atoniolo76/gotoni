@@ -175,11 +175,6 @@ func main() {
 	fmt.Printf("🎉 Instance is ready!\n")
 	fmt.Printf("📍 Public IP: %s\n", instance.PublicIP)
 
-	if instance.JupyterURL != "" && instance.JupyterToken != "" {
-		fmt.Printf("🧠 Jupyter Lab: %s\n", instance.JupyterURL)
-		fmt.Printf("🔑 Jupyter Token: %s\n", instance.JupyterToken)
-	}
-
 	if len(instance.SSHKeys) > 0 {
 		fmt.Printf("🔐 SSH Keys: %v\n", instance.SSHKeys)
 		if createdNewKey {
