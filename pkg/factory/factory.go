@@ -2,7 +2,7 @@ package factory
 
 import (
 	"fmt"
-	"toni/gpusnapshot/internal/providers"
+	"toni/gpusnapshot/pkg/providers"
 	"toni/gpusnapshot/internal/providers/lambdalabs"
 )
 

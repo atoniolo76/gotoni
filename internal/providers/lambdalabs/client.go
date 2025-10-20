@@ -8,7 +8,7 @@ import (
 	"net/http"
 	"time"
 
-	"toni/gpusnapshot/internal/providers"
+	"toni/gpusnapshot/pkg/providers"
 )
 
 const lambdaLabsBaseURL = "https://cloud.lambda.ai/api/v1"
