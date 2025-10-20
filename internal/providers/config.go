@@ -8,29 +8,29 @@ import (
 
 // GPUConfig represents GPU requirements
 type GPUConfig struct {
-	MinVRAM_GB      int      `yaml:"min_vram_gb" json:"min_vram_gb"`
-	MinCUDAVersion  string   `yaml:"min_cuda_version" json:"min_cuda_version"`
-	PreferredGPUs   []string `yaml:"preferred_gpus,omitempty" json:"preferred_gpus,omitempty"`
-	ExcludeGPUs     []string `yaml:"exclude_gpus,omitempty" json:"exclude_gpus,omitempty"`
+	MinVRAM_GB      int      `yaml:"min_vram_gb"`
+	MinCUDAVersion  string   `yaml:"min_cuda_version"`
+	PreferredGPUs   []string `yaml:"preferred_gpus,omitempty"`
+	ExcludeGPUs     []string `yaml:"exclude_gpus,omitempty"`
 }
 
 // ContainerRequirements represents container requirements for config
 type ContainerRequirements struct {
-	Image         string            `yaml:"image" json:"image"`
-	Environment   map[string]string `yaml:"environment,omitempty" json:"environment,omitempty"`
-	Ports         []string          `yaml:"ports,omitempty" json:"ports,omitempty"`
-	Command       []string          `yaml:"command,omitempty" json:"command,omitempty"`
-	Args          []string          `yaml:"args,omitempty" json:"args,omitempty"`
+	Image       string            `yaml:"image"`
+	Environment map[string]string `yaml:"environment,omitempty"`
+	Ports       []string          `yaml:"ports,omitempty"`
+	Command     []string          `yaml:"command,omitempty"`
+	Args        []string          `yaml:"args,omitempty"`
 }
 
 // InstanceConfig represents complete instance requirements
 type InstanceConfig struct {
-	Name       string                 `yaml:"name" json:"name"`
-	GPU        GPUConfig              `yaml:"gpu" json:"gpu"`
-	Container  ContainerRequirements  `yaml:"container" json:"container"`
-	Provider   string                 `yaml:"provider,omitempty" json:"provider,omitempty"` // "lambdalabs"
-	Region     string                 `yaml:"region,omitempty" json:"region,omitempty"`
-	MaxPrice   int                    `yaml:"max_price_cents_hour,omitempty" json:"max_price_cents_hour,omitempty"`
+	Name      string                `yaml:"name"`
+	GPU       GPUConfig             `yaml:"gpu"`
+	Container ContainerRequirements `yaml:"container"`
+	Provider  string                `yaml:"provider,omitempty"`
+	Region    string                `yaml:"region,omitempty"`
+	MaxPrice  int                   `yaml:"max_price_cents_hour,omitempty"`
 }
 
 // LoadConfig loads configuration from a YAML file
@@ -70,67 +70,75 @@ func (c *InstanceConfig) GetRecommendedInstanceType(provider Provider) (*Instanc
 		return nil, fmt.Errorf("failed to list instance types: %w", err)
 	}
 
+	// Pre-compute compatible GPU names for fast lookup
+	var compatibleGPUNames map[string]bool
+	if c.GPU.MinCUDAVersion != "" {
+		compatibleGPUs := GetCompatibleGPUs(c.GPU.MinCUDAVersion)
+		compatibleGPUNames = make(map[string]bool, len(compatibleGPUs))
+		for _, gpu := range compatibleGPUs {
+			compatibleGPUNames[gpu.Name] = true
+		}
+	}
+
+	// Pre-compute region set for fast lookup
+	var requiredRegions map[string]bool
+	if c.Region != "" {
+		requiredRegions = map[string]bool{c.Region: true}
+	}
+
 	var candidates []*InstanceType
+	minPrice := int(^uint(0) >> 1) // Max int value
+	var cheapest *InstanceType
 
 	for _, instanceType := range instanceTypes {
-		// Check GPU compatibility
-		if len(instanceType.GPUs) > 0 {
-			gpu := instanceType.GPUs[0] // Assume homogeneous GPUs for now
+		// Skip if no GPUs
+		if len(instanceType.GPUs) == 0 {
+			continue
+		}
 
-			// Check VRAM requirement
-			if gpu.VRAM_GB < c.GPU.MinVRAM_GB {
+		gpu := instanceType.GPUs[0] // Assume homogeneous GPUs
+
+		// Check VRAM requirement
+		if gpu.VRAM_GB < c.GPU.MinVRAM_GB {
+			continue
+		}
+
+		// Check CUDA compatibility (fast map lookup)
+		if compatibleGPUNames != nil && !compatibleGPUNames[gpu.Name] {
+			continue
+		}
+
+		// Check price limit
+		if c.MaxPrice > 0 && instanceType.PriceCentsPerHour > c.MaxPrice {
+			continue
+		}
+
+		// Check region availability (fast map lookup)
+		if requiredRegions != nil {
+			regionFound := false
+			for _, region := range instanceType.Regions {
+				if requiredRegions[region] {
+					regionFound = true
+					break
+				}
+			}
+			if !regionFound {
 				continue
 			}
+		}
 
-			// Check CUDA compatibility using the new lookup function
-			if c.GPU.MinCUDAVersion != "" {
-				compatibleGPUs := GetCompatibleGPUs(c.GPU.MinCUDAVersion)
-				gpuCompatible := false
-				for _, compatibleGPU := range compatibleGPUs {
-					if compatibleGPU.Name == gpu.Name {
-						gpuCompatible = true
-						break
-					}
-				}
-				if !gpuCompatible {
-					continue
-				}
-			}
+		candidates = append(candidates, instanceType)
 
-			// Check price limit
-			if c.MaxPrice > 0 && instanceType.PriceCentsPerHour > c.MaxPrice {
-				continue
-			}
-
-			// Check region availability
-			if c.Region != "" {
-				regionAvailable := false
-				for _, region := range instanceType.Regions {
-					if region == c.Region {
-						regionAvailable = true
-						break
-					}
-				}
-				if !regionAvailable {
-					continue
-				}
-			}
-
-			candidates = append(candidates, instanceType)
+		// Track cheapest during iteration
+		if instanceType.PriceCentsPerHour < minPrice {
+			minPrice = instanceType.PriceCentsPerHour
+			cheapest = instanceType
 		}
 	}
 
 	if len(candidates) == 0 {
 		return nil, fmt.Errorf("no compatible instance types found for requirements: VRAM>=%dGB, CUDA>=%s",
 			c.GPU.MinVRAM_GB, c.GPU.MinCUDAVersion)
-	}
-
-	// Return the cheapest option
-	cheapest := candidates[0]
-	for _, candidate := range candidates[1:] {
-		if candidate.PriceCentsPerHour < cheapest.PriceCentsPerHour {
-			cheapest = candidate
-		}
 	}
 
 	return cheapest, nil
