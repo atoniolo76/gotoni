@@ -1,0 +1,74 @@
+## **Where Interface Code Goes**
+
+### **1. Interface Definition**
+```go
+// internal/providers/provider.go
+package providers
+
+type Provider interface {
+    ListInstances() ([]*Instance, error)
+    RunInference(request *InferenceRequest) (*InferenceResponse, error)
+}
+```
+
+### **2. Provider Implementations**
+```go
+// internal/providers/lambdalabs/lambdalabs.go
+package lambdalabs
+
+type Client struct {
+    apiToken string
+}
+
+func (c *Client) ListInstances() ([]*Instance, error) {
+    // Lambda Labs specific code
+}
+```
+
+### **3. Factory Function**
+```go
+// internal/providers/factory.go
+package providers
+
+func NewProvider(providerType string, apiToken string) Provider {
+    switch providerType {
+    case "lambdalabs":
+        return lambdalabs.NewClient(apiToken)
+    case "runpod":
+        return runpod.NewClient(apiToken)
+    }
+}
+```
+
+### **4. Usage in Main**
+```go
+// cmd/gpusnapshot/main.go
+package main
+
+import "toni/gpusnapshot/internal/providers"
+
+func main() {
+    provider := providers.NewProvider("lambdalabs", "token")
+    instances, _ := provider.ListInstances()
+}
+```
+
+## **File Structure**
+```
+internal/
+├── providers/
+│   ├── provider.go          # Interface definition
+│   ├── factory.go           # Provider factory
+│   ├── lambdalabs/
+│   │   └── lambdalabs.go   # Lambda Labs implementation
+│   └── runpod/
+│       └── runpod.go       # RunPod implementation
+```
+
+## **Key Points**
+- Interface goes in `internal/providers/provider.go`
+- Implementations go in provider-specific subdirectories
+- Factory function goes in `internal/providers/factory.go`
+- Main code imports the providers package and uses the interface
+
+The interface defines the contract; implementations live in separate files/packages.
