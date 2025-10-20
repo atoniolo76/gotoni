@@ -1,74 +1,39 @@
-## **Where Interface Code Goes**
+## GPU Snapshot Development Roadmap
 
-### **1. Interface Definition**
-```go
-// internal/providers/provider.go
-package providers
+### Phase 1: Core Infrastructure ✅
+- Provider abstraction (Lambda Labs, RunPod)
+- SSH key management
+- Basic instance launch/termination
+- GPU type definitions with CUDA compatibility
 
-type Provider interface {
-    ListInstances() ([]*Instance, error)
-    RunInference(request *InferenceRequest) (*InferenceResponse, error)
-}
-```
+### Phase 2: Container Support ✅
+- Docker image specification in launch requests
+- CUDA version extraction from Dockerfiles (archived)
+- GPU compatibility mapping based on CUDA versions (NVIDIA docs)
+- Resource estimation (VRAM, RAM) from libraries (archived)
+- YAML config format for instance requirements
+- CLI analyzer tool for config analysis and GPU compatibility checking
 
-### **2. Provider Implementations**
-```go
-// internal/providers/lambdalabs/lambdalabs.go
-package lambdalabs
+### Phase 3: Configuration System ✅
+- YAML config format for instance requirements
+- Automatic Dockerfile analysis
+- Instance type recommendation engine
+- Cross-provider compatibility checking
 
-type Client struct {
-    apiToken string
-}
+### Phase 4: CLI Tools ✅
+- Repository analysis tool (`cmd/analyzer`)
+- Auto-configuration generation from Dockerfiles
+- Interactive setup wizard (planned)
+- Batch processing capabilities (planned)
 
-func (c *Client) ListInstances() ([]*Instance, error) {
-    // Lambda Labs specific code
-}
-```
+### Phase 5: Advanced Features
+- Cost optimization
+- Multi-instance orchestration
+- Monitoring and metrics
+- CI/CD integration
 
-### **3. Factory Function**
-```go
-// internal/providers/factory.go
-package providers
+---
 
-func NewProvider(providerType string, apiToken string) Provider {
-    switch providerType {
-    case "lambdalabs":
-        return lambdalabs.NewClient(apiToken)
-    case "runpod":
-        return runpod.NewClient(apiToken)
-    }
-}
-```
-
-### **4. Usage in Main**
-```go
-// cmd/gpusnapshot/main.go
-package main
-
-import "toni/gpusnapshot/internal/providers"
-
-func main() {
-    provider := providers.NewProvider("lambdalabs", "token")
-    instances, _ := provider.ListInstances()
-}
-```
-
-## **File Structure**
-```
-internal/
-├── providers/
-│   ├── provider.go          # Interface definition
-│   ├── factory.go           # Provider factory
-│   ├── lambdalabs/
-│   │   └── lambdalabs.go   # Lambda Labs implementation
-│   └── runpod/
-│       └── runpod.go       # RunPod implementation
-```
-
-## **Key Points**
-- Interface goes in `internal/providers/provider.go`
-- Implementations go in provider-specific subdirectories
-- Factory function goes in `internal/providers/factory.go`
-- Main code imports the providers package and uses the interface
-
-The interface defines the contract; implementations live in separate files/packages.
+Kubernetes references (for future container orchestration):
+https://kind.sigs.k8s.io
+https://kind.sigs.k8s.io/docs/user/quick-start/#installing-with-go-install

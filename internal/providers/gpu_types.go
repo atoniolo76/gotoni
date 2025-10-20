@@ -1,5 +1,11 @@
 package providers
 
+import (
+	"fmt"
+	"strconv"
+	"strings"
+)
+
 // Common GPU specifications based on actual cloud provider offerings
 // These represent the Nvidia GPU models available on Lambda Labs and RunPod
 var (
@@ -330,17 +336,109 @@ func GetGPUTypeByName(name string) (GPUType, bool) {
 }
 
 // GetMinCUDAVersion returns the minimum CUDA version required for a GPU
+// Based on NVIDIA CUDA compatibility documentation
 func (g GPUType) GetMinCUDAVersion() string {
 	switch g.ComputeCapability {
-	case "9.0":
-		return "12.0" // H100 requires CUDA 12.0+
-	case "8.9":
-		return "11.8" // RTX 40-series requires CUDA 11.8+
-	case "8.6":
-		return "11.1" // RTX 30-series requires CUDA 11.1+
-	case "8.0":
-		return "11.0" // A100 requires CUDA 11.0+
-	default:
+	case "9.0":  // Hopper architecture (H100, B200)
+		return "12.0"
+	case "8.9":  // Ada Lovelace (RTX 40-series, RTX 6000 Ada)
+		return "11.8"
+	case "8.6":  // Ampere RTX series (A6000, RTX 30-series)
 		return "11.0"
+	case "8.0":  // Ampere (A100, A6000)
+		return "11.0"
+	case "7.5":  // Turing (RTX 20-series, T4)
+		return "10.0"
+	case "7.2":  // Jetson AGX Xavier
+		return "10.0"
+	case "7.0":  // Volta (V100)
+		return "9.0"
+	case "6.2":  // Jetson TX2
+		return "8.0"
+	case "6.1":  // Pascal (P100, GTX 10-series)
+		return "8.0"
+	case "6.0":  // Pascal (P100)
+		return "8.0"
+	case "5.3":  // Jetson Nano
+		return "8.0"
+	case "5.2":  // Maxwell (M60, M40)
+		return "8.0"
+	default:
+		return "8.0" // Conservative default for older GPUs
 	}
+}
+
+// GetCompatibleGPUs returns all GPUs compatible with a given CUDA version
+// Based on NVIDIA CUDA compatibility requirements
+func GetCompatibleGPUs(cudaVersion string) []GPUType {
+	if cudaVersion == "" {
+		return []GPUType{} // Return empty if no CUDA version specified
+	}
+
+	// Parse CUDA version to float for comparison
+	cudaFloat, err := parseVersion(cudaVersion)
+	if err != nil {
+		return []GPUType{} // Return empty on parse error
+	}
+
+	var compatible []GPUType
+	allGPUs := []GPUType{
+		// Hopper (9.0) - requires CUDA 12.0+
+		H100_80GB_HBM3, H100_80GB_SXM5, H100_NVL, B200,
+
+		// Ada Lovelace (8.9) - requires CUDA 11.8+
+		RTX_6000_ADA, RTX_5000_ADA, RTX_4000_ADA, RTX_4090, RTX_4080,
+
+		// Ampere (8.6) - requires CUDA 11.0+
+		A6000, A5000, A4000, A10, RTX_3090, RTX_3080,
+
+		// Ampere (8.0) - requires CUDA 11.0+
+		A100_40GB_PCIE, A100_80GB_PCIE, A100_80GB_SXM4,
+
+		// Turing (7.5) - requires CUDA 10.0+
+		RTX_6000,
+
+		// Volta (7.0) - requires CUDA 9.0+
+		V100_16GB, V100_32GB,
+
+		// Pascal (6.1) - requires CUDA 8.0+
+		// (We don't have specific Pascal GPUs defined, but they would go here)
+
+		// Maxwell (5.2) - requires CUDA 8.0+
+		// (Legacy GPUs not commonly used in cloud)
+	}
+
+	for _, gpu := range allGPUs {
+		minVersion := gpu.GetMinCUDAVersion()
+		minFloat, err := parseVersion(minVersion)
+		if err != nil {
+			continue // Skip GPUs with invalid version requirements
+		}
+
+		if cudaFloat >= minFloat {
+			compatible = append(compatible, gpu)
+		}
+	}
+
+	return compatible
+}
+
+// parseVersion converts version string like "11.8" to float 11.8
+func parseVersion(version string) (float64, error) {
+	parts := strings.Split(version, ".")
+	if len(parts) < 2 {
+		return 0, fmt.Errorf("invalid version format: %s", version)
+	}
+
+	major, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return 0, err
+	}
+
+	minor, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return 0, err
+	}
+
+	return float64(major) + float64(minor)/10.0, nil
 }

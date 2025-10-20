@@ -41,12 +41,30 @@ type Instance struct {
 	JupyterToken string // If available
 }
 
+// ContainerConfig represents Docker container configuration
+type ContainerConfig struct {
+	Image       string            // Docker image name
+	Environment map[string]string // Environment variables
+	Ports       []string          // Ports to expose (e.g., ["22/tcp", "8888/http"])
+	Command     []string          // Override container command
+	Args        []string          // Override container args
+}
+
 // LaunchRequest represents parameters for launching a new instance
 type LaunchRequest struct {
 	InstanceTypeName string
 	Region           string
 	Name             string   // Optional instance name
 	SSHKeyNames      []string // SSH keys to add
+	Container        *ContainerConfig // Optional container configuration
+}
+
+// SSHKey represents an SSH key pair
+type SSHKey struct {
+	ID         string
+	Name       string
+	PublicKey  string
+	PrivateKey string // Only returned when Lambda generates the key
 }
 
 // Provider defines the interface for GPU cloud providers
@@ -59,6 +77,11 @@ type Provider interface {
 
 	// Instance type information
 	ListInstanceTypes() ([]*InstanceType, error)
+
+	// SSH key management
+	ListSSHKeys() ([]*SSHKey, error)
+	CreateSSHKey(name string) (*SSHKey, error)             // Generates new key pair
+	AddSSHKey(name, publicKey string) (*SSHKey, error)     // Adds existing public key
 
 	// Provider-specific utilities
 	GetProviderName() string
