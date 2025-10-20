@@ -16,11 +16,9 @@ type GPUConfig struct {
 
 // ContainerRequirements represents container requirements for config
 type ContainerRequirements struct {
-	Image       string            `yaml:"image"`
-	Environment map[string]string `yaml:"environment,omitempty"`
-	Ports       []string          `yaml:"ports,omitempty"`
-	Command     []string          `yaml:"command,omitempty"`
-	Args        []string          `yaml:"args,omitempty"`
+	Image   string   `yaml:"image"`
+	Command []string `yaml:"command,omitempty"`
+	Args    []string `yaml:"args,omitempty"`
 }
 
 // InstanceConfig represents complete instance requirements
@@ -28,7 +26,7 @@ type InstanceConfig struct {
 	Name      string                `yaml:"name"`
 	GPU       GPUConfig             `yaml:"gpu"`
 	Container ContainerRequirements `yaml:"container"`
-	Provider  string                `yaml:"provider,omitempty"`
+	Provider  string                `yaml:"provider"` // Required: "lambdalabs" or "runpod"
 	Region    string                `yaml:"region,omitempty"`
 	MaxPrice  int                   `yaml:"max_price_cents_hour,omitempty"`
 }
@@ -45,7 +43,40 @@ func LoadConfig(filename string) (*InstanceConfig, error) {
 		return nil, fmt.Errorf("failed to parse config: %w", err)
 	}
 
+	// Validate required fields
+	if err := config.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid config: %w", err)
+	}
+
 	return &config, nil
+}
+
+// Validate checks that required fields are provided and valid
+func (c *InstanceConfig) Validate() error {
+	if c.Name == "" {
+		return fmt.Errorf("name is required")
+	}
+	if c.Provider == "" {
+		return fmt.Errorf("provider is required (must be 'lambdalabs' or 'runpod')")
+	}
+	if c.Provider != "lambdalabs" && c.Provider != "runpod" {
+		return fmt.Errorf("provider must be 'lambdalabs' or 'runpod', got '%s'", c.Provider)
+	}
+	if c.GPU.MinVRAM_GB <= 0 {
+		return fmt.Errorf("gpu.min_vram_gb must be > 0")
+	}
+	if c.GPU.MinCUDAVersion == "" {
+		return fmt.Errorf("gpu.min_cuda_version is required")
+	}
+	if c.Container.Image == "" {
+		return fmt.Errorf("container.image is required")
+	}
+	return nil
+}
+
+// GetDefaultPorts returns the default ports for inference services
+func (c *InstanceConfig) GetDefaultPorts() []string {
+	return []string{"8080/tcp"}
 }
 
 // SaveConfig saves configuration to a YAML file

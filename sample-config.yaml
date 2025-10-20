@@ -1,25 +1,10 @@
-name: "my-ml-training-instance"
-provider: "lambdalabs"  # or "runpod"
-region: "us-west-1"     # optional - for filtering instances
+name: "my-instance-name"
+provider: "lambdalabs"  # Required: "lambdalabs" or "runpod"
+region: "us-west-1"     # Optional: filter to specific region
 
 gpu:
-  min_vram_gb: 24        # minimum VRAM required
-  min_cuda_version: "11.8"  # minimum CUDA version
-  # preferred_gpus:       # optional - prefer specific GPUs
-  #   - "A100_80GB_SXM4"
-  # exclude_gpus:         # optional - exclude specific GPUs
-  #   - "RTX_3080"
+  min_vram_gb: 24
+  min_cuda_version: "11.8"
 
 container:
-  image: "nvidia/cuda:11.8-devel-ubuntu22.04"
-  environment:
-    CUDA_VISIBLE_DEVICES: "0"
-    MY_ENV_VAR: "value"
-  ports:
-    - "22/tcp"     # SSH
-    - "8888/http"  # Jupyter
-    - "8080/tcp"   # Your app
-  # command: []    # optional - override entrypoint
-  # args: []       # optional - override args
-
-# max_price_cents_hour: 200  # optional - max price filter
+  image: "nvidia/cuda:11.8-devel-ubuntu22.04"  # Your Docker image

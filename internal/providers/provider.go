@@ -44,11 +44,10 @@ type Instance struct {
 
 // ContainerConfig represents Docker container configuration
 type ContainerConfig struct {
-	Image       string            // Docker image name
-	Environment map[string]string // Environment variables
-	Ports       []string          // Ports to expose (e.g., ["22/tcp", "8888/http"])
-	Command     []string          // Override container command
-	Args        []string          // Override container args
+	Image   string   // Docker image name
+	Ports   []string // Ports to expose (e.g., ["8080/tcp"])
+	Command []string // Override container command
+	Args    []string // Override container args
 }
 
 // LaunchRequest represents parameters for launching a new instance
