@@ -1,6 +1,9 @@
 package providers
 
-import "time"
+import (
+	"fmt"
+	"time"
+)
 
 // GPUType represents a specific Nvidia GPU model with its capabilities
 type GPUType struct {
@@ -65,6 +68,28 @@ type SSHKey struct {
 	PrivateKey string // Only returned when Lambda generates the key
 }
 
+// FirewallRule represents a firewall rule for opening ports
+type FirewallRule struct {
+	Protocol     string // "tcp", "udp", "icmp"
+	Port         int    // Port number (for TCP/UDP)
+	SourceNetwork string // CIDR notation, e.g., "0.0.0.0/0"
+	Description  string // Human-readable description
+}
+
+// NewTCPRules creates firewall rules for opening TCP ports
+func NewTCPRules(ports []int, sourceNetwork string) []FirewallRule {
+	rules := make([]FirewallRule, len(ports))
+	for i, port := range ports {
+		rules[i] = FirewallRule{
+			Protocol:      "tcp",
+			Port:          port,
+			SourceNetwork: sourceNetwork,
+			Description:   fmt.Sprintf("TCP port %d access", port),
+		}
+	}
+	return rules
+}
+
 // Provider defines the interface for GPU cloud providers
 type Provider interface {
 	// Instance management
@@ -80,6 +105,9 @@ type Provider interface {
 	ListSSHKeys() ([]*SSHKey, error)
 	CreateSSHKey(name string) (*SSHKey, error)             // Generates new key pair
 	AddSSHKey(name, publicKey string) (*SSHKey, error)     // Adds existing public key
+
+	// Firewall/Port management
+	CreateFirewallRuleset(name, region string, rules []FirewallRule) (string, error)
 
 	// Provider-specific utilities
 	GetProviderName() string

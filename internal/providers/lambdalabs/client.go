@@ -289,3 +289,48 @@ func (c *Client) AddSSHKey(name, publicKey string) (*providers.SSHKey, error) {
 
 	return response.Data, nil
 }
+
+// Firewall/Port Management
+
+func (c *Client) CreateFirewallRuleset(name, region string, rules []providers.FirewallRule) (string, error) {
+	// Convert our FirewallRule to Lambda Labs format
+	lambdaRules := make([]map[string]interface{}, len(rules))
+	for i, rule := range rules {
+		lambdaRules[i] = map[string]interface{}{
+			"protocol":      rule.Protocol,
+			"port_range":    [2]int{rule.Port, rule.Port},
+			"source_network": rule.SourceNetwork,
+			"description":   rule.Description,
+		}
+	}
+
+	createReq := map[string]interface{}{
+		"name":   name,
+		"region": region,
+		"rules":  lambdaRules,
+	}
+
+	resp, err := c.makeRequest("POST", "/firewall-rulesets", createReq)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("API error: %s - %s", resp.Status, string(body))
+	}
+
+	var response struct {
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
+		return "", fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	return response.Data.ID, nil
+}
+
