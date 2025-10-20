@@ -28,7 +28,7 @@ type InstanceConfig struct {
 	Name       string                 `yaml:"name" json:"name"`
 	GPU        GPUConfig              `yaml:"gpu" json:"gpu"`
 	Container  ContainerRequirements  `yaml:"container" json:"container"`
-	Provider   string                 `yaml:"provider,omitempty" json:"provider,omitempty"` // "lambdalabs" or "runpod"
+	Provider   string                 `yaml:"provider,omitempty" json:"provider,omitempty"` // "lambdalabs"
 	Region     string                 `yaml:"region,omitempty" json:"region,omitempty"`
 	MaxPrice   int                    `yaml:"max_price_cents_hour,omitempty" json:"max_price_cents_hour,omitempty"`
 }

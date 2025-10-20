@@ -7,7 +7,7 @@ import (
 )
 
 // Common GPU specifications based on actual cloud provider offerings
-// These represent the Nvidia GPU models available on Lambda Labs and RunPod
+// These represent the Nvidia GPU models available on Lambda Labs
 var (
 	// H100 Series - Latest high-end GPUs
 	H100_80GB_HBM3 = GPUType{
@@ -145,50 +145,6 @@ var (
 		FP32_TFLOPS:      32.3,
 	}
 
-	// Gaming GPUs (available on RunPod)
-	RTX_4090 = GPUType{
-		Name:             "RTX_4090",
-		Description:      "RTX 4090 (24 GB)",
-		VRAM_GB:          24,
-		CUDACores:        16384,
-		ComputeCapability: "8.9",
-		BaseClock_MHz:    2235,
-		MemoryClock_MHz:  1313,
-		FP32_TFLOPS:      80.0,
-	}
-
-	RTX_4080 = GPUType{
-		Name:             "RTX_4080",
-		Description:      "RTX 4080 (16 GB)",
-		VRAM_GB:          16,
-		CUDACores:        9728,
-		ComputeCapability: "8.9",
-		BaseClock_MHz:    2205,
-		MemoryClock_MHz:  1400,
-		FP32_TFLOPS:      48.7,
-	}
-
-	RTX_3090 = GPUType{
-		Name:             "RTX_3090",
-		Description:      "RTX 3090 (24 GB)",
-		VRAM_GB:          24,
-		CUDACores:        10496,
-		ComputeCapability: "8.6",
-		BaseClock_MHz:    1395,
-		MemoryClock_MHz:  1219,
-		FP32_TFLOPS:      35.6,
-	}
-
-	RTX_3080 = GPUType{
-		Name:             "RTX_3080",
-		Description:      "RTX 3080 (12 GB)",
-		VRAM_GB:          12,
-		CUDACores:        8704,
-		ComputeCapability: "8.6",
-		BaseClock_MHz:    1440,
-		MemoryClock_MHz:  1188,
-		FP32_TFLOPS:      29.8,
-	}
 
 	// Previous generation professional GPUs
 	RTX_6000 = GPUType{
@@ -309,11 +265,6 @@ func GetGPUTypeByName(name string) (GPUType, bool) {
 		"RTX_5000_ADA": RTX_5000_ADA,
 		"RTX_4000_ADA": RTX_4000_ADA,
 
-		// Gaming GPUs
-		"RTX_4090": RTX_4090,
-		"RTX_4080": RTX_4080,
-		"RTX_3090": RTX_3090,
-		"RTX_3080": RTX_3080,
 
 		// Previous generation professional
 		"RTX_6000": RTX_6000,
@@ -369,54 +320,30 @@ func (g GPUType) GetMinCUDAVersion() string {
 }
 
 // GetCompatibleGPUs returns all GPUs compatible with a given CUDA version
-// Based on NVIDIA CUDA compatibility requirements
+// Uses a lookup table organized by minimum required CUDA version
 func GetCompatibleGPUs(cudaVersion string) []GPUType {
 	if cudaVersion == "" {
-		return []GPUType{} // Return empty if no CUDA version specified
+		return []GPUType{}
 	}
 
-	// Parse CUDA version to float for comparison
-	cudaFloat, err := parseVersion(cudaVersion)
+	version, err := parseVersion(cudaVersion)
 	if err != nil {
-		return []GPUType{} // Return empty on parse error
+		return []GPUType{}
+	}
+
+	// GPUs organized by minimum CUDA version requirement
+	gpuByMinVersion := map[string][]GPUType{
+		"8.0":  {V100_16GB, V100_32GB, RTX_6000},
+		"11.0": {A100_40GB_PCIE, A100_80GB_PCIE, A100_80GB_SXM4, A6000, A5000, A4000, A10},
+		"11.8": {RTX_6000_ADA, RTX_5000_ADA, RTX_4000_ADA},
+		"12.0": {H100_80GB_HBM3, H100_80GB_SXM5, H100_NVL, B200},
 	}
 
 	var compatible []GPUType
-	allGPUs := []GPUType{
-		// Hopper (9.0) - requires CUDA 12.0+
-		H100_80GB_HBM3, H100_80GB_SXM5, H100_NVL, B200,
-
-		// Ada Lovelace (8.9) - requires CUDA 11.8+
-		RTX_6000_ADA, RTX_5000_ADA, RTX_4000_ADA, RTX_4090, RTX_4080,
-
-		// Ampere (8.6) - requires CUDA 11.0+
-		A6000, A5000, A4000, A10, RTX_3090, RTX_3080,
-
-		// Ampere (8.0) - requires CUDA 11.0+
-		A100_40GB_PCIE, A100_80GB_PCIE, A100_80GB_SXM4,
-
-		// Turing (7.5) - requires CUDA 10.0+
-		RTX_6000,
-
-		// Volta (7.0) - requires CUDA 9.0+
-		V100_16GB, V100_32GB,
-
-		// Pascal (6.1) - requires CUDA 8.0+
-		// (We don't have specific Pascal GPUs defined, but they would go here)
-
-		// Maxwell (5.2) - requires CUDA 8.0+
-		// (Legacy GPUs not commonly used in cloud)
-	}
-
-	for _, gpu := range allGPUs {
-		minVersion := gpu.GetMinCUDAVersion()
-		minFloat, err := parseVersion(minVersion)
-		if err != nil {
-			continue // Skip GPUs with invalid version requirements
-		}
-
-		if cudaFloat >= minFloat {
-			compatible = append(compatible, gpu)
+	for minVersion, gpus := range gpuByMinVersion {
+		minFloat, _ := parseVersion(minVersion)
+		if version >= minFloat {
+			compatible = append(compatible, gpus...)
 		}
 	}
 
