@@ -2,12 +2,10 @@ package cli
 
 import (
 	"context"
-	"fmt"
 	"log"
-	"strings"
 
 	"github.com/urfave/cli/v3"
-	"toni/gpusnapshot/pkg/providers"
+	"toni/gpusnapshot/pkg/cluster"
 )
 
 // NewClusterCommand creates and returns the cluster command
@@ -76,20 +74,39 @@ func NewClusterCommand() *cli.Command {
 					k3sServer := cmd.Bool("k3s-server")
 					k3sArgs := cmd.StringSlice("k3s-args")
 
+					// Get global provider from context/flags
+					provider := "lambdalabs" // TODO: Get from global --provider flag
+
 					log.Printf("Launching instance: type=%s, region=%s, name=%s, k3s=%v",
 						instanceType, region, name, installK3s)
 
-					// Build container configuration
-					var container *providers.ContainerConfig
+					// Create cluster manager
+					manager := cluster.NewManager()
+
+					// Build k3s config if enabled
+					var k3sConfig *cluster.K3sConfig
 					if installK3s {
-						container = buildK3sContainer(k3sVersion, k3sServer, k3sArgs)
+						k3sConfig = cluster.NewK3sConfig(true, k3sVersion, k3sServer, k3sArgs)
 						log.Printf("Will install k3s %s (server: %v)", k3sVersion, k3sServer)
+
+						// Show container config for debugging
+						container := manager.BuildK3sContainer(k3sVersion, k3sServer, k3sArgs)
 						log.Printf("Container config: image=%s, command=%v, args=%v",
 							container.Image, container.Command, container.Args)
 					}
 
-					// TODO: Implement actual instance launching with provider
-					// This would call your provider.LaunchInstance() with the container config
+					// Launch instance using manager
+					instance, err := manager.LaunchInstance(provider, instanceType, region, name, k3sConfig)
+					if err != nil {
+						log.Printf("Failed to launch instance: %v", err)
+						return err
+					}
+
+					if instance != nil {
+						log.Printf("Successfully launched instance: %s (ID: %s)", instance.Name, instance.ID)
+					} else {
+						log.Printf("Instance launch initiated (async)")
+					}
 
 					return nil
 				},
@@ -98,44 +115,3 @@ func NewClusterCommand() *cli.Command {
 	}
 }
 
-// buildK3sContainer creates a container configuration for k3s
-func buildK3sContainer(version string, isServer bool, extraArgs []string) *providers.ContainerConfig {
-	image := "rancher/k3s"
-	if version != "latest" {
-		// Remove 'v' prefix if present to avoid double 'v'
-		cleanVersion := strings.TrimPrefix(version, "v")
-		image = fmt.Sprintf("%s:v%s", image, cleanVersion)
-	}
-
-	// Build k3s command
-	cmd := []string{}
-	args := []string{}
-
-	if isServer {
-		cmd = append(cmd, "server")
-	} else {
-		cmd = append(cmd, "agent")
-	}
-
-	// Add extra arguments
-	if len(extraArgs) > 0 {
-		args = append(args, extraArgs...)
-	}
-
-	// Add common k3s flags for GPU/container workloads
-	args = append(args, "--docker") // Use Docker instead of containerd for compatibility
-	args = append(args, "--kubelet-arg=feature-gates=KubeletInUserNamespace=true")
-
-	// Expose Kubernetes API port
-	ports := []string{"6443/tcp"}
-	if isServer {
-		ports = append(ports, "8080/tcp", "10250/tcp") // Additional server ports
-	}
-
-	return &providers.ContainerConfig{
-		Image:   image,
-		Ports:   ports,
-		Command: cmd,
-		Args:    args,
-	}
-}
