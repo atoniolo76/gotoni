@@ -6,7 +6,7 @@ import (
 	"os"
 
 	"github.com/urfave/cli/v3"
-	"toni/gpusnapshot/cmd/cluster"
+	gpucli "toni/gpusnapshot/pkg/cli"
 )
 
 func main() {
@@ -14,9 +14,21 @@ func main() {
 		Name:  "gpusnapshot",
 		Usage: "GPU cloud instance management tool",
 		Description: "A tool for managing GPU cloud instances across different providers",
+		Flags: []cli.Flag{
+			&cli.StringFlag{
+				Name:    "provider",
+				Usage:   "Cloud provider to use",
+				Value:   "lambdalabs",
+				Aliases: []string{"p"},
+			},
+			&cli.BoolFlag{
+				Name:  "verbose",
+				Usage: "Enable verbose output",
+				Aliases: []string{"v"},
+			},
+		},
 		Commands: []*cli.Command{
-			cluster.NewCommand(),
-			// Add more commands here as you implement them
+			gpucli.NewClusterCommand(),
 		},
 	}
 
