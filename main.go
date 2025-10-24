@@ -33,6 +33,29 @@ type Region struct {
 	Description string `json:"description"`
 }
 
+var minCudaVersions = map[string]string{
+	"H100_80GB_HBM3": "12.0",
+	"H100_80GB_SXM5": "12.0",
+	"H100_NVL":       "12.0",
+	"A100_40GB_PCIE": "11.0",
+	"A100_80GB_PCIE": "11.0",
+	"A100_80GB_SXM4": "11.0",
+	"A6000":          "11.0",
+	"A5000":          "11.0",
+	"A4000":          "11.0",
+	"RTX_6000_ADA":   "11.8",
+	"RTX_5000_ADA":   "11.8",
+	"RTX_4000_ADA":   "11.8",
+	"RTX_6000":       "10.0",
+	"A10":            "11.0",
+	"L40":            "11.8",
+	"L40S":           "11.8",
+	"B200":           "12.0",
+	"GH200":          "12.0",
+	"V100_16GB":      "9.0",
+	"V100_32GB":      "9.0",
+}
+
 func main() {
 	c := http.Client{Timeout: time.Duration(5) * time.Second}
 	req, err := http.NewRequest("GET", "https://cloud.lambda.ai/api/v1/instance-types", nil)
