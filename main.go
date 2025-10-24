@@ -1,81 +1,71 @@
 package main
 
 import (
-	"context"
+	"encoding/json"
 	"fmt"
-	"log"
-	"os"
-
-	"github.com/urfave/cli/v3"
-	"toni/gotoni/pkg/lambdalabs"
+	"io"
+	"net/http"
+	"time"
 )
 
+type Response struct {
+	Data map[string]struct {
+		InstanceType                 InstanceType `json:"instance_type"`
+		RegionsWithCapacityAvailable []Region     `json:"regions_with_capacity_available"`
+	} `json:"data"`
+}
+
+type InstanceType struct {
+	Name              string `json:"name"`
+	Description       string `json:"description"`
+	GPUDescription    string `json:"gpu_description"`
+	PriceCentsPerHour int    `json:"price_cents_per_hour"`
+	Specs             struct {
+		VCPUs      int `json:"vcpus"`
+		MemoryGib  int `json:"memory_gib"`
+		StorageGib int `json:"storage_gib"`
+		GPUs       int `json:"gpus"`
+	} `json:"specs"`
+}
+
+type Region struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+}
+
 func main() {
-	cmd := &cli.Command{
-		Name:  "gotoni",
-		Usage: "GPU cloud instance management tool",
-		Description: "A tool for managing GPU cloud instances with Lambda Labs",
-		Flags: []cli.Flag{
-			&cli.StringFlag{
-				Name:     "api-token",
-				Usage:    "Lambda Labs API token",
-				Required: true,
-				Aliases:  []string{"t"},
-			},
-			&cli.BoolFlag{
-				Name:  "verbose",
-				Usage: "Enable verbose output",
-				Aliases: []string{"v"},
-			},
-		},
-		Commands: []*cli.Command{
-			{
-				Name:  "instances",
-				Usage: "List GPU instances",
-				Action: func(ctx context.Context, cmd *cli.Command) error {
-					client := lambdalabs.NewClient(cmd.String("api-token"))
-
-					instances, err := client.ListInstances()
-					if err != nil {
-						return fmt.Errorf("failed to list instances: %w", err)
-					}
-
-					fmt.Printf("Found %d instances:\n", len(instances))
-					for _, instance := range instances {
-						fmt.Printf("- %s (%s): %s in %s\n",
-							instance.Name, instance.ID, instance.Status, instance.Region)
-					}
-
-					return nil
-				},
-			},
-			{
-				Name:  "instance-types",
-				Usage: "List available instance types",
-				Action: func(ctx context.Context, cmd *cli.Command) error {
-					client := lambdalabs.NewClient(cmd.String("api-token"))
-
-					instanceTypes, err := client.ListInstanceTypes()
-					if err != nil {
-						return fmt.Errorf("failed to list instance types: %w", err)
-					}
-
-					fmt.Printf("Available instance types:\n")
-					for _, it := range instanceTypes {
-						fmt.Printf("- %s: %s (%d GPUs, %d vCPUs, %d GB RAM, $%d/hour)\n",
-							it.Name, it.Description, len(it.GPUs), it.VCPUs, it.RAM_GB, it.PriceCentsPerHour)
-						if len(it.Regions) > 0 {
-							fmt.Printf("  Regions: %v\n", it.Regions)
-						}
-					}
-
-					return nil
-				},
-			},
-		},
+	c := http.Client{Timeout: time.Duration(5) * time.Second}
+	req, err := http.NewRequest("GET", "https://cloud.lambda.ai/api/v1/instance-types", nil)
+	if err != nil {
+		fmt.Println("Error:", err)
+		return
 	}
 
-	if err := cmd.Run(context.Background(), os.Args); err != nil {
-		log.Fatal(err)
+	req.Header.Set("Authorization", "Bearer secret_gpusnapshot_e0390e0a3cf5471d9e9eae8af354a72d.HrNIhxnX0vd7sPft7nTLAqxQAzHWyBki")
+
+	resp, err := c.Do(req)
+	if err != nil {
+		fmt.Println("Error:", err)
+		return
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		fmt.Println("Error:", err)
+		return
+	}
+
+	var response Response
+	err = json.Unmarshal(body, &response)
+	if err != nil {
+		fmt.Println("Error:", err)
+		return
+	}
+
+	for _, item := range response.Data {
+		if len(item.RegionsWithCapacityAvailable) == 0 {
+			continue
+		}
+		fmt.Printf("Instance Type: %s\n", item.InstanceType.Name)
 	}
 }
