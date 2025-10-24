@@ -9,10 +9,12 @@ import (
 )
 
 type Response struct {
-	Data map[string]struct {
-		InstanceType                 InstanceType `json:"instance_type"`
-		RegionsWithCapacityAvailable []Region     `json:"regions_with_capacity_available"`
-	} `json:"data"`
+	Data map[string]Instance `json:"data"`
+}
+
+type Instance struct {
+	InstanceType                 InstanceType `json:"instance_type"`
+	RegionsWithCapacityAvailable []Region     `json:"regions_with_capacity_available"`
 }
 
 type InstanceType struct {
@@ -57,38 +59,52 @@ var minCudaVersions = map[string]string{
 }
 
 func main() {
+	instances, err := getAvailableInstanceTypes("secret_gpusnapshot_e0390e0a3cf5471d9e9eae8af354a72d.HrNIhxnX0vd7sPft7nTLAqxQAzHWyBki")
+	if err != nil {
+		fmt.Println("Error getting available instance types: ", err)
+		return
+	}
+
+	fmt.Printf("Instances: %+v\n", instances)
+}
+
+func getAvailableInstanceTypes(apiToken string) ([]Instance, error) {
 	c := http.Client{Timeout: time.Duration(5) * time.Second}
 	req, err := http.NewRequest("GET", "https://cloud.lambda.ai/api/v1/instance-types", nil)
 	if err != nil {
-		fmt.Println("Error:", err)
-		return
+		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
-	req.Header.Set("Authorization", "Bearer secret_gpusnapshot_e0390e0a3cf5471d9e9eae8af354a72d.HrNIhxnX0vd7sPft7nTLAqxQAzHWyBki")
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", apiToken))
 
 	resp, err := c.Do(req)
 	if err != nil {
-		fmt.Println("Error:", err)
-		return
+		return nil, fmt.Errorf("failed to execute request: %w", err)
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("API request failed with status %d", resp.StatusCode)
+	}
+
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		fmt.Println("Error:", err)
-		return
+		return nil, fmt.Errorf("failed to read response body: %w", err)
 	}
 
 	var response Response
 	err = json.Unmarshal(body, &response)
 	if err != nil {
-		fmt.Println("Error:", err)
-		return
+		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
 	}
 
-	for _, item := range response.Data {
-		if len(item.RegionsWithCapacityAvailable) == 0 {
+	var instances []Instance
+	for _, instance := range response.Data {
+		if len(instance.RegionsWithCapacityAvailable) == 0 {
 			continue
 		}
-		fmt.Printf("Instance Type: %s\n", item.InstanceType.Name)
+		instances = append(instances, instance)
 	}
+
+	return instances, nil
 }
