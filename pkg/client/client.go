@@ -88,6 +88,23 @@ var minCudaVersions = map[string]float64{
 	"Tesla V100 (32 GB)":   9.0,
 }
 
+var MatchingInstanceTypes = map[string]string{
+	"gpu_1x_gh200":        "GH200 (96 GB)",
+	"gpu_1x_h100_sxm5":    "H100 (80 GB SXM5)",
+	"gpu_1x_h100_pcie":    "H100 (80 GB PCIe)",
+	"gpu_1x_a10_pcie":     "A10 (24 GB PCIe)",
+	"gpu_1x_a100_sxm4":    "A100 (40 GB SXM4)",
+	"gpu_8x_b200_sxm6":    "B200 (108 GB SXM6)",
+	"gpu_8x_h100_sxm5":    "H100 (80 GB SXM5)",
+	"gpu_4x_h100_sxm5":    "H100 (80 GB SXM5)",
+	"gpu_2x_h100_sxm5":    "H100 (80 GB SXM5)",
+	"gpu_8x_a100_sxm4":    "A100 (80 GB SXM4)",
+	"gpu_1x_a100_pcie":    "A100 (40 GB PCIe)",
+	"gpu_2x_a100_pcie":    "A100 (40 GB PCIe)",
+	"gpu_4x_a100_pcie":    "A100 (40 GB PCIe)",
+	"gpu_8x_a100_sxm4_v2": "A100 (80 GB SXM4) v2",
+}
+
 func main() {
 	apiToken := os.Getenv("LAMBDA_API_KEY")
 	c := http.Client{Timeout: time.Duration(5) * time.Second}
