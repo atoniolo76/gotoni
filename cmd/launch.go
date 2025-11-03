@@ -5,7 +5,11 @@ package cmd
 
 import (
 	"fmt"
+	"log"
+	"net/http"
+	"os"
 	"strings"
+	"time"
 	"toni/gotoni/pkg/client"
 
 	"github.com/spf13/cobra"
@@ -17,7 +21,51 @@ var launchCmd = &cobra.Command{
 	Short: "Launch a new instance on your Neocloud.",
 	Long:  `Launch a new instance on your Neocloud.`,
 	Run: func(cmd *cobra.Command, args []string) {
-		fmt.Println("launch called")
+		instanceType, err := cmd.Flags().GetString("instance-type")
+		if err != nil {
+			log.Fatalf("Error getting instance type: %v", err)
+		}
+
+		region, err := cmd.Flags().GetString("region")
+		if err != nil {
+			log.Fatalf("Error getting region: %v", err)
+		}
+
+		apiToken, err := cmd.Flags().GetString("api-token")
+		if err != nil {
+			log.Fatalf("Error getting API token: %v", err)
+		}
+
+		// If API token not provided via flag, get from environment
+		if apiToken == "" {
+			apiToken = os.Getenv("LAMBDA_API_KEY")
+			if apiToken == "" {
+				log.Fatal("API token not provided via --api-token flag or LAMBDA_API_KEY environment variable")
+			}
+		}
+
+		// Create HTTP client
+		httpClient := &http.Client{Timeout: time.Duration(30) * time.Second}
+
+		// Create a new SSH key for programmatic access
+		sshKeyName, sshKeyFile, err := client.CreateSSHKeyForProject(httpClient, apiToken)
+		if err != nil {
+			log.Fatalf("Error creating SSH key: %v", err)
+		}
+
+		// Launch the instance
+		launchedInstances, err := client.LaunchInstance(httpClient, apiToken, instanceType, region, []string{sshKeyName}, []string{sshKeyFile}, 1, "cli-launch")
+		if err != nil {
+			log.Fatalf("Error launching instance: %v", err)
+		}
+
+		// Print instance info with SSH access details
+		for _, instance := range launchedInstances {
+			fmt.Printf("Launched instance: %s\n", instance.ID)
+			fmt.Printf("SSH Key: %s\n", instance.SSHKeyName)
+			fmt.Printf("SSH Key File: %s\n", instance.SSHKeyFile)
+			fmt.Printf("Connect with: ssh -i %s ubuntu@<instance-ip>\n\n", instance.SSHKeyFile)
+		}
 	},
 }
 
@@ -38,7 +86,13 @@ func init() {
 		instanceOptions = append(instanceOptions, key)
 	}
 
+	launchCmd.Flags().StringP("api-token", "a", "", "API token for Lambda Cloud (can also be set via LAMBDA_API_KEY env var)")
+
+	launchCmd.Flags().StringP("region", "r", "", "Region to launch the instance in (e.g., us-east-1, us-west-2)")
+
 	launchCmd.Flags().StringP("instance-type", "t", "", `choose the instance type to launch. Options:
 `+strings.Join(instanceOptions, "\n")+`
 	`)
+	launchCmd.MarkFlagRequired("instance-type")
+	launchCmd.MarkFlagRequired("region")
 }

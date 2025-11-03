@@ -132,13 +132,13 @@ func main() {
 	fmt.Printf("Max region name: %s\n", maxRegionName)
 
 	// Create a new SSH key for programmatic access
-	sshKeyName, sshKeyFile, err := createSSHKeyForProject(&c, apiToken)
+	sshKeyName, sshKeyFile, err := CreateSSHKeyForProject(&c, apiToken)
 	if err != nil {
 		fmt.Println("Error creating SSH key: ", err)
 		return
 	}
 
-	launchedInstances, err := launchInstance(&c, apiToken, maxInstanceTypeName, maxRegionName, []string{sshKeyName}, []string{sshKeyFile}, 1, "test")
+	launchedInstances, err := LaunchInstance(&c, apiToken, maxInstanceTypeName, maxRegionName, []string{sshKeyName}, []string{sshKeyFile}, 1, "test")
 	if err != nil {
 		fmt.Println("Error launching instance: ", err)
 		return
@@ -153,21 +153,24 @@ func main() {
 	}
 }
 
-// launchInstanceSimple launches a single instance with default settings
-func launchInstanceSimple(httpClient *http.Client, apiToken string, instanceType string, region string, sshKeyName string, sshKeyFile string) (*LaunchedInstance, error) {
-	instances, err := launchInstance(httpClient, apiToken, instanceType, region, []string{sshKeyName}, []string{sshKeyFile}, 1, "")
-	if err != nil {
-		return nil, err
-	}
-	return &instances[0], nil
-}
-
-func launchInstance(httpClient *http.Client, apiToken string, instanceType string, region string, sshKeyNames []string, sshKeyFiles []string, quantity int, name string) ([]LaunchedInstance, error) {
+func LaunchInstance(
+	httpClient *http.Client,
+	apiToken string,
+	instanceType string,
+	region string,
+	sshKeyNames []string,
+	sshKeyFiles []string,
+	quantity int,
+	name string,
+) ([]LaunchedInstance, error) {
 	if len(sshKeyNames) == 0 {
 		return nil, fmt.Errorf("at least one SSH key name is required")
 	}
 	if quantity <= 0 {
 		quantity = 1 // Default to 1
+	}
+	if name == "" {
+		name = "default"
 	}
 
 	requestBody := InstanceLaunchRequest{
@@ -277,7 +280,7 @@ func createSSHKey(httpClient *http.Client, apiToken string, name string) (*Gener
 }
 
 // createSSHKeyForProject creates a new SSH key and saves it in the project root
-func createSSHKeyForProject(httpClient *http.Client, apiToken string) (string, string, error) {
+func CreateSSHKeyForProject(httpClient *http.Client, apiToken string) (string, string, error) {
 	// Create unique key name with timestamp
 	timestamp := time.Now().Unix()
 	keyName := "lambda-key-" + strconv.FormatInt(timestamp, 10)
