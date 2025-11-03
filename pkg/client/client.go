@@ -92,7 +92,7 @@ func main() {
 	apiToken := os.Getenv("LAMBDA_API_KEY")
 	c := http.Client{Timeout: time.Duration(5) * time.Second}
 
-	instances, err := getAvailableInstanceTypes(&c, apiToken)
+	instances, err := GetAvailableInstanceTypes(&c, apiToken)
 	if err != nil {
 		fmt.Println("Error getting available instance types: ", err)
 		return
@@ -283,7 +283,7 @@ func createSSHKeyForProject(httpClient *http.Client, apiToken string) (string, s
 	return generatedKey.Name, privateKeyFile, nil
 }
 
-func getAvailableInstanceTypes(httpClient *http.Client, apiToken string) ([]Instance, error) {
+func GetAvailableInstanceTypes(httpClient *http.Client, apiToken string) ([]Instance, error) {
 	req, err := http.NewRequest("GET", "https://cloud.lambda.ai/api/v1/instance-types", nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
