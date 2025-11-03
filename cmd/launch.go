@@ -86,6 +86,7 @@ func init() {
 		instanceOptions = append(instanceOptions, key)
 	}
 
+	// Extract region keys from the map
 	launchCmd.Flags().StringP("api-token", "a", "", "API token for Lambda Cloud (can also be set via LAMBDA_API_KEY env var)")
 
 	launchCmd.Flags().StringP("region", "r", "", "Region to launch the instance in (e.g., us-east-1, us-west-2)")

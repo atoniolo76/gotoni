@@ -50,6 +50,37 @@ type InstanceLaunchResponse struct {
 	InstanceIDs []string `json:"instance_ids"`
 }
 
+type InstanceTerminateRequest struct {
+	InstanceIDs []string `json:"instance_ids"`
+}
+
+type InstanceTerminateResponse struct {
+	TerminatedInstances []TerminatedInstance `json:"terminated_instances"`
+}
+
+type TerminatedInstance struct {
+	ID     string `json:"id"`
+	Name   string `json:"name,omitempty"`
+	Status string `json:"status"`
+	// Add other fields as needed
+}
+
+type RunningInstance struct {
+	ID              string       `json:"id"`
+	Name            string       `json:"name,omitempty"`
+	IP              string       `json:"ip"`
+	PrivateIP       string       `json:"private_ip"`
+	Status          string       `json:"status"`
+	SSHKeyNames     []string     `json:"ssh_key_names"`
+	FileSystemNames []string     `json:"file_system_names"`
+	Region          Region       `json:"region"`
+	InstanceType    InstanceType `json:"instance_type"`
+	Hostname        string       `json:"hostname"`
+	JupyterToken    string       `json:"jupyter_token"`
+	JupyterURL      string       `json:"jupyter_url"`
+	IsReserved      bool         `json:"is_reserved"`
+}
+
 type LaunchedInstance struct {
 	ID         string
 	SSHKeyName string
@@ -232,6 +263,94 @@ func LaunchInstance(
 	}
 
 	return instances, nil
+}
+
+func ListRunningInstances(httpClient *http.Client, apiToken string) ([]RunningInstance, error) {
+	req, err := http.NewRequest("GET", "https://cloud.lambda.ai/api/v1/instances", nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", apiToken))
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to execute request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("API request failed with status %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	var response struct {
+		Data []RunningInstance `json:"data"`
+	}
+	err = json.Unmarshal(body, &response)
+	if err != nil {
+		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
+	}
+
+	return response.Data, nil
+}
+
+func TerminateInstance(
+	httpClient *http.Client,
+	apiToken string,
+	instanceIDs []string,
+) (*InstanceTerminateResponse, error) {
+	if len(instanceIDs) == 0 {
+		return nil, fmt.Errorf("at least one instance ID is required")
+	}
+
+	requestBody := InstanceTerminateRequest{
+		InstanceIDs: instanceIDs,
+	}
+
+	jsonBody, err := json.Marshal(requestBody)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request body: %w", err)
+	}
+
+	req, err := http.NewRequest("POST", "https://cloud.lambda.ai/api/v1/instance-operations/terminate", nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Body = io.NopCloser(strings.NewReader(string(jsonBody)))
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", apiToken))
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to execute request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	var apiResponse struct {
+		Data InstanceTerminateResponse `json:"data"`
+	}
+
+	err = json.Unmarshal(body, &apiResponse)
+	if err != nil {
+		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
+	}
+
+	return &apiResponse.Data, nil
 }
 
 // createSSHKey generates a new SSH key pair on Lambda and returns both keys
