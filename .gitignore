@@ -37,3 +37,16 @@ Thumbs.db
 bin/
 dist/
 
+
+# Ignore SSH keys
+*.pem
+*.pub
+lambda-key-*.pem
+lambda-key-*.pub
+id_rsa
+id_rsa.pub
+id_ecdsa
+id_ecdsa.pub
+id_ed25519
+id_ed25519.pub
+.ssh/
