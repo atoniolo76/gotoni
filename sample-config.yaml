@@ -1,4 +1,5 @@
-name: "ui-tars2-inference"
-image: "my-registry/ui-tars2-inference:v1.0"
-min_vram_gb: 24                               
-min_cuda_version: "12.0"                      
+# This file is automatically managed by gotoni
+# It contains the SSH key name for the most recently launched instance
+# You don't need to create or edit this file manually
+
+lambda-key-1736012345                      

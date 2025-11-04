@@ -6,6 +6,8 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -136,67 +138,15 @@ var MatchingInstanceTypes = map[string]string{
 	"gpu_8x_a100_sxm4_v2": "A100 (80 GB SXM4) v2",
 }
 
-func main() {
-	apiToken := os.Getenv("LAMBDA_API_KEY")
-	c := http.Client{Timeout: time.Duration(5) * time.Second}
-
-	instances, err := GetAvailableInstanceTypes(&c, apiToken)
-	if err != nil {
-		fmt.Println("Error getting available instance types: ", err)
-		return
-	}
-
-	maxCudaVersionFloat := float64(0)
-	maxInstanceTypeName := ""
-	maxRegionName := ""
-	for _, instance := range instances {
-		if minCudaVersions[instance.InstanceType.GPUDescription] > maxCudaVersionFloat {
-			maxCudaVersionFloat = minCudaVersions[instance.InstanceType.GPUDescription]
-			maxInstanceTypeName = instance.InstanceType.Name
-
-			maxRegionName = instance.RegionsWithCapacityAvailable[0].Name
-		}
-	}
-
-	fmt.Printf("Max cuda version: %.1f\n", maxCudaVersionFloat)
-	fmt.Printf("Max instance type name: %s\n", maxInstanceTypeName)
-	fmt.Printf("Max region name: %s\n", maxRegionName)
-
-	// Create a new SSH key for programmatic access
-	sshKeyName, sshKeyFile, err := CreateSSHKeyForProject(&c, apiToken)
-	if err != nil {
-		fmt.Println("Error creating SSH key: ", err)
-		return
-	}
-
-	launchedInstances, err := LaunchInstance(&c, apiToken, maxInstanceTypeName, maxRegionName, []string{sshKeyName}, []string{sshKeyFile}, 1, "test")
-	if err != nil {
-		fmt.Println("Error launching instance: ", err)
-		return
-	}
-
-	// Print instance info with SSH access details
-	for _, instance := range launchedInstances {
-		fmt.Printf("Launched instance: %s\n", instance.ID)
-		fmt.Printf("SSH Key: %s\n", instance.SSHKeyName)
-		fmt.Printf("SSH Key File: %s\n", instance.SSHKeyFile)
-		fmt.Printf("Connect with: ssh -i %s ubuntu@<instance-ip>\n\n", instance.SSHKeyFile)
-	}
-}
-
+// LaunchInstance creates a new SSH key, saves it to config, and launches an instance
 func LaunchInstance(
 	httpClient *http.Client,
 	apiToken string,
 	instanceType string,
 	region string,
-	sshKeyNames []string,
-	sshKeyFiles []string,
 	quantity int,
 	name string,
 ) ([]LaunchedInstance, error) {
-	if len(sshKeyNames) == 0 {
-		return nil, fmt.Errorf("at least one SSH key name is required")
-	}
 	if quantity <= 0 {
 		quantity = 1 // Default to 1
 	}
@@ -204,10 +154,21 @@ func LaunchInstance(
 		name = "default"
 	}
 
+	// Create a new SSH key for this instance
+	sshKeyName, sshKeyFile, err := CreateSSHKeyForProject(httpClient, apiToken)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create SSH key: %w", err)
+	}
+
+	// Save the key name to config file
+	if err := saveSSHKeyToConfig(sshKeyName); err != nil {
+		return nil, fmt.Errorf("failed to save SSH key to config: %w", err)
+	}
+
 	requestBody := InstanceLaunchRequest{
 		RegionName:       region,
 		InstanceTypeName: instanceType,
-		SSHKeyNames:      sshKeyNames,
+		SSHKeyNames:      []string{sshKeyName},
 		Quantity:         quantity,
 		Name:             name,
 	}
@@ -254,15 +215,78 @@ func LaunchInstance(
 	// Create LaunchedInstance structs with SSH key info
 	instances := make([]LaunchedInstance, len(apiResponse.Data.InstanceIDs))
 	for i, instanceID := range apiResponse.Data.InstanceIDs {
-		sshKeyIndex := i % len(sshKeyNames) // Cycle through SSH keys if multiple instances
 		instances[i] = LaunchedInstance{
 			ID:         instanceID,
-			SSHKeyName: sshKeyNames[sshKeyIndex],
-			SSHKeyFile: sshKeyFiles[sshKeyIndex],
+			SSHKeyName: sshKeyName,
+			SSHKeyFile: sshKeyFile,
 		}
 	}
 
 	return instances, nil
+}
+
+// saveSSHKeyToConfig saves the SSH key name to the config file
+func saveSSHKeyToConfig(sshKeyName string) error {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+	configPath := filepath.Join(homeDir, ".gotoni", "config.yaml")
+
+	// Create directory if it doesn't exist
+	if err := os.MkdirAll(filepath.Dir(configPath), 0755); err != nil {
+		return err
+	}
+
+	// Write the SSH key name to config file
+	return os.WriteFile(configPath, []byte(sshKeyName+"\n"), 0644)
+}
+
+// ConnectToInstance connects to a remote instance via SSH using the key from config
+func ConnectToInstance(instanceIP string) error {
+	sshKeyName, err := loadSSHKeyFromConfig()
+	if err != nil {
+		return fmt.Errorf("failed to load SSH key from config: %w", err)
+	}
+
+	sshKeyFile := sshKeyName + ".pem"
+	if _, err := os.Stat(sshKeyFile); os.IsNotExist(err) {
+		return fmt.Errorf("SSH key file %s does not exist", sshKeyFile)
+	}
+
+	// Use ssh command to connect
+	cmd := exec.Command("ssh", "-i", sshKeyFile, "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", fmt.Sprintf("ubuntu@%s", instanceIP))
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	return cmd.Run()
+}
+
+// loadSSHKeyFromConfig loads the SSH key name from the config file
+func loadSSHKeyFromConfig() (string, error) {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	configPath := filepath.Join(homeDir, ".gotoni", "config.yaml")
+
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to read config file: %w", err)
+	}
+
+	// Parse the first non-comment, non-empty line as the SSH key name
+	lines := strings.Split(string(data), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		return line, nil
+	}
+
+	return "", fmt.Errorf("no SSH key name found in config file")
 }
 
 func ListRunningInstances(httpClient *http.Client, apiToken string) ([]RunningInstance, error) {
@@ -398,7 +422,7 @@ func createSSHKey(httpClient *http.Client, apiToken string, name string) (*Gener
 	return &apiResponse.Data, nil
 }
 
-// createSSHKeyForProject creates a new SSH key and saves it in the project root
+// CreateSSHKeyForProject creates a new SSH key and saves it in the project root
 func CreateSSHKeyForProject(httpClient *http.Client, apiToken string) (string, string, error) {
 	// Create unique key name with timestamp
 	timestamp := time.Now().Unix()
