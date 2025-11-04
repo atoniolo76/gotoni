@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 type Response struct {
@@ -138,6 +140,71 @@ var MatchingInstanceTypes = map[string]string{
 	"gpu_8x_a100_sxm4_v2": "A100 (80 GB SXM4) v2",
 }
 
+// Config represents the application configuration
+type Config struct {
+	Instances map[string]string `yaml:"instances,omitempty"` // instance-id -> ssh-key-name
+	SSHKeys   map[string]string `yaml:"ssh_keys,omitempty"`  // ssh-key-name -> private-key-file
+}
+
+// DefaultConfig returns an empty config
+func DefaultConfig() *Config {
+	return &Config{
+		Instances: make(map[string]string),
+		SSHKeys:   make(map[string]string),
+	}
+}
+
+// LoadConfig loads the configuration from file
+func LoadConfig() (*Config, error) {
+	configPath := ".gotoni/config.yaml"
+
+	// Check if file exists
+	if _, err := os.Stat(configPath); os.IsNotExist(err) {
+		return DefaultConfig(), nil
+	}
+
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read config file: %w", err)
+	}
+
+	var config Config
+	if err := yaml.Unmarshal(data, &config); err != nil {
+		return nil, fmt.Errorf("failed to parse config: %w", err)
+	}
+
+	// Initialize maps if they're nil
+	if config.Instances == nil {
+		config.Instances = make(map[string]string)
+	}
+	if config.SSHKeys == nil {
+		config.SSHKeys = make(map[string]string)
+	}
+
+	return &config, nil
+}
+
+// SaveConfig saves the configuration to file
+func SaveConfig(config *Config) error {
+	configPath := ".gotoni/config.yaml"
+
+	// Create directory if it doesn't exist
+	if err := os.MkdirAll(filepath.Dir(configPath), 0755); err != nil {
+		return fmt.Errorf("failed to create config directory: %w", err)
+	}
+
+	data, err := yaml.Marshal(config)
+	if err != nil {
+		return fmt.Errorf("failed to marshal config: %w", err)
+	}
+
+	if err := os.WriteFile(configPath, data, 0644); err != nil {
+		return fmt.Errorf("failed to write config file: %w", err)
+	}
+
+	return nil
+}
+
 // LaunchInstance creates a new SSH key, saves it to config, and launches an instance
 func LaunchInstance(
 	httpClient *http.Client,
@@ -160,9 +227,18 @@ func LaunchInstance(
 		return nil, fmt.Errorf("failed to create SSH key: %w", err)
 	}
 
-	// Save the key name to config file
-	if err := saveSSHKeyToConfig(sshKeyName); err != nil {
-		return nil, fmt.Errorf("failed to save SSH key to config: %w", err)
+	// Load current config
+	config, err := LoadConfig()
+	if err != nil {
+		return nil, fmt.Errorf("failed to load config: %w", err)
+	}
+
+	// Save SSH key info to config
+	config.SSHKeys[sshKeyName] = sshKeyFile
+
+	// Save config
+	if err := SaveConfig(config); err != nil {
+		return nil, fmt.Errorf("failed to save config: %w", err)
 	}
 
 	requestBody := InstanceLaunchRequest{
@@ -220,36 +296,45 @@ func LaunchInstance(
 			SSHKeyName: sshKeyName,
 			SSHKeyFile: sshKeyFile,
 		}
+
+		// Save instance -> SSH key mapping
+		config.Instances[instanceID] = sshKeyName
+	}
+
+	// Save updated config with instance mappings
+	if err := SaveConfig(config); err != nil {
+		return nil, fmt.Errorf("failed to save config with instance mappings: %w", err)
 	}
 
 	return instances, nil
 }
 
-// saveSSHKeyToConfig saves the SSH key name to the config file
-func saveSSHKeyToConfig(sshKeyName string) error {
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		return err
-	}
-	configPath := filepath.Join(homeDir, ".gotoni", "config.yaml")
-
-	// Create directory if it doesn't exist
-	if err := os.MkdirAll(filepath.Dir(configPath), 0755); err != nil {
-		return err
-	}
-
-	// Write the SSH key name to config file
-	return os.WriteFile(configPath, []byte(sshKeyName+"\n"), 0644)
-}
-
 // ConnectToInstance connects to a remote instance via SSH using the key from config
 func ConnectToInstance(instanceIP string) error {
-	sshKeyName, err := loadSSHKeyFromConfig()
+	// Load config
+	config, err := LoadConfig()
 	if err != nil {
-		return fmt.Errorf("failed to load SSH key from config: %w", err)
+		return fmt.Errorf("failed to load config: %w", err)
 	}
 
-	sshKeyFile := sshKeyName + ".pem"
+	// For now, we'll use the most recent SSH key if we don't have instance-specific mapping
+	// In the future, we could enhance this to accept instance ID instead of IP
+	var sshKeyName string
+	if len(config.SSHKeys) > 0 {
+		// Get the most recently added SSH key (simple heuristic)
+		for name := range config.SSHKeys {
+			sshKeyName = name
+			break // Just get first one for now
+		}
+	} else {
+		return fmt.Errorf("no SSH keys found in config")
+	}
+
+	sshKeyFile, exists := config.SSHKeys[sshKeyName]
+	if !exists {
+		return fmt.Errorf("SSH key file not found for key: %s", sshKeyName)
+	}
+
 	if _, err := os.Stat(sshKeyFile); os.IsNotExist(err) {
 		return fmt.Errorf("SSH key file %s does not exist", sshKeyFile)
 	}
@@ -263,30 +348,36 @@ func ConnectToInstance(instanceIP string) error {
 	return cmd.Run()
 }
 
-// loadSSHKeyFromConfig loads the SSH key name from the config file
-func loadSSHKeyFromConfig() (string, error) {
-	homeDir, err := os.UserHomeDir()
+// GetSSHKeyForInstance returns the SSH key file for a given instance ID
+func GetSSHKeyForInstance(instanceID string) (string, error) {
+	config, err := LoadConfig()
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to load config: %w", err)
 	}
-	configPath := filepath.Join(homeDir, ".gotoni", "config.yaml")
 
-	data, err := os.ReadFile(configPath)
+	sshKeyName, exists := config.Instances[instanceID]
+	if !exists {
+		return "", fmt.Errorf("no SSH key mapping found for instance: %s", instanceID)
+	}
+
+	sshKeyFile, exists := config.SSHKeys[sshKeyName]
+	if !exists {
+		return "", fmt.Errorf("SSH key file not found for key: %s", sshKeyName)
+	}
+
+	return sshKeyFile, nil
+}
+
+// RemoveInstanceFromConfig removes an instance from the config
+func RemoveInstanceFromConfig(instanceID string) error {
+	config, err := LoadConfig()
 	if err != nil {
-		return "", fmt.Errorf("failed to read config file: %w", err)
+		return fmt.Errorf("failed to load config: %w", err)
 	}
 
-	// Parse the first non-comment, non-empty line as the SSH key name
-	lines := strings.Split(string(data), "\n")
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		return line, nil
-	}
+	delete(config.Instances, instanceID)
 
-	return "", fmt.Errorf("no SSH key name found in config file")
+	return SaveConfig(config)
 }
 
 func ListRunningInstances(httpClient *http.Client, apiToken string) ([]RunningInstance, error) {
@@ -422,7 +513,7 @@ func createSSHKey(httpClient *http.Client, apiToken string, name string) (*Gener
 	return &apiResponse.Data, nil
 }
 
-// CreateSSHKeyForProject creates a new SSH key and saves it in the project root
+// CreateSSHKeyForProject creates a new SSH key and saves it in the ssh directory
 func CreateSSHKeyForProject(httpClient *http.Client, apiToken string) (string, string, error) {
 	// Create unique key name with timestamp
 	timestamp := time.Now().Unix()
@@ -434,8 +525,14 @@ func CreateSSHKeyForProject(httpClient *http.Client, apiToken string) (string, s
 		return "", "", fmt.Errorf("failed to create SSH key: %w", err)
 	}
 
-	// Save the private key in project root
-	privateKeyFile := keyName + ".pem"
+	// Create ssh directory if it doesn't exist
+	sshDir := "ssh"
+	if err := os.MkdirAll(sshDir, 0755); err != nil {
+		return "", "", fmt.Errorf("failed to create ssh directory: %w", err)
+	}
+
+	// Save the private key in ssh directory
+	privateKeyFile := filepath.Join(sshDir, keyName+".pem")
 	err = os.WriteFile(privateKeyFile, []byte(generatedKey.PrivateKey), 0600)
 	if err != nil {
 		return "", "", fmt.Errorf("failed to save private key: %w", err)

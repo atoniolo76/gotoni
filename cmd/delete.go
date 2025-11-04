@@ -4,6 +4,7 @@ Copyright © 2025 ALESSIO TONIOLO
 package cmd
 
 import (
+	"crypto/tls"
 	"fmt"
 	"log"
 	"net/http"
@@ -54,14 +55,26 @@ var deleteCmd = &cobra.Command{
 			log.Fatal("No instance IDs provided. Use 'gotoni delete <instance-id>' or 'gotoni delete --instance-ids <id1,id2>'")
 		}
 
-		// Create HTTP client
-		httpClient := &http.Client{Timeout: time.Duration(30) * time.Second}
+		// Create HTTP client with TLS skip verify for testing
+		httpClient := &http.Client{
+			Timeout: time.Duration(30) * time.Second,
+			Transport: &http.Transport{
+				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			},
+		}
 
 		fmt.Printf("Terminating instance(s): %s\n", strings.Join(instanceIDs, ", "))
 
 		terminatedResponse, err := client.TerminateInstance(httpClient, apiToken, instanceIDs)
 		if err != nil {
 			log.Fatalf("Error terminating instance: %v", err)
+		}
+
+		// Remove terminated instances from config
+		for _, instance := range terminatedResponse.TerminatedInstances {
+			if err := client.RemoveInstanceFromConfig(instance.ID); err != nil {
+				log.Printf("Warning: failed to remove instance %s from config: %v", instance.ID, err)
+			}
 		}
 
 		fmt.Printf("Successfully terminated %d instance(s):\n", len(terminatedResponse.TerminatedInstances))
