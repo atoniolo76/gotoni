@@ -4,6 +4,7 @@ Copyright © 2025 ALESSIO TONIOLO
 package cmd
 
 import (
+	"crypto/tls"
 	"fmt"
 	"log"
 	"net/http"
@@ -44,8 +45,13 @@ var launchCmd = &cobra.Command{
 			}
 		}
 
-		// Create HTTP client
-		httpClient := &http.Client{Timeout: time.Duration(30) * time.Second}
+		// Create HTTP client with TLS skip verify for testing
+		httpClient := &http.Client{
+			Timeout: time.Duration(30) * time.Second,
+			Transport: &http.Transport{
+				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			},
+		}
 
 		// Launch the instance (this creates SSH key and saves to config)
 		launchedInstances, err := client.LaunchInstance(httpClient, apiToken, instanceType, region, 1, "cli-launch")
