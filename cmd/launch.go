@@ -47,14 +47,8 @@ var launchCmd = &cobra.Command{
 		// Create HTTP client
 		httpClient := &http.Client{Timeout: time.Duration(30) * time.Second}
 
-		// Create a new SSH key for programmatic access
-		sshKeyName, sshKeyFile, err := client.CreateSSHKeyForProject(httpClient, apiToken)
-		if err != nil {
-			log.Fatalf("Error creating SSH key: %v", err)
-		}
-
-		// Launch the instance
-		launchedInstances, err := client.LaunchInstance(httpClient, apiToken, instanceType, region, []string{sshKeyName}, []string{sshKeyFile}, 1, "cli-launch")
+		// Launch the instance (this creates SSH key and saves to config)
+		launchedInstances, err := client.LaunchInstance(httpClient, apiToken, instanceType, region, 1, "cli-launch")
 		if err != nil {
 			log.Fatalf("Error launching instance: %v", err)
 		}
@@ -64,7 +58,8 @@ var launchCmd = &cobra.Command{
 			fmt.Printf("Launched instance: %s\n", instance.ID)
 			fmt.Printf("SSH Key: %s\n", instance.SSHKeyName)
 			fmt.Printf("SSH Key File: %s\n", instance.SSHKeyFile)
-			fmt.Printf("Connect with: ssh -i %s ubuntu@<instance-ip>\n\n", instance.SSHKeyFile)
+			fmt.Printf("Connect with: ssh -i %s ubuntu@<instance-ip>\n", instance.SSHKeyFile)
+			fmt.Printf("Or use: gotoni connect <instance-ip>\n\n")
 		}
 	},
 }
@@ -94,6 +89,7 @@ func init() {
 	launchCmd.Flags().StringP("instance-type", "t", "", `choose the instance type to launch. Options:
 `+strings.Join(instanceOptions, "\n")+`
 	`)
+
 	launchCmd.MarkFlagRequired("instance-type")
 	launchCmd.MarkFlagRequired("region")
 }
