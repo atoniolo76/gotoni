@@ -71,9 +71,13 @@ var deleteCmd = &cobra.Command{
 		}
 
 		// Remove terminated instances from config
-		for _, instance := range terminatedResponse.TerminatedInstances {
-			if err := client.RemoveInstanceFromConfig(instance.ID); err != nil {
-				log.Printf("Warning: failed to remove instance %s from config: %v", instance.ID, err)
+		// Remove all requested instance IDs, not just the ones in the response
+		// (in case some were already terminated or not returned by API)
+		for _, instanceID := range instanceIDs {
+			if err := client.RemoveInstanceFromConfig(instanceID); err != nil {
+				log.Printf("Warning: failed to remove instance %s from config: %v", instanceID, err)
+			} else {
+				fmt.Printf("Removed instance %s from config\n", instanceID)
 			}
 		}
 
