@@ -56,3 +56,7 @@ gotoni
 
 # Config files with sensitive data
 .gotoni/config.yaml
+
+# Image files
+*.jpg
+*.jpeg
