@@ -53,3 +53,6 @@ id_ed25519.pub
 
 # Go binaries
 gotoni
+
+# Config files with sensitive data
+.gotoni/config.yaml
