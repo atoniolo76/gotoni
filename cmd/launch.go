@@ -54,7 +54,7 @@ var launchCmd = &cobra.Command{
 		}
 
 		// Launch the instance (this creates SSH key and saves to config)
-		launchedInstances, err := client.LaunchInstance(httpClient, apiToken, instanceType, region, 1, "cli-launch")
+		launchedInstances, err := client.LaunchInstance(httpClient, apiToken, instanceType, region, 1, "cli-launch", "")
 		if err != nil {
 			log.Fatalf("Error launching instance: %v", err)
 		}
