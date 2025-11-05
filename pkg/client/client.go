@@ -142,8 +142,22 @@ var MatchingInstanceTypes = map[string]string{
 
 // Config represents the application configuration
 type Config struct {
+	APIKey    string            `yaml:"api_key,omitempty"`   // Lambda Cloud API key
 	Instances map[string]string `yaml:"instances,omitempty"` // instance-id -> ssh-key-name
 	SSHKeys   map[string]string `yaml:"ssh_keys,omitempty"`  // ssh-key-name -> private-key-file
+	Tasks     []Task            `yaml:"tasks,omitempty"`     // tasks/playbooks to run
+}
+
+// Task represents a task or playbook step
+type Task struct {
+	Name       string            `yaml:"name"`                  // Task name/description
+	Type       string            `yaml:"type"`                  // "command" or "service"
+	Command    string            `yaml:"command,omitempty"`     // Shell command to run
+	Background bool              `yaml:"background,omitempty"`  // Run in background (for services)
+	WorkingDir string            `yaml:"working_dir,omitempty"` // Working directory for command
+	Env        map[string]string `yaml:"env,omitempty"`         // Environment variables
+	DependsOn  []string          `yaml:"depends_on,omitempty"`  // Task dependencies (by name)
+	When       string            `yaml:"when,omitempty"`        // Condition to run (e.g., "instance_type == 'gpu_1x_a100_sxm4'")
 }
 
 // DefaultConfig returns an empty config
@@ -702,4 +716,191 @@ func GetAvailableInstanceTypes(httpClient *http.Client, apiToken string) ([]Inst
 	}
 
 	return instances, nil
+}
+
+// ExecuteTask executes a single task on a remote instance
+func ExecuteTask(manager *SSHClientManager, instanceIP string, task Task, completedTasks map[string]bool) error {
+	// Check dependencies
+	for _, dep := range task.DependsOn {
+		if !completedTasks[dep] {
+			return fmt.Errorf("task %s depends on %s which hasn't been completed", task.Name, dep)
+		}
+	}
+
+	fmt.Printf("Executing task: %s (type: %s)\n", task.Name, task.Type)
+
+	var cmd string
+
+	switch task.Type {
+	case "command":
+		// Build command with environment variables and working directory
+		if len(task.Env) > 0 {
+			envVars := []string{}
+			for k, v := range task.Env {
+				envVars = append(envVars, fmt.Sprintf("%s=%s", k, v))
+			}
+			cmd = fmt.Sprintf("%s %s", strings.Join(envVars, " "), task.Command)
+		} else {
+			cmd = task.Command
+		}
+
+		if task.WorkingDir != "" {
+			cmd = fmt.Sprintf("cd %s && %s", task.WorkingDir, cmd)
+		}
+
+		if task.Background {
+			// Run in background using tmux
+			tmuxSessionName := strings.ReplaceAll(task.Name, " ", "_")
+			// Check if tmux session already exists, kill it if so
+			checkCmd := fmt.Sprintf("tmux has-session -t %s 2>/dev/null && tmux kill-session -t %s || true", tmuxSessionName, tmuxSessionName)
+			manager.ExecuteCommand(instanceIP, checkCmd)
+			// Start new tmux session with the command
+			cmd = fmt.Sprintf("tmux new-session -d -s %s bash -c %s", tmuxSessionName, fmt.Sprintf("%q", cmd))
+			output, err := manager.ExecuteCommand(instanceIP, cmd)
+			if err != nil {
+				return fmt.Errorf("task %s failed to start in background: %w\nOutput: %s", task.Name, err, output)
+			}
+			fmt.Printf("Task %s started in background (tmux session: %s)\n", task.Name, tmuxSessionName)
+			return nil
+		}
+
+		output, err := manager.ExecuteCommand(instanceIP, cmd)
+		if err != nil {
+			return fmt.Errorf("task %s failed: %w\nOutput: %s", task.Name, err, output)
+		}
+		fmt.Printf("Task %s completed. Output:\n%s\n", task.Name, output)
+
+	case "service":
+		// Service is like command but always runs in background using tmux
+		if task.Command == "" {
+			return fmt.Errorf("task %s: service requires command", task.Name)
+		}
+		cmd = task.Command
+		if len(task.Env) > 0 {
+			envVars := []string{}
+			for k, v := range task.Env {
+				envVars = append(envVars, fmt.Sprintf("%s=%s", k, v))
+			}
+			cmd = fmt.Sprintf("%s %s", strings.Join(envVars, " "), cmd)
+		}
+		if task.WorkingDir != "" {
+			cmd = fmt.Sprintf("cd %s && %s", task.WorkingDir, cmd)
+		}
+		// Use tmux to run service in background
+		tmuxSessionName := strings.ReplaceAll(task.Name, " ", "_")
+		// Check if tmux session already exists, kill it if so
+		checkCmd := fmt.Sprintf("tmux has-session -t %s 2>/dev/null && tmux kill-session -t %s || true", tmuxSessionName, tmuxSessionName)
+		manager.ExecuteCommand(instanceIP, checkCmd)
+		// Start new tmux session with the service
+		// Use printf with %q to properly escape the command
+		tmuxCmd := fmt.Sprintf("tmux new-session -d -s %s bash -c %s", tmuxSessionName, fmt.Sprintf("%q", cmd))
+		output, err := manager.ExecuteCommand(instanceIP, tmuxCmd)
+		if err != nil {
+			return fmt.Errorf("task %s failed to start service: %w\nOutput: %s", task.Name, err, output)
+		}
+		fmt.Printf("Task %s started as service in tmux session '%s'\n", task.Name, tmuxSessionName)
+
+	default:
+		return fmt.Errorf("unknown task type: %s (must be 'command' or 'service')", task.Type)
+	}
+
+	return nil
+}
+
+// ExecuteTasks executes all tasks in order, respecting dependencies
+func ExecuteTasks(manager *SSHClientManager, instanceIP string, tasks []Task) error {
+	completedTasks := make(map[string]bool)
+	taskMap := make(map[string]Task)
+
+	// Build task map
+	for _, task := range tasks {
+		taskMap[task.Name] = task
+	}
+
+	// Execute tasks respecting dependencies
+	remaining := make(map[string]bool)
+	for _, task := range tasks {
+		remaining[task.Name] = true
+	}
+
+	for len(remaining) > 0 {
+		progressMade := false
+		for name := range remaining {
+			task := taskMap[name]
+			canRun := true
+			for _, dep := range task.DependsOn {
+				if !completedTasks[dep] {
+					canRun = false
+					break
+				}
+			}
+			if canRun {
+				err := ExecuteTask(manager, instanceIP, task, completedTasks)
+				if err != nil {
+					return err
+				}
+				completedTasks[task.Name] = true
+				delete(remaining, task.Name)
+				progressMade = true
+			}
+		}
+		if !progressMade {
+			return fmt.Errorf("circular dependency or missing dependency detected in tasks")
+		}
+	}
+
+	return nil
+}
+
+// FilterTasksByType filters tasks by their type
+func FilterTasksByType(tasks []Task, taskType string) []Task {
+	var filtered []Task
+	for _, task := range tasks {
+		if task.Type == taskType {
+			filtered = append(filtered, task)
+		}
+	}
+	return filtered
+}
+
+// GetAPIToken returns the API token from config, environment, or empty string
+func GetAPIToken() string {
+	config, err := LoadConfig()
+	if err == nil && config.APIKey != "" {
+		return config.APIKey
+	}
+	return os.Getenv("LAMBDA_API_KEY")
+}
+
+// ListTmuxSessions lists all tmux sessions on a remote instance
+func (scm *SSHClientManager) ListTmuxSessions(instanceIP string) ([]string, error) {
+	output, err := scm.ExecuteCommand(instanceIP, "tmux ls -F '#{session_name}' 2>/dev/null || echo ''")
+	if err != nil {
+		return nil, err
+	}
+
+	sessions := []string{}
+	if output != "" {
+		lines := strings.Split(strings.TrimSpace(output), "\n")
+		for _, line := range lines {
+			if line != "" {
+				sessions = append(sessions, strings.TrimSpace(line))
+			}
+		}
+	}
+	return sessions, nil
+}
+
+// GetTmuxLogs gets the output/logs from a tmux session
+func (scm *SSHClientManager) GetTmuxLogs(instanceIP string, sessionName string, lines int) (string, error) {
+	if lines <= 0 {
+		lines = 100 // Default to last 100 lines
+	}
+	cmd := fmt.Sprintf("tmux capture-pane -t %s -p -S -%d 2>/dev/null || echo 'Session not found or no output'", sessionName, lines)
+	return scm.ExecuteCommand(instanceIP, cmd)
+}
+
+// AttachToTmuxSession attaches to a tmux session (returns command to run)
+func AttachToTmuxSessionCommand(instanceIP string, sessionName string, sshKeyFile string) string {
+	return fmt.Sprintf("ssh -i %s -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ubuntu@%s -t 'tmux attach -t %s'", sshKeyFile, instanceIP, sessionName)
 }
