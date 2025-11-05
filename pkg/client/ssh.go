@@ -68,6 +68,10 @@ func (scm *SSHClientManager) ConnectToInstance(instanceIP string, keyFile string
 }
 
 func (scm *SSHClientManager) ExecuteCommand(instanceIP string, command string) (string, error) {
+	return scm.ExecuteCommandWithTimeout(instanceIP, command, 30*time.Minute)
+}
+
+func (scm *SSHClientManager) ExecuteCommandWithTimeout(instanceIP string, command string, timeout time.Duration) (string, error) {
 	scm.mu.RLock()
 	client, exists := scm.clients[instanceIP]
 	scm.mu.RUnlock()
@@ -90,12 +94,12 @@ func (scm *SSHClientManager) ExecuteCommand(instanceIP string, command string) (
 		return "", fmt.Errorf("timeout sending command to %s", instanceIP)
 	}
 
-	// Wait for result with timeout
+	// Wait for result with configurable timeout
 	select {
 	case result := <-resultChan:
 		return result.Output, result.Error
-	case <-time.After(30 * time.Second):
-		return "", fmt.Errorf("timeout waiting for result from %s", instanceIP)
+	case <-time.After(timeout):
+		return "", fmt.Errorf("timeout waiting for result from %s (timeout: %v)", instanceIP, timeout)
 	}
 }
 
@@ -146,6 +150,8 @@ func (sc *SSHClient) executeCommand(cmd *SSHCommand) {
 	}
 	defer session.Close()
 
+	// Set a very long timeout for the session itself (for long-running commands)
+	// The actual timeout is enforced by ExecuteCommandWithTimeout
 	output, err := session.CombinedOutput(cmd.Command)
 	cmd.Result <- &SSHResult{
 		Output: string(output),
