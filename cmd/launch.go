@@ -37,6 +37,16 @@ var launchCmd = &cobra.Command{
 			log.Fatalf("Error getting API token: %v", err)
 		}
 
+		wait, err := cmd.Flags().GetBool("wait")
+		if err != nil {
+			log.Fatalf("Error getting wait flag: %v", err)
+		}
+
+		waitTimeout, err := cmd.Flags().GetDuration("wait-timeout")
+		if err != nil {
+			log.Fatalf("Error getting wait timeout: %v", err)
+		}
+
 		// If API token not provided via flag, get from environment
 		if apiToken == "" {
 			apiToken = os.Getenv("LAMBDA_API_KEY")
@@ -53,10 +63,19 @@ var launchCmd = &cobra.Command{
 			},
 		}
 
-		// Launch the instance (this creates SSH key and saves to config)
-		launchedInstances, err := client.LaunchInstance(httpClient, apiToken, instanceType, region, 1, "cli-launch", "")
-		if err != nil {
-			log.Fatalf("Error launching instance: %v", err)
+		var launchedInstances []client.LaunchedInstance
+		var launchErr error
+
+		if wait {
+			// Launch and wait for instances to be ready
+			launchedInstances, launchErr = client.LaunchAndWait(httpClient, apiToken, instanceType, region, 1, "cli-launch", "", waitTimeout)
+		} else {
+			// Launch the instance (this creates SSH key and saves to config)
+			launchedInstances, launchErr = client.LaunchInstance(httpClient, apiToken, instanceType, region, 1, "cli-launch", "")
+		}
+
+		if launchErr != nil {
+			log.Fatalf("Error launching instance: %v", launchErr)
 		}
 
 		// Print instance info with SSH access details
@@ -95,6 +114,10 @@ func init() {
 	launchCmd.Flags().StringP("instance-type", "t", "", `choose the instance type to launch. Options:
 `+strings.Join(instanceOptions, "\n")+`
 	`)
+
+	launchCmd.Flags().BoolP("wait", "w", false, "Wait for instance to become ready before returning")
+
+	launchCmd.Flags().DurationP("wait-timeout", "", 10*time.Minute, "Timeout for waiting for instance to become ready")
 
 	launchCmd.MarkFlagRequired("instance-type")
 	launchCmd.MarkFlagRequired("region")

@@ -323,6 +323,114 @@ func LaunchInstance(
 	return instances, nil
 }
 
+// WaitForInstanceReady waits for an instance to become active
+func WaitForInstanceReady(httpClient *http.Client, apiToken, instanceID string, timeout time.Duration) error {
+	if timeout == 0 {
+		timeout = 10 * time.Minute // Default timeout
+	}
+
+	ticker := time.NewTicker(10 * time.Second) // Check every 10 seconds
+	defer ticker.Stop()
+
+	timeoutChan := time.After(timeout)
+
+	for {
+		select {
+		case <-timeoutChan:
+			return fmt.Errorf("timeout waiting for instance %s to become ready", instanceID)
+
+		case <-ticker.C:
+			instance, err := GetInstance(httpClient, apiToken, instanceID)
+			if err != nil {
+				return fmt.Errorf("failed to get instance status: %w", err)
+			}
+
+			switch instance.Status {
+			case "active":
+				return nil // Instance is ready!
+			case "terminated", "terminating":
+				return fmt.Errorf("instance %s terminated during startup", instanceID)
+			case "unhealthy":
+				return fmt.Errorf("instance %s became unhealthy", instanceID)
+			case "preempted":
+				return fmt.Errorf("instance %s was preempted", instanceID)
+			case "booting":
+				// Still booting, continue waiting
+				continue
+			default:
+				return fmt.Errorf("unknown instance status: %s", instance.Status)
+			}
+		}
+	}
+}
+
+// GetInstance retrieves details for a specific instance
+func GetInstance(httpClient *http.Client, apiToken, instanceID string) (*RunningInstance, error) {
+	url := fmt.Sprintf("https://cloud.lambda.ai/api/v1/instances/%s", instanceID)
+
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", apiToken))
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to execute request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	var apiResponse struct {
+		Data RunningInstance `json:"data"`
+	}
+
+	err = json.Unmarshal(body, &apiResponse)
+	if err != nil {
+		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
+	}
+
+	return &apiResponse.Data, nil
+}
+
+// LaunchAndWait launches instances and waits for them to be ready
+func LaunchAndWait(
+	httpClient *http.Client,
+	apiToken string,
+	instanceType string,
+	region string,
+	quantity int,
+	name string,
+	sshKeyName string,
+	timeout time.Duration,
+) ([]LaunchedInstance, error) {
+	// Launch the instances
+	instances, err := LaunchInstance(httpClient, apiToken, instanceType, region, quantity, name, sshKeyName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to launch instances: %w", err)
+	}
+
+	// Wait for each instance to become ready
+	for _, instance := range instances {
+		fmt.Printf("Waiting for instance %s to become ready...\n", instance.ID)
+		if err := WaitForInstanceReady(httpClient, apiToken, instance.ID, timeout); err != nil {
+			return nil, fmt.Errorf("instance %s failed to become ready: %w", instance.ID, err)
+		}
+		fmt.Printf("Instance %s is now ready!\n", instance.ID)
+	}
+
+	return instances, nil
+}
+
 // ConnectToInstance connects to a remote instance via SSH using the key from config
 func ConnectToInstance(instanceIP string) error {
 	// Load config
