@@ -1,5 +1,4 @@
 instances:
     25fcd7d752a746d389629f6a2e98e6c0: lambda-key-1762234839
-    d8032d6003ff4c31a2fde2c73f85905e: lambda-key-1762234839
 ssh_keys:
     lambda-key-1762234839: ssh/lambda-key-1762234839.pem
