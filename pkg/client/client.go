@@ -1,9 +1,7 @@
 package client
 
 import (
-	"crypto/x509"
 	"encoding/json"
-	"encoding/pem"
 	"fmt"
 	"io"
 	"net/http"
@@ -14,7 +12,6 @@ import (
 	"strings"
 	"time"
 
-	"golang.org/x/crypto/ssh"
 	"gopkg.in/yaml.v3"
 )
 
@@ -99,12 +96,6 @@ type GeneratedSSHKey struct {
 	Name       string `json:"name"`
 	PublicKey  string `json:"public_key"`
 	PrivateKey string `json:"private_key"`
-}
-
-type SSHKey struct {
-	ID        string `json:"id"`
-	Name      string `json:"name"`
-	PublicKey string `json:"public_key"`
 }
 
 var minCudaVersions = map[string]float64{
@@ -214,7 +205,7 @@ func SaveConfig(config *Config) error {
 	return nil
 }
 
-// LaunchInstance creates a new SSH key (or uses provided public key), saves it to config, and launches an instance
+// LaunchInstance creates a new SSH key (or uses provided existing key), saves it to config, and launches an instance
 func LaunchInstance(
 	httpClient *http.Client,
 	apiToken string,
@@ -222,7 +213,7 @@ func LaunchInstance(
 	region string,
 	quantity int,
 	name string,
-	publicKey string, // optional: if provided, upload this key instead of generating new one
+	sshKeyName string, // optional: if provided, use this existing SSH key name instead of generating new one
 ) ([]LaunchedInstance, error) {
 	if quantity <= 0 {
 		quantity = 1 // Default to 1
@@ -231,18 +222,20 @@ func LaunchInstance(
 		name = "default"
 	}
 
-	var sshKeyName, sshKeyFile string
+	var finalSSHKeyName, sshKeyFile string
 	var err error
 
-	if publicKey != "" {
-		// Upload the provided public key
-		sshKeyName, sshKeyFile, err = UploadSSHKey(httpClient, apiToken, publicKey)
-		if err != nil {
-			return nil, fmt.Errorf("failed to upload SSH key: %w", err)
+	if sshKeyName != "" {
+		// Use the provided existing SSH key name
+		finalSSHKeyName = sshKeyName
+		sshKeyFile = filepath.Join("ssh", sshKeyName+".pem")
+		// Check if the private key file exists
+		if _, err := os.Stat(sshKeyFile); os.IsNotExist(err) {
+			return nil, fmt.Errorf("private key file %s does not exist for SSH key %s", sshKeyFile, sshKeyName)
 		}
 	} else {
 		// Create a new SSH key for this instance
-		sshKeyName, sshKeyFile, err = CreateSSHKeyForProject(httpClient, apiToken)
+		finalSSHKeyName, sshKeyFile, err = CreateSSHKeyForProject(httpClient, apiToken)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create SSH key: %w", err)
 		}
@@ -255,7 +248,7 @@ func LaunchInstance(
 	}
 
 	// Save SSH key info to config
-	config.SSHKeys[sshKeyName] = sshKeyFile
+	config.SSHKeys[finalSSHKeyName] = sshKeyFile
 
 	// Save config
 	if err := SaveConfig(config); err != nil {
@@ -265,7 +258,7 @@ func LaunchInstance(
 	requestBody := InstanceLaunchRequest{
 		RegionName:       region,
 		InstanceTypeName: instanceType,
-		SSHKeyNames:      []string{sshKeyName},
+		SSHKeyNames:      []string{finalSSHKeyName},
 		Quantity:         quantity,
 		Name:             name,
 	}
@@ -314,12 +307,12 @@ func LaunchInstance(
 	for i, instanceID := range apiResponse.Data.InstanceIDs {
 		instances[i] = LaunchedInstance{
 			ID:         instanceID,
-			SSHKeyName: sshKeyName,
+			SSHKeyName: finalSSHKeyName,
 			SSHKeyFile: sshKeyFile,
 		}
 
 		// Save instance -> SSH key mapping
-		config.Instances[instanceID] = sshKeyName
+		config.Instances[instanceID] = finalSSHKeyName
 	}
 
 	// Save updated config with instance mappings
@@ -562,116 +555,6 @@ func CreateSSHKeyForProject(httpClient *http.Client, apiToken string) (string, s
 	fmt.Printf("Created new SSH key '%s' and saved private key to %s\n", keyName, privateKeyFile)
 	fmt.Printf("Use: ssh -i %s ubuntu@<instance-ip>\n", privateKeyFile)
 	return generatedKey.Name, privateKeyFile, nil
-}
-
-// UploadSSHKey uploads an existing public key to Lambda and saves the private key locally
-func UploadSSHKey(httpClient *http.Client, apiToken string, publicKey string) (string, string, error) {
-	// Create unique key name with timestamp
-	timestamp := time.Now().Unix()
-	keyName := "lambda-key-" + strconv.FormatInt(timestamp, 10)
-
-	// Upload the SSH key
-	uploadedKey, err := uploadSSHKey(httpClient, apiToken, keyName, publicKey)
-	if err != nil {
-		return "", "", fmt.Errorf("failed to upload SSH key: %w", err)
-	}
-
-	// Create ssh directory if it doesn't exist
-	sshDir := "ssh"
-	if err := os.MkdirAll(sshDir, 0755); err != nil {
-		return "", "", fmt.Errorf("failed to create ssh directory: %w", err)
-	}
-
-	// For uploaded keys, we need to save the private key that corresponds to the public key
-	// This assumes the private key is managed externally and we just need to reference it
-	privateKeyFile := filepath.Join(sshDir, keyName+".pem")
-
-	// If the private key file already exists, use it; otherwise, this is an error
-	if _, err := os.Stat(privateKeyFile); os.IsNotExist(err) {
-		return "", "", fmt.Errorf("private key file %s does not exist for uploaded key", privateKeyFile)
-	}
-
-	fmt.Printf("Uploaded SSH key '%s' to Lambda Cloud\n", keyName)
-	fmt.Printf("Using existing private key file: %s\n", privateKeyFile)
-	return uploadedKey.Name, privateKeyFile, nil
-}
-
-// uploadSSHKey uploads a public key to Lambda Cloud
-func uploadSSHKey(httpClient *http.Client, apiToken string, name string, publicKey string) (*SSHKey, error) {
-	requestBody := map[string]string{
-		"name":       name,
-		"public_key": publicKey,
-	}
-
-	jsonBody, err := json.Marshal(requestBody)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal request body: %w", err)
-	}
-
-	req, err := http.NewRequest("POST", "https://cloud.lambda.ai/api/v1/ssh-keys", strings.NewReader(string(jsonBody)))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-
-	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", apiToken))
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to execute request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read response body: %w", err)
-	}
-
-	var apiResponse struct {
-		Data SSHKey `json:"data"`
-	}
-
-	err = json.Unmarshal(body, &apiResponse)
-	if err != nil {
-		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
-	}
-
-	return &apiResponse.Data, nil
-}
-
-// ExtractPublicKeyFromPrivateKey extracts the public key from a private key file
-func ExtractPublicKeyFromPrivateKey(privateKeyPath string) (string, error) {
-	// Read the private key file
-	keyData, err := os.ReadFile(privateKeyPath)
-	if err != nil {
-		return "", fmt.Errorf("failed to read private key file: %w", err)
-	}
-
-	// Decode the PEM block
-	block, _ := pem.Decode(keyData)
-	if block == nil {
-		return "", fmt.Errorf("failed to decode PEM block")
-	}
-
-	// Parse the private key
-	privateKey, err := x509.ParsePKCS1PrivateKey(block.Bytes)
-	if err != nil {
-		return "", fmt.Errorf("failed to parse private key: %w", err)
-	}
-
-	// Extract the public key
-	publicKey, err := ssh.NewPublicKey(&privateKey.PublicKey)
-	if err != nil {
-		return "", fmt.Errorf("failed to create public key: %w", err)
-	}
-
-	// Return the public key in SSH format
-	return string(ssh.MarshalAuthorizedKey(publicKey)), nil
 }
 
 func GetAvailableInstanceTypes(httpClient *http.Client, apiToken string) ([]Instance, error) {
