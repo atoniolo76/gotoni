@@ -104,7 +104,7 @@ Services run in tmux sessions for easy management.`,
 		}
 
 		fmt.Printf("\nAll services started successfully!\n")
-		fmt.Printf("Use 'tmux ls' on the instance to see running services.\n")
+		fmt.Printf("Use 'systemctl --user list-units' or 'gotoni status' to see running services.\n")
 	},
 }
 

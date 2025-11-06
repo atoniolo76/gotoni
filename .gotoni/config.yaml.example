@@ -30,9 +30,14 @@ tasks:
     working_dir: "/home/ubuntu"
     depends_on: ["Install uv"]
   
-  # Service tasks run in background tmux sessions
+  # Service tasks run as systemd user services with auto-restart and logging
   - name: "Start vLLM server"
     type: "service"
     command: "export PATH=\"$HOME/.local/bin:$PATH\" && cd /home/ubuntu && source .venv/bin/activate && vllm serve deepseek-ai/DeepSeek-OCR --logits_processors vllm.model_executor.models.deepseek_ocr:NGramPerReqLogitsProcessor --no-enable-prefix-caching --mm-processor-cache-gb 0 --port 8000"
     working_dir: "/home/ubuntu"
+    # Optional systemd service options:
+    # restart: "always" | "on-failure" | "on-success" | "no" (default: "always")
+    # restart_sec: seconds to wait before restarting (default: 10)
+    # restart: "always"
+    # restart_sec: 10
 

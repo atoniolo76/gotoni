@@ -1,6 +1,7 @@
 package client
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -158,6 +159,9 @@ type Task struct {
 	Env        map[string]string `yaml:"env,omitempty"`         // Environment variables
 	DependsOn  []string          `yaml:"depends_on,omitempty"`  // Task dependencies (by name)
 	When       string            `yaml:"when,omitempty"`        // Condition to run (e.g., "instance_type == 'gpu_1x_a100_sxm4'")
+	// systemd service options (only applies to service type tasks or background commands)
+	Restart    string `yaml:"restart,omitempty"`     // Restart policy: "always", "on-failure", "on-success", "no" (default: "always")
+	RestartSec int    `yaml:"restart_sec,omitempty"` // Seconds to wait before restarting (default: 10)
 }
 
 // DefaultConfig returns an empty config
@@ -749,18 +753,23 @@ func ExecuteTask(manager *SSHClientManager, instanceIP string, task Task, comple
 		}
 
 		if task.Background {
-			// Run in background using tmux
-			tmuxSessionName := strings.ReplaceAll(task.Name, " ", "_")
-			// Check if tmux session already exists, kill it if so
-			checkCmd := fmt.Sprintf("tmux has-session -t %s 2>/dev/null && tmux kill-session -t %s || true", tmuxSessionName, tmuxSessionName)
-			manager.ExecuteCommand(instanceIP, checkCmd)
-			// Start new tmux session with the command
-			cmd = fmt.Sprintf("tmux new-session -d -s %s bash -c %s", tmuxSessionName, fmt.Sprintf("%q", cmd))
-			output, err := manager.ExecuteCommand(instanceIP, cmd)
-			if err != nil {
-				return fmt.Errorf("task %s failed to start in background: %w\nOutput: %s", task.Name, err, output)
+			// Run in background using systemd
+			serviceName := fmt.Sprintf("gotoni-%s", strings.ReplaceAll(task.Name, " ", "_"))
+			// Stop existing service if it exists
+			manager.StopSystemdService(instanceIP, serviceName)
+			// Create systemd service file
+			workingDir := task.WorkingDir
+			if workingDir == "" {
+				workingDir = "/home/ubuntu"
 			}
-			fmt.Printf("Task %s started in background (tmux session: %s)\n", task.Name, tmuxSessionName)
+			if err := manager.CreateSystemdService(instanceIP, serviceName, cmd, workingDir, task.Env, &task); err != nil {
+				return fmt.Errorf("task %s failed to create systemd service: %w", task.Name, err)
+			}
+			// Start the service
+			if err := manager.StartSystemdService(instanceIP, serviceName); err != nil {
+				return fmt.Errorf("task %s failed to start systemd service: %w", task.Name, err)
+			}
+			fmt.Printf("Task %s started in background (systemd service: %s)\n", task.Name, serviceName)
 			return nil
 		}
 
@@ -771,34 +780,31 @@ func ExecuteTask(manager *SSHClientManager, instanceIP string, task Task, comple
 		fmt.Printf("Task %s completed. Output:\n%s\n", task.Name, output)
 
 	case "service":
-		// Service is like command but always runs in background using tmux
+		// Service is like command but always runs in background using systemd
 		if task.Command == "" {
 			return fmt.Errorf("task %s: service requires command", task.Name)
 		}
 		cmd = task.Command
-		if len(task.Env) > 0 {
-			envVars := []string{}
-			for k, v := range task.Env {
-				envVars = append(envVars, fmt.Sprintf("%s=%s", k, v))
-			}
-			cmd = fmt.Sprintf("%s %s", strings.Join(envVars, " "), cmd)
+		// Note: we don't prepend env vars here as they'll be set in the systemd service file
+		// Environment variables are handled via CreateSystemdService
+
+		// Use systemd to run service in background
+		serviceName := fmt.Sprintf("gotoni-%s", strings.ReplaceAll(task.Name, " ", "_"))
+		// Stop existing service if it exists
+		manager.StopSystemdService(instanceIP, serviceName)
+		// Create systemd service file
+		workingDir := task.WorkingDir
+		if workingDir == "" {
+			workingDir = "/home/ubuntu"
 		}
-		if task.WorkingDir != "" {
-			cmd = fmt.Sprintf("cd %s && %s", task.WorkingDir, cmd)
+		if err := manager.CreateSystemdService(instanceIP, serviceName, cmd, workingDir, task.Env, &task); err != nil {
+			return fmt.Errorf("task %s failed to create systemd service: %w", task.Name, err)
 		}
-		// Use tmux to run service in background
-		tmuxSessionName := strings.ReplaceAll(task.Name, " ", "_")
-		// Check if tmux session already exists, kill it if so
-		checkCmd := fmt.Sprintf("tmux has-session -t %s 2>/dev/null && tmux kill-session -t %s || true", tmuxSessionName, tmuxSessionName)
-		manager.ExecuteCommand(instanceIP, checkCmd)
-		// Start new tmux session with the service
-		// Use printf with %q to properly escape the command
-		tmuxCmd := fmt.Sprintf("tmux new-session -d -s %s bash -c %s", tmuxSessionName, fmt.Sprintf("%q", cmd))
-		output, err := manager.ExecuteCommand(instanceIP, tmuxCmd)
-		if err != nil {
-			return fmt.Errorf("task %s failed to start service: %w\nOutput: %s", task.Name, err, output)
+		// Start the service
+		if err := manager.StartSystemdService(instanceIP, serviceName); err != nil {
+			return fmt.Errorf("task %s failed to start systemd service: %w", task.Name, err)
 		}
-		fmt.Printf("Task %s started as service in tmux session '%s'\n", task.Name, tmuxSessionName)
+		fmt.Printf("Task %s started as systemd service '%s'\n", task.Name, serviceName)
 
 	default:
 		return fmt.Errorf("unknown task type: %s (must be 'command' or 'service')", task.Type)
@@ -872,32 +878,160 @@ func GetAPIToken() string {
 	return os.Getenv("LAMBDA_API_KEY")
 }
 
-// ListTmuxSessions lists all tmux sessions on a remote instance
-func (scm *SSHClientManager) ListTmuxSessions(instanceIP string) ([]string, error) {
-	output, err := scm.ExecuteCommand(instanceIP, "tmux ls -F '#{session_name}' 2>/dev/null || echo ''")
+// CreateSystemdService creates a systemd user service file
+func (scm *SSHClientManager) CreateSystemdService(instanceIP string, serviceName string, command string, workingDir string, envVars map[string]string, serviceOpts *Task) error {
+	// Ensure systemd user directory exists
+	serviceDirCmd := "mkdir -p ~/.config/systemd/user"
+	if _, err := scm.ExecuteCommand(instanceIP, serviceDirCmd); err != nil {
+		return fmt.Errorf("failed to create systemd user directory: %w", err)
+	}
+
+	// Build environment variables
+	envVarsStr := ""
+	for k, v := range envVars {
+		// Escape quotes in environment variable values
+		escapedV := strings.ReplaceAll(v, `"`, `\"`)
+		envVarsStr += fmt.Sprintf("Environment=\"%s=%s\"\n", k, escapedV)
+	}
+
+	// Add PATH if not already set
+	if _, hasPath := envVars["PATH"]; !hasPath {
+		envVarsStr += "Environment=\"PATH=/home/ubuntu/.local/bin:/usr/local/bin:/usr/bin:/bin\"\n"
+	}
+
+	// Escape the command for the service file
+	// Since ExecStart needs the full command, we'll use a shell wrapper
+	execStart := fmt.Sprintf("/bin/bash -c %s", fmt.Sprintf("%q", command))
+
+	// Set defaults for service options
+	restart := "always"
+	restartSec := 10
+
+	if serviceOpts != nil {
+		if serviceOpts.Restart != "" {
+			restart = serviceOpts.Restart
+		}
+		if serviceOpts.RestartSec > 0 {
+			restartSec = serviceOpts.RestartSec
+		}
+	}
+
+	// Build service section
+	serviceSection := fmt.Sprintf(`[Service]
+Type=simple
+WorkingDirectory=%s
+%sExecStart=%s
+Restart=%s
+RestartSec=%d
+StandardOutput=journal
+StandardError=journal
+`, workingDir, envVarsStr, execStart, restart, restartSec)
+
+	// Create service file content
+	serviceContent := fmt.Sprintf(`[Unit]
+Description=%s
+After=network.target
+
+%s
+[Install]
+WantedBy=default.target
+`, serviceName, serviceSection)
+
+	// Write service file using base64 encoding for reliable transfer
+	serviceFile := fmt.Sprintf("~/.config/systemd/user/%s.service", serviceName)
+
+	// Base64 encode the content to avoid shell escaping issues
+	encodedContent := base64.StdEncoding.EncodeToString([]byte(serviceContent))
+
+	// Decode and write using base64 -d
+	writeCmd := fmt.Sprintf("echo %s | base64 -d > %s", encodedContent, serviceFile)
+	if _, err := scm.ExecuteCommand(instanceIP, writeCmd); err != nil {
+		return fmt.Errorf("failed to write service file: %w", err)
+	}
+
+	// Reload systemd daemon
+	reloadCmd := "systemctl --user daemon-reload"
+	if _, err := scm.ExecuteCommand(instanceIP, reloadCmd); err != nil {
+		return fmt.Errorf("failed to reload systemd daemon: %w", err)
+	}
+
+	return nil
+}
+
+// StartSystemdService starts a systemd user service
+func (scm *SSHClientManager) StartSystemdService(instanceIP string, serviceName string) error {
+	// Ensure lingering is enabled for user services to persist after logout
+	enableCmd := "loginctl enable-linger $USER 2>/dev/null || true"
+	scm.ExecuteCommand(instanceIP, enableCmd)
+
+	// Start the service
+	startCmd := fmt.Sprintf("systemctl --user start %s.service", serviceName)
+	output, err := scm.ExecuteCommand(instanceIP, startCmd)
+	if err != nil {
+		return fmt.Errorf("failed to start service: %w\nOutput: %s", err, output)
+	}
+	return nil
+}
+
+// StopSystemdService stops a systemd user service
+func (scm *SSHClientManager) StopSystemdService(instanceIP string, serviceName string) error {
+	stopCmd := fmt.Sprintf("systemctl --user stop %s.service 2>/dev/null || true", serviceName)
+	_, err := scm.ExecuteCommand(instanceIP, stopCmd)
+	return err
+}
+
+// ListSystemdServices lists all gotoni-managed systemd services
+func (scm *SSHClientManager) ListSystemdServices(instanceIP string) ([]string, error) {
+	// List all user services and filter for gotoni-managed ones
+	// We'll use a naming convention: gotoni-<service-name>
+	cmd := "systemctl --user list-units --type=service --no-pager --no-legend 2>/dev/null | grep -E 'gotoni-' | awk '{print $1}' | sed 's/\\.service$//' | sed 's/^gotoni-//' || echo ''"
+	output, err := scm.ExecuteCommand(instanceIP, cmd)
 	if err != nil {
 		return nil, err
 	}
 
-	sessions := []string{}
+	services := []string{}
 	if output != "" {
 		lines := strings.Split(strings.TrimSpace(output), "\n")
 		for _, line := range lines {
 			if line != "" {
-				sessions = append(sessions, strings.TrimSpace(line))
+				services = append(services, strings.TrimSpace(line))
 			}
 		}
 	}
-	return sessions, nil
+	return services, nil
+}
+
+// GetSystemdServiceStatus gets the status of a systemd service
+func (scm *SSHClientManager) GetSystemdServiceStatus(instanceIP string, serviceName string) (string, error) {
+	cmd := fmt.Sprintf("systemctl --user is-active gotoni-%s.service 2>&1 || echo 'inactive'", serviceName)
+	status, err := scm.ExecuteCommand(instanceIP, cmd)
+	if err != nil {
+		return "unknown", err
+	}
+	return strings.TrimSpace(status), nil
+}
+
+// GetSystemdLogs gets logs from a systemd service using journalctl
+func (scm *SSHClientManager) GetSystemdLogs(instanceIP string, serviceName string, lines int) (string, error) {
+	if lines <= 0 {
+		lines = 100 // Default to last 100 lines
+	}
+	cmd := fmt.Sprintf("journalctl --user -u gotoni-%s.service -n %d --no-pager 2>&1 || echo 'Service not found or no logs'", serviceName, lines)
+	return scm.ExecuteCommand(instanceIP, cmd)
+}
+
+// Legacy tmux functions (kept for backward compatibility, but deprecated)
+// ListTmuxSessions lists all tmux sessions on a remote instance
+func (scm *SSHClientManager) ListTmuxSessions(instanceIP string) ([]string, error) {
+	// Now delegates to systemd
+	return scm.ListSystemdServices(instanceIP)
 }
 
 // GetTmuxLogs gets the output/logs from a tmux session
 func (scm *SSHClientManager) GetTmuxLogs(instanceIP string, sessionName string, lines int) (string, error) {
-	if lines <= 0 {
-		lines = 100 // Default to last 100 lines
-	}
-	cmd := fmt.Sprintf("tmux capture-pane -t %s -p -S -%d 2>/dev/null || echo 'Session not found or no output'", sessionName, lines)
-	return scm.ExecuteCommand(instanceIP, cmd)
+	// Now delegates to systemd
+	return scm.GetSystemdLogs(instanceIP, sessionName, lines)
 }
 
 // AttachToTmuxSession attaches to a tmux session (returns command to run)
