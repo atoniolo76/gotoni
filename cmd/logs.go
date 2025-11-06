@@ -18,10 +18,10 @@ import (
 
 // logsCmd represents the logs command
 var logsCmd = &cobra.Command{
-	Use:   "logs [instance-id] [session-name]",
-	Short: "View logs from a tmux session/service",
-	Long: `View logs from a tmux session running on a remote instance.
-If session-name is not provided, shows logs from all sessions.`,
+	Use:   "logs [instance-id] [service-name]",
+	Short: "View logs from a systemd service",
+	Long: `View logs from a systemd user service running on a remote instance using journalctl.
+If service-name is not provided, shows logs from all services.`,
 	Run: func(cmd *cobra.Command, args []string) {
 		apiToken, err := cmd.Flags().GetString("api-token")
 		if err != nil {
@@ -48,7 +48,7 @@ If session-name is not provided, shows logs from all sessions.`,
 		var sessionName string
 
 		if len(args) == 0 {
-			log.Fatal("Please provide at least an instance ID. Use 'gotoni logs <instance-id> [session-name]'")
+			log.Fatal("Please provide at least an instance ID. Use 'gotoni logs <instance-id> [service-name]'")
 		} else if len(args) == 1 {
 			instanceID = args[0]
 		} else {
@@ -88,32 +88,32 @@ If session-name is not provided, shows logs from all sessions.`,
 		fmt.Printf("Connected!\n\n")
 
 		if sessionName != "" {
-			// Show logs for specific session
-			logs, err := manager.GetTmuxLogs(instanceDetails.IP, sessionName, lines)
+			// Show logs for specific service
+			logs, err := manager.GetSystemdLogs(instanceDetails.IP, sessionName, lines)
 			if err != nil {
 				log.Fatalf("Failed to get logs: %v", err)
 			}
-			fmt.Printf("=== Logs for session '%s' (last %d lines) ===\n\n", sessionName, lines)
+			fmt.Printf("=== Logs for service '%s' (last %d lines) ===\n\n", sessionName, lines)
 			fmt.Println(logs)
 		} else {
-			// List all sessions and show their logs
-			sessions, err := manager.ListTmuxSessions(instanceDetails.IP)
+			// List all services and show their logs
+			services, err := manager.ListSystemdServices(instanceDetails.IP)
 			if err != nil {
-				log.Fatalf("Failed to list tmux sessions: %v", err)
+				log.Fatalf("Failed to list systemd services: %v", err)
 			}
 
-			if len(sessions) == 0 {
-				fmt.Println("No active tmux sessions found.")
+			if len(services) == 0 {
+				fmt.Println("No active services found.")
 				return
 			}
 
-			for _, session := range sessions {
-				logs, err := manager.GetTmuxLogs(instanceDetails.IP, session, lines)
+			for _, service := range services {
+				logs, err := manager.GetSystemdLogs(instanceDetails.IP, service, lines)
 				if err != nil {
-					fmt.Printf("Error getting logs for %s: %v\n", session, err)
+					fmt.Printf("Error getting logs for %s: %v\n", service, err)
 					continue
 				}
-				fmt.Printf("=== Logs for session '%s' (last %d lines) ===\n\n", session, lines)
+				fmt.Printf("=== Logs for service '%s' (last %d lines) ===\n\n", service, lines)
 				fmt.Println(logs)
 				fmt.Println(strings.Repeat("=", 60))
 				fmt.Println()

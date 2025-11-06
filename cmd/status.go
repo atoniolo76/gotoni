@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"strings"
 	"time"
 
 	"toni/gotoni/pkg/client"
@@ -20,8 +19,8 @@ import (
 var statusCmd = &cobra.Command{
 	Use:   "status [instance-id]",
 	Short: "Check status of services running on an instance",
-	Long: `Check the status of services (tmux sessions) running on a remote instance.
-Shows all active tmux sessions and their status.`,
+	Long: `Check the status of systemd user services running on a remote instance.
+Shows all active services and their status.`,
 	Run: func(cmd *cobra.Command, args []string) {
 		apiToken, err := cmd.Flags().GetString("api-token")
 		if err != nil {
@@ -87,27 +86,29 @@ Shows all active tmux sessions and their status.`,
 		}
 		fmt.Printf("Connected!\n\n")
 
-		// List tmux sessions
-		sessions, err := manager.ListTmuxSessions(instanceDetails.IP)
+		// List systemd services
+		services, err := manager.ListSystemdServices(instanceDetails.IP)
 		if err != nil {
-			log.Fatalf("Failed to list tmux sessions: %v", err)
+			log.Fatalf("Failed to list systemd services: %v", err)
 		}
 
-		if len(sessions) == 0 {
-			fmt.Println("No active tmux sessions found.")
+		if len(services) == 0 {
+			fmt.Println("No active services found.")
 			return
 		}
 
-		fmt.Printf("Active services (tmux sessions):\n\n")
-		for _, session := range sessions {
-			// Check if session is still alive
-			statusCmd := fmt.Sprintf("tmux has-session -t %s 2>/dev/null && echo 'active' || echo 'dead'", session)
-			status, _ := manager.ExecuteCommand(instanceDetails.IP, statusCmd)
-			statusStr := strings.TrimSpace(status)
-			if statusStr == "active" {
-				fmt.Printf("  ✓ %s (active)\n", session)
+		fmt.Printf("Active services (systemd):\n\n")
+		for _, service := range services {
+			// Check service status
+			status, err := manager.GetSystemdServiceStatus(instanceDetails.IP, service)
+			if err != nil {
+				fmt.Printf("  ? %s (unknown)\n", service)
+				continue
+			}
+			if status == "active" {
+				fmt.Printf("  ✓ %s (active)\n", service)
 			} else {
-				fmt.Printf("  ✗ %s (dead)\n", session)
+				fmt.Printf("  ✗ %s (%s)\n", service, status)
 			}
 		}
 		fmt.Println()
