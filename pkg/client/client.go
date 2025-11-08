@@ -99,6 +99,27 @@ type GeneratedSSHKey struct {
 	PrivateKey string `json:"private_key"`
 }
 
+type FirewallRule struct {
+	Protocol      string `json:"protocol"`       // "tcp", "udp", "icmp", or "all"
+	PortRange     []int  `json:"port_range"`     // [min, max] - required for non-icmp protocols
+	SourceNetwork string `json:"source_network"` // CIDR notation, e.g., "0.0.0.0/0"
+	Description   string `json:"description,omitempty"`
+}
+
+type GlobalFirewallRuleset struct {
+	ID    string         `json:"id"`   // Always "global"
+	Name  string         `json:"name"` // Always "Global Firewall Rules"
+	Rules []FirewallRule `json:"rules"`
+}
+
+type GlobalFirewallRulesetResponse struct {
+	Data GlobalFirewallRuleset `json:"data"`
+}
+
+type GlobalFirewallRulesetPatchRequest struct {
+	Rules []FirewallRule `json:"rules"`
+}
+
 var minCudaVersions = map[string]float64{
 	"H100 (80 GB SXM5)":    12.0,
 	"H100 (80 GB PCIe)":    12.0,
@@ -876,6 +897,133 @@ func GetAPIToken() string {
 		return config.APIKey
 	}
 	return os.Getenv("LAMBDA_API_KEY")
+}
+
+// GetGlobalFirewallRules retrieves the current global firewall ruleset
+func GetGlobalFirewallRules(httpClient *http.Client, apiToken string) (*GlobalFirewallRuleset, error) {
+	url := "https://cloud.lambda.ai/api/v1/firewall-rulesets/global"
+
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", apiToken))
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to execute request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	var apiResponse GlobalFirewallRulesetResponse
+	err = json.Unmarshal(body, &apiResponse)
+	if err != nil {
+		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
+	}
+
+	return &apiResponse.Data, nil
+}
+
+// UpdateGlobalFirewallRules updates the global firewall ruleset with new rules
+func UpdateGlobalFirewallRules(httpClient *http.Client, apiToken string, rules []FirewallRule) (*GlobalFirewallRuleset, error) {
+	url := "https://cloud.lambda.ai/api/v1/firewall-rulesets/global"
+
+	patchRequest := GlobalFirewallRulesetPatchRequest{
+		Rules: rules,
+	}
+
+	jsonData, err := json.Marshal(patchRequest)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	req, err := http.NewRequest("PATCH", url, strings.NewReader(string(jsonData)))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", apiToken))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to execute request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	var apiResponse GlobalFirewallRulesetResponse
+	err = json.Unmarshal(body, &apiResponse)
+	if err != nil {
+		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
+	}
+
+	return &apiResponse.Data, nil
+}
+
+// EnsurePortOpen ensures that the specified port is open in the global firewall rules
+// It checks existing rules and adds the port if it doesn't exist
+func EnsurePortOpen(httpClient *http.Client, apiToken string, port int, protocol string, description string) error {
+	// Get current rules
+	currentRuleset, err := GetGlobalFirewallRules(httpClient, apiToken)
+	if err != nil {
+		return fmt.Errorf("failed to get current firewall rules: %w", err)
+	}
+
+	// Check if port is already open
+	portAlreadyOpen := false
+	for _, rule := range currentRuleset.Rules {
+		if rule.Protocol == protocol && len(rule.PortRange) == 2 {
+			if rule.PortRange[0] <= port && port <= rule.PortRange[1] {
+				portAlreadyOpen = true
+				break
+			}
+		}
+	}
+
+	if portAlreadyOpen {
+		// Port is already open, no need to update
+		return nil
+	}
+
+	// Add new rule for the port
+	newRule := FirewallRule{
+		Protocol:      protocol,
+		PortRange:     []int{port, port},
+		SourceNetwork: "0.0.0.0/0",
+		Description:   description,
+	}
+
+	// Merge with existing rules
+	updatedRules := append(currentRuleset.Rules, newRule)
+
+	// Update firewall rules
+	_, err = UpdateGlobalFirewallRules(httpClient, apiToken, updatedRules)
+	if err != nil {
+		return fmt.Errorf("failed to update firewall rules: %w", err)
+	}
+
+	return nil
 }
 
 // CreateSystemdService creates a systemd user service file

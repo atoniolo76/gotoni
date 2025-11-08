@@ -1,4 +1,27 @@
+api_key: secret_gotoni3_10e4a7a9e887403ba956443eb6b85ee6.XosnMaybE3WCDPDB0324pW5fHMA4Jaoy
 instances:
     25fcd7d752a746d389629f6a2e98e6c0: lambda-key-1762234839
 ssh_keys:
     lambda-key-1762234839: ssh/lambda-key-1762234839.pem
+tasks:
+  - name: "Install dependencies"
+    type: "command"
+    command: "sudo apt-get update && sudo apt-get install -y python3-pip curl python3-venv"
+  
+  - name: "Install uv"
+    type: "command"
+    command: "curl -LsSf https://astral.sh/uv/install.sh | sh"
+    depends_on: ["Install dependencies"]
+  
+  - name: "Setup Python environment"
+    type: "command"
+    command: "export PATH=\"$HOME/.local/bin:$PATH\" && uv venv --clear && source .venv/bin/activate && uv pip install torchaudio && uv pip install torchcodec && uv pip install git+https://github.com/MahmoudAshraf97/ctc-forced-aligner.git && uv pip install flask flask-cors"
+    working_dir: "/home/ubuntu"
+    depends_on: ["Install uv"]
+  
+  - name: "Start CTC Alignment server"
+    type: "service"
+    command: "export PATH=\"$HOME/.local/bin:$PATH\" && cd /home/ubuntu && source .venv/bin/activate && PORT=8000 python -c \"\nimport torch\nimport os\nimport json\nimport base64\nimport tempfile\nfrom flask import Flask, request, jsonify\nfrom flask_cors import CORS\nfrom ctc_forced_aligner import (\n    load_audio,\n    load_alignment_model,\n    generate_emissions,\n    preprocess_text,\n    get_alignments,\n    get_spans,\n    postprocess_results,\n)\napp = Flask(__name__)\nCORS(app)\nalignment_model = None\nalignment_tokenizer = None\ndevice = None\ndef initialize_model():\n    global alignment_model, alignment_tokenizer, device\n    if alignment_model is not None:\n        return\n    device = 'cuda' if torch.cuda.is_available() else 'cpu'\n    print(f'Initializing alignment model on {device}...')\n    alignment_model, alignment_tokenizer = load_alignment_model(\n        device,\n        dtype=torch.float16 if device == 'cuda' else torch.float32,\n    )\n    print(f'Model loaded successfully on {device}')\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'healthy', 'device': device or 'not initialized'}), 200\n@app.route('/align', methods=['POST'])\ndef align():\n    global alignment_model, alignment_tokenizer\n    try:\n        if alignment_model is None:\n            initialize_model()\n        data = request.json\n        audio_data = data.get('audio_data')\n        text = data.get('text')\n        language = data.get('language', 'eng')\n        batch_size = int(data.get('batch_size', 16))\n        if not audio_data or not text:\n            return jsonify({'error': 'Missing required fields: audio_data (base64) and text'}), 400\n        audio_bytes = base64.b64decode(audio_data)\n        with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as tmp_audio:\n            tmp_audio.write(audio_bytes)\n            audio_path = tmp_audio.name\n        try:\n            audio_waveform = load_audio(audio_path, alignment_model.dtype, alignment_model.device)\n            tokens_starred, text_starred = preprocess_text(text, romanize=True, language=language)\n            emissions, stride = generate_emissions(alignment_model, audio_waveform, batch_size=batch_size)\n            segments, scores, blank_token = get_alignments(emissions, tokens_starred, alignment_tokenizer)\n            spans = get_spans(tokens_starred, segments, blank_token)\n            word_timestamps = postprocess_results(text_starred, spans, stride, scores)\n            os.unlink(audio_path)\n            return jsonify({'success': True, 'word_timestamps': word_timestamps, 'device': device}), 200\n        except Exception as e:\n            if os.path.exists(audio_path):\n                os.unlink(audio_path)\n            raise e\n    except Exception as e:\n        return jsonify({'error': str(e), 'type': type(e).__name__}), 500\nif __name__ == '__main__':\n    port = int(os.environ.get('PORT', 8000))\n    host = os.environ.get('HOST', '0.0.0.0')\n    print(f'Starting CTC Alignment Server on {host}:{port}')\n    app.run(host=host, port=port, threaded=True)\n\""
+    working_dir: "/home/ubuntu"
+    restart: "always"
+    restart_sec: 10
