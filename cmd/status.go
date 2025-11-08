@@ -67,7 +67,7 @@ Shows all active services and their status.`,
 		}
 
 		if instanceDetails.IP == "" {
-			log.Fatal("Instance IP address is empty")
+			log.Fatalf("Instance IP address is empty. Instance status: %s. The instance may still be booting. Please wait a moment and try again, or check the instance status with 'gotoni list'.", instanceDetails.Status)
 		}
 
 		// Get SSH key

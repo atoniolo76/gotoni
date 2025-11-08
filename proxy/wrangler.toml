@@ -1,0 +1,12 @@
+name = "gotoni-proxy"
+main = "worker.js"
+compatibility_date = "2024-01-01"
+
+# Environment variables
+# Set TARGET_URL in Cloudflare dashboard or uncomment below:
+# [vars]
+# TARGET_URL = "https://your-server-ip:port"
+
+# For production, use secrets instead:
+# wrangler secret put TARGET_URL
+
