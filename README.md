@@ -1,40 +1,86 @@
 # gotoni
-Turn your Neocloud into an inference engine with <100ms cold-starts.
 
-## Usage
+Automate Lambda.ai with Ansible-inspired Go CLI  
 
-Launch an instance (creates SSH key automatically):
+## Motivation
+On-demand GPU instances are powerful for experimenting with new models and hosting your own inference service.
+
+Thankfully, the team at [Lambda.ai](https://lambda.ai) have created an excellent [API](./docs/Lambda%20Cloud%20API%20spec%201.8.3.json) for spinning up instances, managing filesystems, and even replacing inbound firewall rules!
+
+gotoni aims to make this process simple with a cli interface. Since AI coding agents are great at using the terminal, they can now execute remote commands on your GPUs instance without requiring a ssh connection or separate Cursor remote window!
+
+## How it works
+Like [Ansible Automation](https://docs.ansible.com/projects/ansible/latest/playbook_guide/index.html), you can create a "playbook" by adding setup tasks with YAML property `type: command`. Tasks you want to run continuously in the background, like an OpenAI inference server for example, are labeled "service" and managed by systemd. Telemetry is available with the `logs` cmd.
+
+## Installation
+
+Install Go if you don't have it: https://go.dev/dl/
+
+Then install gotoni:
+
 ```bash
-gotoni launch --instance-type gpu_1x_a100_sxm4 --region us-east-1
+go install github.com/atoniolo76/gotoni@latest
 ```
-
-Connect to a running instance:
-```bash
-gotoni connect <instance-ip>
-```
-
-List running instances:
-```bash
-gotoni list --running
-```
-
-Terminate instances:
-```bash
-gotoni delete <instance-id>
-```
-
-## How It Works
-
-1. **Launch**: Creates a new SSH key pair, saves the key to `~/.gotoni/config.yaml`, and launches the instance
-2. **Connect**: Reads the SSH key from config and connects to the specified instance IP
-3. Each launch creates a fresh SSH key for security
 
 ## Setup
 
-Set your Lambda API token:
+Export your [Lambda API key](https://cloud.lambda.ai/api-keys/cloud-api):
+
 ```bash
 export LAMBDA_API_KEY=your_token_here
 ```
 
-The config file `~/.gotoni/config.yaml` is automatically managed - you don't need to create it manually.
+## Commands
 
+- `gotoni launch` - Launch a new instance
+- `gotoni list [--running]` - List instances or instance types
+- `gotoni delete <instance-id>` - Terminate instances
+- `gotoni connect <instance-ip>` - Connect to an instance via SSH
+- `gotoni run [instance-id] <command>` - Run a command on a remote instance
+- `gotoni setup [instance-id]` - Run setup tasks/playbooks
+- `gotoni start [instance-id]` - Start service tasks
+- `gotoni status [instance-id]` - Check status of services
+- `gotoni logs [instance-id] [service-name]` - View service logs
+- `gotoni gpu [instance-id] --log <file.csv>` - Track GPU memory usage
+- `gotoni ssh-keys list` - List SSH keys
+- `gotoni ssh-keys delete <key-id>` - Delete an SSH key
+- `gotoni filesystems list` - List filesystems
+- `gotoni filesystems delete <filesystem-id>` - Delete a filesystem
+
+## Configuration
+
+Configuration is stored in `~/.gotoni/config.yaml` and is automatically managed. The file contains:
+
+- `instances`: Mapping of instance IDs to SSH key names
+- `ssh_keys`: Mapping of SSH key names to private key file paths
+- `filesystems`: Mapping of filesystem names to filesystem info (ID and region)
+- `tasks`: List of tasks to run on instances. Use `depends_on` and a previous task name to enforce successful command execution in order.
+
+Example `config.yaml`:
+
+```yaml
+instances:
+  instance-123: lambda-key-1234567890
+
+ssh_keys:
+  lambda-key-1234567890: ssh/lambda-key-1234567890.pem
+
+filesystems:
+  my-data:
+    id: fs-123
+    region: us-east-1
+
+tasks:
+  - name: "Install dependencies"
+    type: "command"
+    command: "sudo apt-get update"
+  
+  - name: "Start server"
+    type: "service"
+    command: "python app.py"
+    depends_on:
+      - Install dependencies
+```
+
+## Changelog
+- [ ] Create client struct for sdk usage
