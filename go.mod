@@ -1,4 +1,4 @@
-module toni/gotoni
+module github.com/atoniolo76/gotoni
 
 go 1.25.3
 

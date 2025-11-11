@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"toni/gotoni/pkg/client"
+	"github.com/atoniolo76/gotoni/pkg/client"
 
 	"github.com/spf13/cobra"
 )

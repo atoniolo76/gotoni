@@ -5,7 +5,7 @@ package cmd
 
 import (
 	"log"
-	"toni/gotoni/pkg/client"
+	"github.com/atoniolo76/gotoni/pkg/client"
 
 	"github.com/spf13/cobra"
 )
