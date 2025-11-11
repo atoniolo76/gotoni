@@ -3,11 +3,11 @@
 Automate Lambda.ai with Ansible-inspired Go CLI  
 
 ## Motivation
-On-demand GPU instances are powerful for experimenting with new models and hosting your own inference service.
+On-demand GPUs are powerful for experimenting with new models and hosting your own inference.
 
-Thankfully, the team at [Lambda.ai](https://lambda.ai) have created an excellent [API](./docs/Lambda%20Cloud%20API%20spec%201.8.3.json) for spinning up instances, managing filesystems, and even replacing inbound firewall rules!
+Thankfully, the team at [Lambda.ai](https://lambda.ai) have created an excellent [API](./docs/Lambda%20Cloud%20API%20spec%201.8.3.json) for spinning up instances, managing filesystems, and even replacing inbound firewall rules on the fly!
 
-gotoni aims to make this process simple with a cli interface. Since AI coding agents are great at using the terminal, they can now execute remote commands on your GPUs instance without requiring a ssh connection or separate Cursor remote window!
+gotoni aims to make deploying your own infra process simple and automated through a CLI. I prefer this over a GUI or manual YAML configuration because AI agents are quite adept at using the terminal, so managing your infra without even needing a remote SSH window makes things 10x faster!
 
 ## How it works
 Like [Ansible Automation](https://docs.ansible.com/projects/ansible/latest/playbook_guide/index.html), you can create a "playbook" by adding setup tasks with YAML property `type: command`. Tasks you want to run continuously in the background, like an OpenAI inference server for example, are labeled "service" and managed by systemd. Telemetry is available with the `logs` cmd.
