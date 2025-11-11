@@ -20,6 +20,9 @@ Then install gotoni:
 
 ```bash
 go install github.com/atoniolo76/gotoni@latest
+go build -o gotoni
+# usage
+gotoni list
 ```
 
 ## Setup
