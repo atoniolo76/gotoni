@@ -40,7 +40,7 @@ func TestLaunchInstanceWithExistingSSHKey(t *testing.T) {
 
 	sshKeyName := "lambda-key-1762234839" // Matches ssh/lambda-key-1762234839.pem
 
-	launchedInstances, err := LaunchInstance(httpClient, apiToken, "gpu_1x_a10", "us-east-1", 1, "test-launch", sshKeyName)
+	launchedInstances, err := LaunchInstance(httpClient, apiToken, "gpu_1x_a10", "us-east-1", 1, "test-launch", sshKeyName, "")
 	if err != nil {
 		t.Fatalf("Failed to launch instance: %v", err)
 	}
@@ -85,7 +85,7 @@ func TestCTCAlignmentPlaybook(t *testing.T) {
 
 	apiToken := GetAPIToken()
 	if apiToken == "" {
-		t.Fatal("API token not found in config.yaml or LAMBDA_API_KEY environment variable")
+		t.Fatal("API token not found in LAMBDA_API_KEY environment variable")
 	}
 
 	// Ensure port 8000 is open in firewall

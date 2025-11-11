@@ -39,7 +39,7 @@ func TestLaunchInstanceAndRunSSHCommand(t *testing.T) {
 
 	// Launch instance
 	t.Logf("Launching instance...")
-	launchedInstances, err := LaunchInstance(httpClient, apiToken, "gpu_1x_a100_sxm4", "us-east-1", 1, "test-launch", sshKeyName)
+	launchedInstances, err := LaunchInstance(httpClient, apiToken, "gpu_1x_a100_sxm4", "us-east-1", 1, "test-launch", sshKeyName, "")
 	if err != nil {
 		t.Fatalf("Failed to launch instance: %v", err)
 	}

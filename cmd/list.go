@@ -4,12 +4,9 @@ Copyright © 2025 ALESSIO TONIOLO
 package cmd
 
 import (
-	"crypto/tls"
 	"fmt"
 	"log"
-	"net/http"
 	"os"
-	"time"
 	"toni/gotoni/pkg/client"
 
 	"github.com/spf13/cobra"
@@ -31,13 +28,8 @@ var listCmd = &cobra.Command{
 			log.Fatalf("Error getting API token: %v", err)
 		}
 
-		// Create HTTP client with TLS skip verify for testing
-		httpClient := &http.Client{
-			Timeout: time.Duration(30) * time.Second,
-			Transport: &http.Transport{
-				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-			},
-		}
+		// Create HTTP client
+		httpClient := client.NewHTTPClient()
 
 		// If API token not provided via flag, get from environment
 		if apiToken == "" {

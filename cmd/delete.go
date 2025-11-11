@@ -4,13 +4,10 @@ Copyright © 2025 ALESSIO TONIOLO
 package cmd
 
 import (
-	"crypto/tls"
 	"fmt"
 	"log"
-	"net/http"
 	"os"
 	"strings"
-	"time"
 
 	"toni/gotoni/pkg/client"
 
@@ -55,13 +52,8 @@ var deleteCmd = &cobra.Command{
 			log.Fatal("No instance IDs provided. Use 'gotoni delete <instance-id>' or 'gotoni delete --instance-ids <id1,id2>'")
 		}
 
-		// Create HTTP client with TLS skip verify for testing
-		httpClient := &http.Client{
-			Timeout: time.Duration(30) * time.Second,
-			Transport: &http.Transport{
-				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-			},
-		}
+		// Create HTTP client
+		httpClient := client.NewHTTPClient()
 
 		fmt.Printf("Terminating instance(s): %s\n", strings.Join(instanceIDs, ", "))
 

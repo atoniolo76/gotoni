@@ -4,11 +4,9 @@ Copyright © 2025 ALESSIO TONIOLO
 package cmd
 
 import (
-	"crypto/tls"
 	"encoding/csv"
 	"fmt"
 	"log"
-	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -36,7 +34,7 @@ Use the included plot.py script to visualize the CSV data.`,
 		if apiToken == "" {
 			apiToken = client.GetAPIToken()
 			if apiToken == "" {
-				log.Fatal("API token not provided via --api-token flag, config.yaml, or LAMBDA_API_KEY environment variable")
+				log.Fatal("API token not provided via --api-token flag or LAMBDA_API_KEY environment variable")
 			}
 		}
 
@@ -58,10 +56,7 @@ Use the included plot.py script to visualize the CSV data.`,
 		if len(args) > 0 {
 			instanceID = args[0]
 		} else {
-			httpClient := &http.Client{
-				Timeout:   time.Duration(30) * time.Second,
-				Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}},
-			}
+			httpClient := client.NewHTTPClient()
 			runningInstances, err := client.ListRunningInstances(httpClient, apiToken)
 			if err != nil {
 				log.Fatalf("Failed to list running instances: %v", err)
@@ -73,10 +68,7 @@ Use the included plot.py script to visualize the CSV data.`,
 			fmt.Printf("Using instance: %s\n", instanceID)
 		}
 
-		httpClient := &http.Client{
-			Timeout:   time.Duration(30) * time.Second,
-			Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}},
-		}
+		httpClient := client.NewHTTPClient()
 
 		instanceDetails, err := client.GetInstance(httpClient, apiToken, instanceID)
 		if err != nil {
