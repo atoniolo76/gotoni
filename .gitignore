@@ -57,7 +57,41 @@ gotoni
 # Config files with sensitive data
 .gotoni/config.yaml
 config.yaml
+.gotoni/
 
 # Image files
 *.jpg
 *.jpeg
+*.png
+*.gif
+
+# Data files
+*.csv
+*.json
+!go.mod
+!go.sum
+
+# Python files (if any remain)
+*.py
+*.pyc
+__pycache__/
+
+# Audio/video files
+*.wav
+*.mp3
+*.mp4
+
+# Temporary files
+*.tmp
+*.bak
+*.swp
+*~
+
+# Build artifacts
+dist/
+*.exe
+gotoni
+
+# Test coverage
+*.coverprofile
+coverage.html
