@@ -14,15 +14,54 @@ Like [Ansible Automation](https://docs.ansible.com/projects/ansible/latest/playb
 
 ## Installation
 
-Install Go if you don't have it: https://go.dev/dl/
+### Option 1: Download Pre-built Binary (Recommended)
 
-Then install gotoni:
+Download the binary for your platform from the [latest release](https://github.com/atoniolo76/gotoni/releases/latest):
+
+**Linux:**
+```bash
+# For x86_64
+wget https://github.com/atoniolo76/gotoni/releases/latest/download/gotoni-linux-amd64 -O gotoni
+chmod +x gotoni
+sudo mv gotoni /usr/local/bin/
+
+# For ARM64
+wget https://github.com/atoniolo76/gotoni/releases/latest/download/gotoni-linux-arm64 -O gotoni
+chmod +x gotoni
+sudo mv gotoni /usr/local/bin/
+```
+
+**macOS:**
+```bash
+# For Intel Macs
+curl -L https://github.com/atoniolo76/gotoni/releases/latest/download/gotoni-darwin-amd64 -o gotoni
+chmod +x gotoni
+sudo mv gotoni /usr/local/bin/
+
+# For Apple Silicon (M1/M2/M3)
+curl -L https://github.com/atoniolo76/gotoni/releases/latest/download/gotoni-darwin-arm64 -o gotoni
+chmod +x gotoni
+sudo mv gotoni /usr/local/bin/
+```
+
+**Windows:**
+Download `gotoni-windows-amd64.exe` from the releases page and add it to your PATH.
+
+### Option 2: Build from Source
+
+If you have Go installed:
 
 ```bash
 go install github.com/atoniolo76/gotoni@latest
+# Or clone and build:
+git clone https://github.com/atoniolo76/gotoni.git
+cd gotoni
 go build -o gotoni
-# usage
-gotoni list
+```
+
+To build binaries for all platforms, use the included build script:
+```bash
+./build.sh
 ```
 
 ## Setup
