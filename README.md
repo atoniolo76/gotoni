@@ -82,5 +82,5 @@ tasks:
       - Install dependencies
 ```
 
-## Changelog
+## TODO (PRs welcome!)
 - [ ] Create client struct for sdk usage
