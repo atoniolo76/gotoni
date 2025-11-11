@@ -4,10 +4,8 @@ Copyright © 2025 ALESSIO TONIOLO
 package cmd
 
 import (
-	"crypto/tls"
 	"fmt"
 	"log"
-	"net/http"
 	"os"
 	"strings"
 	"time"
@@ -47,6 +45,11 @@ var launchCmd = &cobra.Command{
 			log.Fatalf("Error getting wait timeout: %v", err)
 		}
 
+		filesystemName, err := cmd.Flags().GetString("filesystem")
+		if err != nil {
+			log.Fatalf("Error getting filesystem flag: %v", err)
+		}
+
 		// If API token not provided via flag, get from environment
 		if apiToken == "" {
 			apiToken = os.Getenv("LAMBDA_API_KEY")
@@ -55,12 +58,17 @@ var launchCmd = &cobra.Command{
 			}
 		}
 
-		// Create HTTP client with TLS skip verify for testing
-		httpClient := &http.Client{
-			Timeout: time.Duration(30) * time.Second,
-			Transport: &http.Transport{
-				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-			},
+		// Create HTTP client
+		httpClient := client.NewHTTPClient()
+
+		// Create filesystem if flag is provided
+		if filesystemName != "" {
+			fmt.Printf("Creating filesystem '%s' in region '%s'...\n", filesystemName, region)
+			fs, err := client.CreateFilesystem(httpClient, apiToken, filesystemName, region)
+			if err != nil {
+				log.Fatalf("Error creating filesystem: %v", err)
+			}
+			fmt.Printf("Filesystem '%s' created successfully (ID: %s)\n", fs.Name, fs.ID)
 		}
 
 		var launchedInstances []client.LaunchedInstance
@@ -68,10 +76,10 @@ var launchCmd = &cobra.Command{
 
 		if wait {
 			// Launch and wait for instances to be ready
-			launchedInstances, launchErr = client.LaunchAndWait(httpClient, apiToken, instanceType, region, 1, "cli-launch", "", waitTimeout)
+			launchedInstances, launchErr = client.LaunchAndWait(httpClient, apiToken, instanceType, region, 1, "cli-launch", "", waitTimeout, filesystemName)
 		} else {
 			// Launch the instance (this creates SSH key and saves to config)
-			launchedInstances, launchErr = client.LaunchInstance(httpClient, apiToken, instanceType, region, 1, "cli-launch", "")
+			launchedInstances, launchErr = client.LaunchInstance(httpClient, apiToken, instanceType, region, 1, "cli-launch", "", filesystemName)
 		}
 
 		if launchErr != nil {
@@ -118,6 +126,8 @@ func init() {
 	launchCmd.Flags().BoolP("wait", "w", false, "Wait for instance to become ready before returning")
 
 	launchCmd.Flags().DurationP("wait-timeout", "", 10*time.Minute, "Timeout for waiting for instance to become ready")
+
+	launchCmd.Flags().StringP("filesystem", "f", "", "Create and mount a filesystem with the specified name (will be created in the same region as the instance)")
 
 	launchCmd.MarkFlagRequired("instance-type")
 	launchCmd.MarkFlagRequired("region")

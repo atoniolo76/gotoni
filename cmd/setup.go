@@ -4,11 +4,8 @@ Copyright © 2025 ALESSIO TONIOLO
 package cmd
 
 import (
-	"crypto/tls"
 	"fmt"
 	"log"
-	"net/http"
-	"time"
 
 	"toni/gotoni/pkg/client"
 
@@ -31,7 +28,7 @@ Tasks can include commands, file uploads, scripts, and background services.`,
 		if apiToken == "" {
 			apiToken = client.GetAPIToken()
 			if apiToken == "" {
-				log.Fatal("API token not provided via --api-token flag, config.yaml, or LAMBDA_API_KEY environment variable")
+				log.Fatal("API token not provided via --api-token flag or LAMBDA_API_KEY environment variable")
 			}
 		}
 
@@ -50,10 +47,7 @@ Tasks can include commands, file uploads, scripts, and background services.`,
 			instanceID = args[0]
 		} else {
 			// Use first running instance if no ID provided
-			httpClient := &http.Client{
-				Timeout:   time.Duration(30) * time.Second,
-				Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}},
-			}
+			httpClient := client.NewHTTPClient()
 			runningInstances, err := client.ListRunningInstances(httpClient, apiToken)
 			if err != nil {
 				log.Fatalf("Failed to list running instances: %v", err)
@@ -66,10 +60,7 @@ Tasks can include commands, file uploads, scripts, and background services.`,
 		}
 
 		// Get instance details
-		httpClient := &http.Client{
-			Timeout:   time.Duration(30) * time.Second,
-			Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}},
-		}
+		httpClient := client.NewHTTPClient()
 
 		instanceDetails, err := client.GetInstance(httpClient, apiToken, instanceID)
 		if err != nil {

@@ -16,6 +16,16 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// NewHTTPClient creates a new HTTP client with secure defaults
+func NewHTTPClient() *http.Client {
+	return &http.Client{
+		Timeout:   30 * time.Second,
+		Transport: &http.Transport{
+			// Use default TLS config which verifies certificates
+		},
+	}
+}
+
 type Response struct {
 	Data map[string]Instance `json:"data"`
 }
@@ -47,6 +57,7 @@ type InstanceLaunchRequest struct {
 	RegionName       string   `json:"region_name"`
 	InstanceTypeName string   `json:"instance_type_name"`
 	SSHKeyNames      []string `json:"ssh_key_names"`
+	FileSystemNames  []string `json:"file_system_names,omitempty"`
 	Quantity         int      `json:"quantity,omitempty"`
 	Name             string   `json:"name,omitempty"`
 }
@@ -99,6 +110,12 @@ type GeneratedSSHKey struct {
 	PrivateKey string `json:"private_key"`
 }
 
+type SSHKey struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	PublicKey string `json:"public_key"`
+}
+
 type FirewallRule struct {
 	Protocol      string `json:"protocol"`       // "tcp", "udp", "icmp", or "all"
 	PortRange     []int  `json:"port_range"`     // [min, max] - required for non-icmp protocols
@@ -118,6 +135,28 @@ type GlobalFirewallRulesetResponse struct {
 
 type GlobalFirewallRulesetPatchRequest struct {
 	Rules []FirewallRule `json:"rules"`
+}
+
+type FilesystemCreateRequest struct {
+	Name   string `json:"name"`
+	Region string `json:"region"`
+}
+
+type Filesystem struct {
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	MountPoint string `json:"mount_point"`
+	Created    string `json:"created"`
+	CreatedBy  *User  `json:"created_by,omitempty"`
+	IsInUse    bool   `json:"is_in_use"`
+	Region     Region `json:"region"`
+	BytesUsed  *int   `json:"bytes_used,omitempty"`
+}
+
+type User struct {
+	ID     string `json:"id"`
+	Email  string `json:"email"`
+	Status string `json:"status"`
 }
 
 var minCudaVersions = map[string]float64{
@@ -163,11 +202,16 @@ var MatchingInstanceTypes = map[string]string{
 }
 
 // Config represents the application configuration
+type FilesystemInfo struct {
+	ID     string `yaml:"id"`
+	Region string `yaml:"region"`
+}
+
 type Config struct {
-	APIKey    string            `yaml:"api_key,omitempty"`   // Lambda Cloud API key
-	Instances map[string]string `yaml:"instances,omitempty"` // instance-id -> ssh-key-name
-	SSHKeys   map[string]string `yaml:"ssh_keys,omitempty"`  // ssh-key-name -> private-key-file
-	Tasks     []Task            `yaml:"tasks,omitempty"`     // tasks/playbooks to run
+	Instances   map[string]string         `yaml:"instances,omitempty"`   // instance-id -> ssh-key-name
+	SSHKeys     map[string]string         `yaml:"ssh_keys,omitempty"`    // ssh-key-name -> private-key-file
+	Filesystems map[string]FilesystemInfo `yaml:"filesystems,omitempty"` // filesystem-name -> filesystem-info
+	Tasks       []Task                    `yaml:"tasks,omitempty"`       // tasks/playbooks to run
 }
 
 // Task represents a task or playbook step
@@ -188,8 +232,9 @@ type Task struct {
 // DefaultConfig returns an empty config
 func DefaultConfig() *Config {
 	return &Config{
-		Instances: make(map[string]string),
-		SSHKeys:   make(map[string]string),
+		Instances:   make(map[string]string),
+		SSHKeys:     make(map[string]string),
+		Filesystems: make(map[string]FilesystemInfo),
 	}
 }
 
@@ -218,6 +263,9 @@ func LoadConfig() (*Config, error) {
 	}
 	if config.SSHKeys == nil {
 		config.SSHKeys = make(map[string]string)
+	}
+	if config.Filesystems == nil {
+		config.Filesystems = make(map[string]FilesystemInfo)
 	}
 
 	return &config, nil
@@ -253,6 +301,7 @@ func LaunchInstance(
 	quantity int,
 	name string,
 	sshKeyName string, // optional: if provided, use this existing SSH key name instead of generating new one
+	filesystemName string, // optional: if provided, mount this filesystem to the instance
 ) ([]LaunchedInstance, error) {
 	if quantity <= 0 {
 		quantity = 1 // Default to 1
@@ -289,6 +338,22 @@ func LaunchInstance(
 	// Save SSH key info to config
 	config.SSHKeys[finalSSHKeyName] = sshKeyFile
 
+	// Validate filesystem region if filesystem is provided
+	var fileSystemNames []string
+	if filesystemName != "" {
+		fsInfo, err := GetFilesystemInfo(filesystemName)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get filesystem info: %w", err)
+		}
+
+		// Validate that filesystem region matches instance region
+		if fsInfo.Region != region {
+			return nil, fmt.Errorf("filesystem %s is in region %s, but instance is being launched in region %s (regions must match)", filesystemName, fsInfo.Region, region)
+		}
+
+		fileSystemNames = []string{filesystemName}
+	}
+
 	// Save config
 	if err := SaveConfig(config); err != nil {
 		return nil, fmt.Errorf("failed to save config: %w", err)
@@ -298,6 +363,7 @@ func LaunchInstance(
 		RegionName:       region,
 		InstanceTypeName: instanceType,
 		SSHKeyNames:      []string{finalSSHKeyName},
+		FileSystemNames:  fileSystemNames,
 		Quantity:         quantity,
 		Name:             name,
 	}
@@ -451,9 +517,10 @@ func LaunchAndWait(
 	name string,
 	sshKeyName string,
 	timeout time.Duration,
+	filesystemName string, // optional: if provided, mount this filesystem to the instance
 ) ([]LaunchedInstance, error) {
 	// Launch the instances
-	instances, err := LaunchInstance(httpClient, apiToken, instanceType, region, quantity, name, sshKeyName)
+	instances, err := LaunchInstance(httpClient, apiToken, instanceType, region, quantity, name, sshKeyName, filesystemName)
 	if err != nil {
 		return nil, fmt.Errorf("failed to launch instances: %w", err)
 	}
@@ -704,6 +771,69 @@ func CreateSSHKeyForProject(httpClient *http.Client, apiToken string) (string, s
 	return generatedKey.Name, privateKeyFile, nil
 }
 
+// ListSSHKeys retrieves a list of SSH keys from Lambda Cloud
+func ListSSHKeys(httpClient *http.Client, apiToken string) ([]SSHKey, error) {
+	req, err := http.NewRequest("GET", "https://cloud.lambda.ai/api/v1/ssh-keys", nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", apiToken))
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to execute request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	var apiResponse struct {
+		Data []SSHKey `json:"data"`
+	}
+
+	err = json.Unmarshal(body, &apiResponse)
+	if err != nil {
+		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
+	}
+
+	return apiResponse.Data, nil
+}
+
+// DeleteSSHKey deletes an SSH key from Lambda Cloud by ID
+func DeleteSSHKey(httpClient *http.Client, apiToken string, sshKeyID string) error {
+	if sshKeyID == "" {
+		return fmt.Errorf("SSH key ID is required")
+	}
+
+	url := fmt.Sprintf("https://cloud.lambda.ai/api/v1/ssh-keys/%s", sshKeyID)
+	req, err := http.NewRequest("DELETE", url, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", apiToken))
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to execute request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	return nil
+}
+
 func GetAvailableInstanceTypes(httpClient *http.Client, apiToken string) ([]Instance, error) {
 	req, err := http.NewRequest("GET", "https://cloud.lambda.ai/api/v1/instance-types", nil)
 	if err != nil {
@@ -741,6 +871,187 @@ func GetAvailableInstanceTypes(httpClient *http.Client, apiToken string) ([]Inst
 	}
 
 	return instances, nil
+}
+
+// CheckInstanceTypeAvailability checks if a specific instance type is available and returns the regions with capacity
+func CheckInstanceTypeAvailability(httpClient *http.Client, apiToken string, instanceTypeName string) ([]Region, error) {
+	req, err := http.NewRequest("GET", "https://cloud.lambda.ai/api/v1/instance-types", nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", apiToken))
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to execute request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	var response Response
+	err = json.Unmarshal(body, &response)
+	if err != nil {
+		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
+	}
+
+	// Look up the specific instance type
+	instance, exists := response.Data[instanceTypeName]
+	if !exists {
+		return nil, fmt.Errorf("instance type %s not found", instanceTypeName)
+	}
+
+	// Return the regions with capacity available
+	return instance.RegionsWithCapacityAvailable, nil
+}
+
+// CreateFilesystem creates a new filesystem in the specified region and saves it to config
+func CreateFilesystem(httpClient *http.Client, apiToken string, name string, region string) (*Filesystem, error) {
+	requestBody := FilesystemCreateRequest{
+		Name:   name,
+		Region: region,
+	}
+
+	jsonBody, err := json.Marshal(requestBody)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request body: %w", err)
+	}
+
+	req, err := http.NewRequest("POST", "https://cloud.lambda.ai/api/v1/filesystems", strings.NewReader(string(jsonBody)))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", apiToken))
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to execute request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	var apiResponse struct {
+		Data Filesystem `json:"data"`
+	}
+
+	err = json.Unmarshal(body, &apiResponse)
+	if err != nil {
+		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
+	}
+
+	// Save filesystem to config
+	config, err := LoadConfig()
+	if err != nil {
+		return nil, fmt.Errorf("failed to load config: %w", err)
+	}
+
+	config.Filesystems[name] = FilesystemInfo{
+		ID:     apiResponse.Data.ID,
+		Region: apiResponse.Data.Region.Name,
+	}
+
+	if err := SaveConfig(config); err != nil {
+		return nil, fmt.Errorf("failed to save config: %w", err)
+	}
+
+	return &apiResponse.Data, nil
+}
+
+// GetFilesystemInfo returns filesystem info from config by name
+func GetFilesystemInfo(filesystemName string) (*FilesystemInfo, error) {
+	config, err := LoadConfig()
+	if err != nil {
+		return nil, fmt.Errorf("failed to load config: %w", err)
+	}
+
+	fsInfo, exists := config.Filesystems[filesystemName]
+	if !exists {
+		return nil, fmt.Errorf("filesystem %s not found in config", filesystemName)
+	}
+
+	return &fsInfo, nil
+}
+
+// ListFilesystems retrieves a list of filesystems from Lambda Cloud
+func ListFilesystems(httpClient *http.Client, apiToken string) ([]Filesystem, error) {
+	req, err := http.NewRequest("GET", "https://cloud.lambda.ai/api/v1/filesystems", nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", apiToken))
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to execute request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	var apiResponse struct {
+		Data []Filesystem `json:"data"`
+	}
+
+	err = json.Unmarshal(body, &apiResponse)
+	if err != nil {
+		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
+	}
+
+	return apiResponse.Data, nil
+}
+
+// DeleteFilesystem deletes a filesystem from Lambda Cloud by ID
+func DeleteFilesystem(httpClient *http.Client, apiToken string, filesystemID string) error {
+	if filesystemID == "" {
+		return fmt.Errorf("filesystem ID is required")
+	}
+
+	url := fmt.Sprintf("https://cloud.lambda.ai/api/v1/filesystems/%s", filesystemID)
+	req, err := http.NewRequest("DELETE", url, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", apiToken))
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to execute request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	return nil
 }
 
 // ExecuteTask executes a single task on a remote instance
@@ -890,12 +1201,8 @@ func FilterTasksByType(tasks []Task, taskType string) []Task {
 	return filtered
 }
 
-// GetAPIToken returns the API token from config, environment, or empty string
+// GetAPIToken returns the API token from environment variable
 func GetAPIToken() string {
-	config, err := LoadConfig()
-	if err == nil && config.APIKey != "" {
-		return config.APIKey
-	}
 	return os.Getenv("LAMBDA_API_KEY")
 }
 

@@ -4,12 +4,9 @@ Copyright © 2025 ALESSIO TONIOLO
 package cmd
 
 import (
-	"crypto/tls"
 	"fmt"
 	"log"
-	"net/http"
 	"strings"
-	"time"
 
 	"toni/gotoni/pkg/client"
 
@@ -33,7 +30,7 @@ Example: gotoni run "ls -la"`,
 		if apiToken == "" {
 			apiToken = client.GetAPIToken()
 			if apiToken == "" {
-				log.Fatal("API token not provided via --api-token flag, config.yaml, or LAMBDA_API_KEY environment variable")
+				log.Fatal("API token not provided via --api-token flag or LAMBDA_API_KEY environment variable")
 			}
 		}
 
@@ -44,10 +41,7 @@ Example: gotoni run "ls -la"`,
 		if len(args) == 1 {
 			// Only command provided, use first running instance
 			command = args[0]
-			httpClient := &http.Client{
-				Timeout:   time.Duration(30) * time.Second,
-				Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}},
-			}
+			httpClient := client.NewHTTPClient()
 			runningInstances, err := client.ListRunningInstances(httpClient, apiToken)
 			if err != nil {
 				log.Fatalf("Failed to list running instances: %v", err)
@@ -64,10 +58,7 @@ Example: gotoni run "ls -la"`,
 		}
 
 		// Get instance details
-		httpClient := &http.Client{
-			Timeout:   time.Duration(30) * time.Second,
-			Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}},
-		}
+		httpClient := client.NewHTTPClient()
 
 		instanceDetails, err := client.GetInstance(httpClient, apiToken, instanceID)
 		if err != nil {
@@ -109,4 +100,3 @@ func init() {
 	rootCmd.AddCommand(runCmd)
 	runCmd.Flags().StringP("api-token", "a", "", "API token for Lambda Cloud (can also be set via LAMBDA_API_KEY env var)")
 }
-

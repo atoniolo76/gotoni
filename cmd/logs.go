@@ -4,12 +4,9 @@ Copyright © 2025 ALESSIO TONIOLO
 package cmd
 
 import (
-	"crypto/tls"
 	"fmt"
 	"log"
-	"net/http"
 	"strings"
-	"time"
 
 	"toni/gotoni/pkg/client"
 
@@ -32,7 +29,7 @@ If service-name is not provided, shows logs from all services.`,
 		if apiToken == "" {
 			apiToken = client.GetAPIToken()
 			if apiToken == "" {
-				log.Fatal("API token not provided via --api-token flag, config.yaml, or LAMBDA_API_KEY environment variable")
+				log.Fatal("API token not provided via --api-token flag or LAMBDA_API_KEY environment variable")
 			}
 		}
 
@@ -57,10 +54,7 @@ If service-name is not provided, shows logs from all services.`,
 		}
 
 		// Get instance details
-		httpClient := &http.Client{
-			Timeout:   time.Duration(30) * time.Second,
-			Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}},
-		}
+		httpClient := client.NewHTTPClient()
 
 		instanceDetails, err := client.GetInstance(httpClient, apiToken, instanceID)
 		if err != nil {
