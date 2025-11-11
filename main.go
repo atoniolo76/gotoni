@@ -4,7 +4,7 @@ Copyright © 2025 ALESSIO TONIOLO
 package main
 
 import (
-	"toni/gotoni/cmd"
+	"github.com/atoniolo76/gotoni/cmd"
 )
 
 func main() {
