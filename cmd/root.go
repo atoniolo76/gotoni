@@ -12,8 +12,8 @@ import (
 // rootCmd represents the base command when called without any subcommands
 var rootCmd = &cobra.Command{
 	Use:   "gotoni",
-	Short: "Turn your Neocloud into an inference engine with <100ms cold-starts.",
-	Long:  `Turn your Neocloud into an inference engine with <100ms cold-starts.`,
+	Short: "CLI for automating Lambda.ai",
+	Long:  `CLI for automating Lambda.ai.`,
 	// Uncomment the following line if your bare application
 	// has an action associated with it:
 	// Run: func(cmd *cobra.Command, args []string) { },
