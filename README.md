@@ -30,6 +30,7 @@ export LAMBDA_API_KEY=your_token_here
 
 ## Commands
 
+- `gotoni update` - Update gotoni to the latest version
 - `gotoni launch` - Launch a new instance
 - `gotoni list [--running]` - List instances or instance types
 - `gotoni delete <instance-id>` - Terminate instances
