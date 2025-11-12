@@ -1,6 +1,7 @@
 package client
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -1034,7 +1035,12 @@ func DeleteFilesystem(httpClient *http.Client, apiToken string, filesystemID str
 	}
 
 	url := fmt.Sprintf("https://cloud.lambda.ai/api/v1/filesystems/%s", filesystemID)
-	req, err := http.NewRequest("DELETE", url, nil)
+	
+	// Use a longer timeout for filesystem deletion (can take time for large filesystems)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	
+	req, err := http.NewRequestWithContext(ctx, "DELETE", url, nil)
 	if err != nil {
 		return fmt.Errorf("failed to create request: %w", err)
 	}
