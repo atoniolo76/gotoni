@@ -1,6 +1,6 @@
 # gotoni
 
-![gotoni in action!](./docs/Terminal.gif)
+![gotoni in action!](./docs/image.png)
 
 Automate Lambda.ai with Ansible-inspired Go CLI  
 
@@ -80,5 +80,8 @@ tasks:
       - Install dependencies
 ```
 
-## TODO (PRs welcome!)
+## TODO
 - [ ] Create client struct for sdk usage
+
+---
+![gotoni running a remote command](./docs/Terminal.gif)
