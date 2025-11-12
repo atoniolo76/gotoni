@@ -16,9 +16,16 @@ Like [Ansible Automation](https://docs.ansible.com/projects/ansible/latest/playb
 
 ### Option 1: Download Pre-built Binary (Recommended)
 
-**One-liner install (Linux/macOS):**
+**Quick install (Linux/macOS):**
 ```bash
-curl -sL https://github.com/atoniolo76/gotoni/releases/latest/download/gotoni-$(uname -s | tr '[:upper:]' '[:lower:]')-$(case $(uname -m) in x86_64) echo amd64 ;; aarch64|arm64) echo arm64 ;; *) echo $(uname -m) ;; esac) -o gotoni && chmod +x gotoni && sudo mv gotoni /usr/local/bin/
+curl -fsSL https://raw.githubusercontent.com/atoniolo76/gotoni/main/install.sh | bash
+```
+
+Or download and run the install script manually:
+```bash
+curl -fsSL https://raw.githubusercontent.com/atoniolo76/gotoni/main/install.sh -o install.sh
+chmod +x install.sh
+./install.sh
 ```
 
 **Manual download:**
