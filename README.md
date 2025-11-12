@@ -1,6 +1,6 @@
 # gotoni
 
-![gotoni in action!](./docs/Terminal.gif)
+![gotoni in action!](./docs/image.png)
 
 Automate Lambda.ai with Ansible-inspired Go CLI  
 
@@ -27,10 +27,6 @@ Export your [Lambda API key](https://cloud.lambda.ai/api-keys/cloud-api):
 ```bash
 export LAMBDA_API_KEY=your_token_here
 ```
-## Launch an instance
-Here's an example of launching your first instance, specifying the `--instance-type`, `--region`, `--filesystem`, and `--wait` flags.
-
-![instance launch image](./docs/image.png)
 
 ## Commands
 
@@ -84,5 +80,8 @@ tasks:
       - Install dependencies
 ```
 
-## TODO (PRs welcome!)
+## TODO
 - [ ] Create client struct for sdk usage
+
+---
+![gotoni running a remote command](./docs/Terminal.gif)
