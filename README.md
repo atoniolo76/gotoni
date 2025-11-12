@@ -14,51 +14,8 @@ Like [Ansible Automation](https://docs.ansible.com/projects/ansible/latest/playb
 
 ## Installation
 
-### Option 1: Download Pre-built Binary (Recommended)
-
-**Quick install (Linux/macOS):**
 ```bash
 curl -fsSL https://raw.githubusercontent.com/atoniolo76/gotoni/main/install.sh | bash
-```
-
-Or download and run the install script manually:
-```bash
-curl -fsSL https://raw.githubusercontent.com/atoniolo76/gotoni/main/install.sh -o install.sh
-chmod +x install.sh
-./install.sh
-```
-
-**Manual download:**
-
-Download the binary for your platform from the [latest release](https://github.com/atoniolo76/gotoni/releases/latest):
-
-- **Linux x86_64:** `gotoni-linux-amd64`
-- **Linux ARM64:** `gotoni-linux-arm64`
-- **macOS Intel:** `gotoni-darwin-amd64`
-- **macOS Apple Silicon:** `gotoni-darwin-arm64`
-- **Windows:** `gotoni-windows-amd64.exe`
-
-After downloading, make it executable and move to your PATH:
-```bash
-chmod +x gotoni
-sudo mv gotoni /usr/local/bin/  # Linux/macOS
-```
-
-### Option 2: Build from Source
-
-If you have Go installed:
-
-```bash
-go install github.com/atoniolo76/gotoni@latest
-# Or clone and build:
-git clone https://github.com/atoniolo76/gotoni.git
-cd gotoni
-go build -o gotoni
-```
-
-To build binaries for all platforms, use the included build script:
-```bash
-./build.sh
 ```
 
 ## Setup
