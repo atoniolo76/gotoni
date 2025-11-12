@@ -993,7 +993,7 @@ func GetFilesystemInfo(filesystemName string) (*FilesystemInfo, error) {
 
 // ListFilesystems retrieves a list of filesystems from Lambda Cloud
 func ListFilesystems(httpClient *http.Client, apiToken string) ([]Filesystem, error) {
-	req, err := http.NewRequest("GET", "https://cloud.lambda.ai/api/v1/filesystems", nil)
+	req, err := http.NewRequest("GET", "https://cloud.lambda.ai/api/v1/file-systems", nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
