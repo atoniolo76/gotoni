@@ -64,12 +64,14 @@ config.yaml
 *.jpeg
 *.png
 *.gif
+!docs/*.gif
 
 # Data files
 *.csv
 *.json
 !go.mod
 !go.sum
+!docs/*.json
 
 # Python files (if any remain)
 *.py
