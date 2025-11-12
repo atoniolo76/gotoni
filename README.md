@@ -16,36 +16,26 @@ Like [Ansible Automation](https://docs.ansible.com/projects/ansible/latest/playb
 
 ### Option 1: Download Pre-built Binary (Recommended)
 
+**One-liner install (Linux/macOS):**
+```bash
+curl -sL https://github.com/atoniolo76/gotoni/releases/latest/download/gotoni-$(uname -s | tr '[:upper:]' '[:lower:]')-$(case $(uname -m) in x86_64) echo amd64 ;; aarch64|arm64) echo arm64 ;; *) echo $(uname -m) ;; esac) -o gotoni && chmod +x gotoni && sudo mv gotoni /usr/local/bin/
+```
+
+**Manual download:**
+
 Download the binary for your platform from the [latest release](https://github.com/atoniolo76/gotoni/releases/latest):
 
-**Linux:**
+- **Linux x86_64:** `gotoni-linux-amd64`
+- **Linux ARM64:** `gotoni-linux-arm64`
+- **macOS Intel:** `gotoni-darwin-amd64`
+- **macOS Apple Silicon:** `gotoni-darwin-arm64`
+- **Windows:** `gotoni-windows-amd64.exe`
+
+After downloading, make it executable and move to your PATH:
 ```bash
-# For x86_64
-wget https://github.com/atoniolo76/gotoni/releases/latest/download/gotoni-linux-amd64 -O gotoni
 chmod +x gotoni
-sudo mv gotoni /usr/local/bin/
-
-# For ARM64
-wget https://github.com/atoniolo76/gotoni/releases/latest/download/gotoni-linux-arm64 -O gotoni
-chmod +x gotoni
-sudo mv gotoni /usr/local/bin/
+sudo mv gotoni /usr/local/bin/  # Linux/macOS
 ```
-
-**macOS:**
-```bash
-# For Intel Macs
-curl -L https://github.com/atoniolo76/gotoni/releases/latest/download/gotoni-darwin-amd64 -o gotoni
-chmod +x gotoni
-sudo mv gotoni /usr/local/bin/
-
-# For Apple Silicon (M1/M2/M3)
-curl -L https://github.com/atoniolo76/gotoni/releases/latest/download/gotoni-darwin-arm64 -o gotoni
-chmod +x gotoni
-sudo mv gotoni /usr/local/bin/
-```
-
-**Windows:**
-Download `gotoni-windows-amd64.exe` from the releases page and add it to your PATH.
 
 ### Option 2: Build from Source
 
