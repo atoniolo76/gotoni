@@ -28,7 +28,8 @@ Export your [Lambda API key](https://cloud.lambda.ai/api-keys/cloud-api):
 export LAMBDA_API_KEY=your_token_here
 ```
 ## Launch an instance
-Here's an example of launching your first instance, specifying the `--instance-type`, `--region`, `--filesystem`, and `--wait` flags.<br>
+Here's an example of launching your first instance, specifying the `--instance-type`, `--region`, `--filesystem`, and `--wait` flags.
+
 ![instance launch image](./docs/image.png)
 
 ## Commands
