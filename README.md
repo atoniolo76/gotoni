@@ -1,5 +1,7 @@
 # gotoni
 
+![gotoni in action!](./docs/Terminal.gif)
+
 Automate Lambda.ai with Ansible-inspired Go CLI  
 
 ## Motivation
