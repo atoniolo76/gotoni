@@ -1,6 +1,6 @@
 # gotoni
 
-![gotoni in action!](./docs/image.png)
+![gotoni running a remote command](./docs/Terminal.gif)
 
 Automate Lambda.ai with Ansible-inspired Go CLI  
 
@@ -37,6 +37,7 @@ export LAMBDA_API_KEY=your_token_here
 - `gotoni delete <instance-id>` - Terminate instances
 - `gotoni connect <instance-ip>` - Connect to an instance via SSH
 - `gotoni run [instance-id] <command>` - Run a command on a remote instance
+- `gotoni add-task` - Add a new task interactively to your configuration
 - `gotoni setup [instance-id]` - Run setup tasks/playbooks
 - `gotoni start [instance-id]` - Start service tasks
 - `gotoni status [instance-id]` - Check status of services
@@ -84,8 +85,7 @@ tasks:
       - Install dependencies
 ```
 
+![gotoni in action!](./docs/image.png)
+
 ## TODO
 - [ ] Create client struct for sdk usage
-
----
-![gotoni running a remote command](./docs/Terminal.gif)
