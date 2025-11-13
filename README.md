@@ -32,6 +32,7 @@ export LAMBDA_API_KEY=your_token_here
 
 - `gotoni update` - Update gotoni to the latest version
 - `gotoni launch` - Launch a new instance
+- `gotoni snipe --instance-type <type> [--interval <duration>] [--timeout <duration>]` - Poll for instance availability and automatically launch when found
 - `gotoni list [--running]` - List instances or instance types
 - `gotoni delete <instance-id>` - Terminate instances
 - `gotoni connect <instance-ip>` - Connect to an instance via SSH
