@@ -808,6 +808,62 @@ func ListSSHKeys(httpClient *http.Client, apiToken string) ([]SSHKey, error) {
 	return apiResponse.Data, nil
 }
 
+// AddExistingSSHKey adds an existing SSH key file to the gotoni configuration
+// Returns the key name and target path
+func AddExistingSSHKey(keyPath string, keyName string) (string, string, error) {
+	// Validate the key file exists
+	if _, err := os.Stat(keyPath); os.IsNotExist(err) {
+		return "", "", fmt.Errorf("SSH key file does not exist: %s", keyPath)
+	}
+
+	// Generate key name if not provided
+	if keyName == "" {
+		baseName := filepath.Base(keyPath)
+		// Remove extension if present
+		keyName = strings.TrimSuffix(baseName, filepath.Ext(baseName))
+		// Ensure it's a valid name
+		if keyName == "" {
+			keyName = "imported-key"
+		}
+	}
+
+	// Create ssh directory if it doesn't exist
+	sshDir := "ssh"
+	if err := os.MkdirAll(sshDir, 0755); err != nil {
+		return "", "", fmt.Errorf("failed to create ssh directory: %w", err)
+	}
+
+	// Copy the key file to ssh directory
+	targetPath := filepath.Join(sshDir, keyName+".pem")
+	
+	// Read the source file
+	sourceData, err := os.ReadFile(keyPath)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to read SSH key file: %w", err)
+	}
+
+	// Write to target location with proper permissions
+	if err := os.WriteFile(targetPath, sourceData, 0600); err != nil {
+		return "", "", fmt.Errorf("failed to copy SSH key file: %w", err)
+	}
+
+	// Load config
+	config, err := LoadConfig()
+	if err != nil {
+		return "", "", fmt.Errorf("failed to load config: %w", err)
+	}
+
+	// Add to config
+	config.SSHKeys[keyName] = targetPath
+
+	// Save config
+	if err := SaveConfig(config); err != nil {
+		return "", "", fmt.Errorf("failed to save config: %w", err)
+	}
+
+	return keyName, targetPath, nil
+}
+
 // DeleteSSHKey deletes an SSH key from Lambda Cloud by ID
 func DeleteSSHKey(httpClient *http.Client, apiToken string, sshKeyID string) error {
 	if sshKeyID == "" {

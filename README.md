@@ -43,6 +43,8 @@ export LAMBDA_API_KEY=your_token_here
 - `gotoni logs [instance-id] [service-name]` - View service logs
 - `gotoni gpu [instance-id] --log <file.csv>` - Track GPU memory usage
 - `gotoni ssh-keys list` - List SSH keys
+- `gotoni ssh-keys get <instance-id> [--link]` - Get SSH key associated with an instance (optionally create symlink in current directory)
+- `gotoni ssh-keys add <key-path> [--name <name>]` - Add an existing SSH key file to gotoni configuration
 - `gotoni ssh-keys delete <key-id>` - Delete an SSH key
 - `gotoni filesystems list` - List filesystems
 - `gotoni filesystems delete <filesystem-id>` - Delete a filesystem
