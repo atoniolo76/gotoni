@@ -304,208 +304,20 @@ func LaunchInstance(
 	sshKeyName string, // optional: if provided, use this existing SSH key name instead of generating new one
 	filesystemName string, // optional: if provided, mount this filesystem to the instance
 ) ([]LaunchedInstance, error) {
-	if quantity <= 0 {
-		quantity = 1 // Default to 1
-	}
-	if name == "" {
-		name = "default"
-	}
-
-	var finalSSHKeyName, sshKeyFile string
-	var err error
-
-	if sshKeyName != "" {
-		// Use the provided existing SSH key name
-		finalSSHKeyName = sshKeyName
-		sshKeyFile = filepath.Join("ssh", sshKeyName+".pem")
-		// Check if the private key file exists
-		if _, err := os.Stat(sshKeyFile); os.IsNotExist(err) {
-			return nil, fmt.Errorf("private key file %s does not exist for SSH key %s", sshKeyFile, sshKeyName)
-		}
-	} else {
-		// Create a new SSH key for this instance
-		finalSSHKeyName, sshKeyFile, err = CreateSSHKeyForProject(httpClient, apiToken)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create SSH key: %w", err)
-		}
-	}
-
-	// Load current config
-	config, err := LoadConfig()
-	if err != nil {
-		return nil, fmt.Errorf("failed to load config: %w", err)
-	}
-
-	// Save SSH key info to config
-	config.SSHKeys[finalSSHKeyName] = sshKeyFile
-
-	// Validate filesystem region if filesystem is provided
-	var fileSystemNames []string
-	if filesystemName != "" {
-		fsInfo, err := GetFilesystemInfo(filesystemName)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get filesystem info: %w", err)
-		}
-
-		// Validate that filesystem region matches instance region
-		if fsInfo.Region != region {
-			return nil, fmt.Errorf("filesystem %s is in region %s, but instance is being launched in region %s (regions must match)", filesystemName, fsInfo.Region, region)
-		}
-
-		fileSystemNames = []string{filesystemName}
-	}
-
-	// Save config
-	if err := SaveConfig(config); err != nil {
-		return nil, fmt.Errorf("failed to save config: %w", err)
-	}
-
-	requestBody := InstanceLaunchRequest{
-		RegionName:       region,
-		InstanceTypeName: instanceType,
-		SSHKeyNames:      []string{finalSSHKeyName},
-		FileSystemNames:  fileSystemNames,
-		Quantity:         quantity,
-		Name:             name,
-	}
-
-	jsonBody, err := json.Marshal(requestBody)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal request body: %w", err)
-	}
-
-	req, err := http.NewRequest("POST", "https://cloud.lambda.ai/api/v1/instance-operations/launch", nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-
-	req.Body = io.NopCloser(strings.NewReader(string(jsonBody)))
-	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", apiToken))
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to execute request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read response body: %w", err)
-	}
-
-	var apiResponse struct {
-		Data InstanceLaunchResponse `json:"data"`
-	}
-
-	err = json.Unmarshal(body, &apiResponse)
-	if err != nil {
-		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
-	}
-
-	// Create LaunchedInstance structs with SSH key info
-	instances := make([]LaunchedInstance, len(apiResponse.Data.InstanceIDs))
-	for i, instanceID := range apiResponse.Data.InstanceIDs {
-		instances[i] = LaunchedInstance{
-			ID:         instanceID,
-			SSHKeyName: finalSSHKeyName,
-			SSHKeyFile: sshKeyFile,
-		}
-
-		// Save instance -> SSH key mapping
-		config.Instances[instanceID] = finalSSHKeyName
-	}
-
-	// Save updated config with instance mappings
-	if err := SaveConfig(config); err != nil {
-		return nil, fmt.Errorf("failed to save config with instance mappings: %w", err)
-	}
-
-	return instances, nil
+	provider, _ := GetCloudProvider()
+	return provider.LaunchInstance(httpClient, apiToken, instanceType, region, quantity, name, sshKeyName, filesystemName)
 }
 
 // WaitForInstanceReady waits for an instance to become active
 func WaitForInstanceReady(httpClient *http.Client, apiToken, instanceID string, timeout time.Duration) error {
-	if timeout == 0 {
-		timeout = 10 * time.Minute // Default timeout
-	}
-
-	ticker := time.NewTicker(10 * time.Second) // Check every 10 seconds
-	defer ticker.Stop()
-
-	timeoutChan := time.After(timeout)
-
-	for {
-		select {
-		case <-timeoutChan:
-			return fmt.Errorf("timeout waiting for instance %s to become ready", instanceID)
-
-		case <-ticker.C:
-			instance, err := GetInstance(httpClient, apiToken, instanceID)
-			if err != nil {
-				return fmt.Errorf("failed to get instance status: %w", err)
-			}
-
-			switch instance.Status {
-			case "active":
-				return nil // Instance is ready!
-			case "terminated", "terminating":
-				return fmt.Errorf("instance %s terminated during startup", instanceID)
-			case "unhealthy":
-				return fmt.Errorf("instance %s became unhealthy", instanceID)
-			case "preempted":
-				return fmt.Errorf("instance %s was preempted", instanceID)
-			case "booting":
-				// Still booting, continue waiting
-				continue
-			default:
-				return fmt.Errorf("unknown instance status: %s", instance.Status)
-			}
-		}
-	}
+	provider, _ := GetCloudProvider()
+	return provider.WaitForInstanceReady(httpClient, apiToken, instanceID, timeout)
 }
 
 // GetInstance retrieves details for a specific instance
 func GetInstance(httpClient *http.Client, apiToken, instanceID string) (*RunningInstance, error) {
-	url := fmt.Sprintf("https://cloud.lambda.ai/api/v1/instances/%s", instanceID)
-
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", apiToken))
-
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to execute request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read response body: %w", err)
-	}
-
-	var apiResponse struct {
-		Data RunningInstance `json:"data"`
-	}
-
-	err = json.Unmarshal(body, &apiResponse)
-	if err != nil {
-		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
-	}
-
-	return &apiResponse.Data, nil
+	provider, _ := GetCloudProvider()
+	return provider.GetInstance(httpClient, apiToken, instanceID)
 }
 
 // LaunchAndWait launches instances and waits for them to be ready
@@ -520,22 +332,8 @@ func LaunchAndWait(
 	timeout time.Duration,
 	filesystemName string, // optional: if provided, mount this filesystem to the instance
 ) ([]LaunchedInstance, error) {
-	// Launch the instances
-	instances, err := LaunchInstance(httpClient, apiToken, instanceType, region, quantity, name, sshKeyName, filesystemName)
-	if err != nil {
-		return nil, fmt.Errorf("failed to launch instances: %w", err)
-	}
-
-	// Wait for each instance to become ready
-	for _, instance := range instances {
-		fmt.Printf("Waiting for instance %s to become ready...\n", instance.ID)
-		if err := WaitForInstanceReady(httpClient, apiToken, instance.ID, timeout); err != nil {
-			return nil, fmt.Errorf("instance %s failed to become ready: %w", instance.ID, err)
-		}
-		fmt.Printf("Instance %s is now ready!\n", instance.ID)
-	}
-
-	return instances, nil
+	provider, _ := GetCloudProvider()
+	return provider.LaunchAndWait(httpClient, apiToken, instanceType, region, quantity, name, sshKeyName, timeout, filesystemName)
 }
 
 // ConnectToInstance connects to a remote instance via SSH using the key from config
@@ -610,36 +408,8 @@ func RemoveInstanceFromConfig(instanceID string) error {
 }
 
 func ListRunningInstances(httpClient *http.Client, apiToken string) ([]RunningInstance, error) {
-	req, err := http.NewRequest("GET", "https://cloud.lambda.ai/api/v1/instances", nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", apiToken))
-
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to execute request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("API request failed with status %d", resp.StatusCode)
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read response body: %w", err)
-	}
-
-	var response struct {
-		Data []RunningInstance `json:"data"`
-	}
-	err = json.Unmarshal(body, &response)
-	if err != nil {
-		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
-	}
-
-	return response.Data, nil
+	provider, _ := GetCloudProvider()
+	return provider.ListRunningInstances(httpClient, apiToken)
 }
 
 func TerminateInstance(
@@ -647,54 +417,8 @@ func TerminateInstance(
 	apiToken string,
 	instanceIDs []string,
 ) (*InstanceTerminateResponse, error) {
-	if len(instanceIDs) == 0 {
-		return nil, fmt.Errorf("at least one instance ID is required")
-	}
-
-	requestBody := InstanceTerminateRequest{
-		InstanceIDs: instanceIDs,
-	}
-
-	jsonBody, err := json.Marshal(requestBody)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal request body: %w", err)
-	}
-
-	req, err := http.NewRequest("POST", "https://cloud.lambda.ai/api/v1/instance-operations/terminate", nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-
-	req.Body = io.NopCloser(strings.NewReader(string(jsonBody)))
-	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", apiToken))
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to execute request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read response body: %w", err)
-	}
-
-	var apiResponse struct {
-		Data InstanceTerminateResponse `json:"data"`
-	}
-
-	err = json.Unmarshal(body, &apiResponse)
-	if err != nil {
-		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
-	}
-
-	return &apiResponse.Data, nil
+	provider, _ := GetCloudProvider()
+	return provider.TerminateInstance(httpClient, apiToken, instanceIDs)
 }
 
 // createSSHKey generates a new SSH key pair on Lambda and returns both keys
@@ -744,68 +468,14 @@ func createSSHKey(httpClient *http.Client, apiToken string, name string) (*Gener
 
 // CreateSSHKeyForProject creates a new SSH key and saves it in the ssh directory
 func CreateSSHKeyForProject(httpClient *http.Client, apiToken string) (string, string, error) {
-	// Create unique key name with timestamp
-	timestamp := time.Now().Unix()
-	keyName := "lambda-key-" + strconv.FormatInt(timestamp, 10)
-
-	// Create the SSH key
-	generatedKey, err := createSSHKey(httpClient, apiToken, keyName)
-	if err != nil {
-		return "", "", fmt.Errorf("failed to create SSH key: %w", err)
-	}
-
-	// Create ssh directory if it doesn't exist
-	sshDir := "ssh"
-	if err := os.MkdirAll(sshDir, 0755); err != nil {
-		return "", "", fmt.Errorf("failed to create ssh directory: %w", err)
-	}
-
-	// Save the private key in ssh directory
-	privateKeyFile := filepath.Join(sshDir, keyName+".pem")
-	err = os.WriteFile(privateKeyFile, []byte(generatedKey.PrivateKey), 0600)
-	if err != nil {
-		return "", "", fmt.Errorf("failed to save private key: %w", err)
-	}
-
-	fmt.Printf("Created new SSH key '%s' and saved private key to %s\n", keyName, privateKeyFile)
-	fmt.Printf("Use: ssh -i %s ubuntu@<instance-ip>\n", privateKeyFile)
-	return generatedKey.Name, privateKeyFile, nil
+	provider, _ := GetCloudProvider()
+	return provider.CreateSSHKeyForProject(httpClient, apiToken)
 }
 
-// ListSSHKeys retrieves a list of SSH keys from Lambda Cloud
+// ListSSHKeys retrieves a list of SSH keys from the cloud provider
 func ListSSHKeys(httpClient *http.Client, apiToken string) ([]SSHKey, error) {
-	req, err := http.NewRequest("GET", "https://cloud.lambda.ai/api/v1/ssh-keys", nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", apiToken))
-
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to execute request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read response body: %w", err)
-	}
-
-	var apiResponse struct {
-		Data []SSHKey `json:"data"`
-	}
-
-	err = json.Unmarshal(body, &apiResponse)
-	if err != nil {
-		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
-	}
-
-	return apiResponse.Data, nil
+	provider, _ := GetCloudProvider()
+	return provider.ListSSHKeys(httpClient, apiToken)
 }
 
 // AddExistingSSHKey adds an existing SSH key file to the gotoni configuration
@@ -866,108 +536,19 @@ func AddExistingSSHKey(keyPath string, keyName string) (string, string, error) {
 
 // DeleteSSHKey deletes an SSH key from Lambda Cloud by ID
 func DeleteSSHKey(httpClient *http.Client, apiToken string, sshKeyID string) error {
-	if sshKeyID == "" {
-		return fmt.Errorf("SSH key ID is required")
-	}
-
-	url := fmt.Sprintf("https://cloud.lambda.ai/api/v1/ssh-keys/%s", sshKeyID)
-	req, err := http.NewRequest("DELETE", url, nil)
-	if err != nil {
-		return fmt.Errorf("failed to create request: %w", err)
-	}
-	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", apiToken))
-
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("failed to execute request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
-	}
-
-	return nil
+	provider, _ := GetCloudProvider()
+	return provider.DeleteSSHKey(httpClient, apiToken, sshKeyID)
 }
 
 func GetAvailableInstanceTypes(httpClient *http.Client, apiToken string) ([]Instance, error) {
-	req, err := http.NewRequest("GET", "https://cloud.lambda.ai/api/v1/instance-types", nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", apiToken))
-
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to execute request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("API request failed with status %d", resp.StatusCode)
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read response body: %w", err)
-	}
-
-	var response Response
-	err = json.Unmarshal(body, &response)
-	if err != nil {
-		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
-	}
-
-	var instances []Instance
-	for _, instance := range response.Data {
-		if len(instance.RegionsWithCapacityAvailable) == 0 {
-			continue
-		}
-		instances = append(instances, instance)
-	}
-
-	return instances, nil
+	provider, _ := GetCloudProvider()
+	return provider.GetAvailableInstanceTypes(httpClient, apiToken)
 }
 
 // CheckInstanceTypeAvailability checks if a specific instance type is available and returns the regions with capacity
 func CheckInstanceTypeAvailability(httpClient *http.Client, apiToken string, instanceTypeName string) ([]Region, error) {
-	req, err := http.NewRequest("GET", "https://cloud.lambda.ai/api/v1/instance-types", nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", apiToken))
-
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to execute request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read response body: %w", err)
-	}
-
-	var response Response
-	err = json.Unmarshal(body, &response)
-	if err != nil {
-		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
-	}
-
-	// Look up the specific instance type
-	instance, exists := response.Data[instanceTypeName]
-	if !exists {
-		return nil, fmt.Errorf("instance type %s not found", instanceTypeName)
-	}
-
-	// Return the regions with capacity available
-	return instance.RegionsWithCapacityAvailable, nil
+	provider, _ := GetCloudProvider()
+	return provider.CheckInstanceTypeAvailability(httpClient, apiToken, instanceTypeName)
 }
 
 // CreateFilesystem creates a new filesystem in the specified region and saves it to config
@@ -1263,9 +844,20 @@ func FilterTasksByType(tasks []Task, taskType string) []Task {
 	return filtered
 }
 
-// GetAPIToken returns the API token from environment variable
+// GetAPIToken returns the API token from environment variable based on the current cloud provider
 func GetAPIToken() string {
-	return os.Getenv("LAMBDA_API_KEY")
+	_, providerType := GetCloudProvider()
+	return GetAPITokenForProvider(providerType)
+}
+
+// GetAPITokenForProvider returns the API token for a specific provider
+func GetAPITokenForProvider(providerType CloudProviderType) string {
+	switch providerType {
+	case CloudProviderNebius:
+		return os.Getenv("NEBIUS_API_KEY")
+	default:
+		return os.Getenv("LAMBDA_API_KEY")
+	}
 }
 
 // GetGlobalFirewallRules retrieves the current global firewall ruleset

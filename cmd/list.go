@@ -16,7 +16,7 @@ import (
 var listCmd = &cobra.Command{
 	Use:   "list",
 	Short: "List instances or instance types",
-	Long:  `List your running instances or available instance types on Lambda Cloud.`,
+	Long:  `List your running instances or available instance types on your cloud provider.`,
 	Run: func(cmd *cobra.Command, args []string) {
 		running, err := cmd.Flags().GetBool("running")
 		if err != nil {
@@ -33,9 +33,9 @@ var listCmd = &cobra.Command{
 
 		// If API token not provided via flag, get from environment
 		if apiToken == "" {
-			apiToken = os.Getenv("LAMBDA_API_KEY")
+			apiToken = client.GetAPIToken()
 			if apiToken == "" {
-				log.Fatal("API token not provided via --api-token flag or LAMBDA_API_KEY environment variable")
+				log.Fatal("API token not provided via --api-token flag or appropriate environment variable (LAMBDA_API_KEY or NEBIUS_API_KEY based on GOTONI_CLOUD)")
 			}
 		}
 
@@ -108,7 +108,7 @@ func init() {
 
 	// Cobra supports local flags which will only run when this command
 	// is called directly, e.g.:
-	listCmd.Flags().StringP("api-token", "a", "", "API token for Lambda Cloud (can also be set via LAMBDA_API_KEY env var)")
+	listCmd.Flags().StringP("api-token", "a", "", "API token for cloud provider (can also be set via LAMBDA_API_KEY or NEBIUS_API_KEY env vars based on GOTONI_CLOUD)")
 	listCmd.Flags().BoolP("running", "r", false, "List running instances instead of available instance types")
 	listCmd.Flags().StringP("region", "", "", "Filter available instance types by region (only used when not listing running instances)")
 }

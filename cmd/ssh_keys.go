@@ -40,7 +40,7 @@ var sshKeysListCmd = &cobra.Command{
 		if apiToken == "" {
 			apiToken = os.Getenv("LAMBDA_API_KEY")
 			if apiToken == "" {
-				log.Fatal("API token not provided via --api-token flag or LAMBDA_API_KEY environment variable")
+				log.Fatal("API token not provided via --api-token flag or appropriate environment variable (LAMBDA_API_KEY or NEBIUS_API_KEY based on GOTONI_CLOUD)")
 			}
 		}
 
@@ -84,7 +84,7 @@ var sshKeysDeleteCmd = &cobra.Command{
 		if apiToken == "" {
 			apiToken = os.Getenv("LAMBDA_API_KEY")
 			if apiToken == "" {
-				log.Fatal("API token not provided via --api-token flag or LAMBDA_API_KEY environment variable")
+				log.Fatal("API token not provided via --api-token flag or appropriate environment variable (LAMBDA_API_KEY or NEBIUS_API_KEY based on GOTONI_CLOUD)")
 			}
 		}
 
@@ -223,7 +223,7 @@ func init() {
 
 	// Add list subcommand
 	sshKeysCmd.AddCommand(sshKeysListCmd)
-	sshKeysListCmd.Flags().StringP("api-token", "a", "", "API token for Lambda Cloud (can also be set via LAMBDA_API_KEY env var)")
+	sshKeysListCmd.Flags().StringP("api-token", "a", "", "API token for cloud provider (can also be set via LAMBDA_API_KEY or NEBIUS_API_KEY env vars based on GOTONI_CLOUD)")
 
 	// Add get subcommand
 	sshKeysCmd.AddCommand(sshKeysGetCmd)
@@ -231,7 +231,7 @@ func init() {
 
 	// Add delete subcommand
 	sshKeysCmd.AddCommand(sshKeysDeleteCmd)
-	sshKeysDeleteCmd.Flags().StringP("api-token", "a", "", "API token for Lambda Cloud (can also be set via LAMBDA_API_KEY env var)")
+	sshKeysDeleteCmd.Flags().StringP("api-token", "a", "", "API token for cloud provider (can also be set via LAMBDA_API_KEY or NEBIUS_API_KEY env vars based on GOTONI_CLOUD)")
 	sshKeysDeleteCmd.Flags().StringSliceP("ids", "i", []string{}, "SSH key IDs to delete (can also be provided as arguments)")
 
 	// Add add subcommand
