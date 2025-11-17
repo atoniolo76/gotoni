@@ -52,9 +52,9 @@ var launchCmd = &cobra.Command{
 
 		// If API token not provided via flag, get from environment
 		if apiToken == "" {
-			apiToken = os.Getenv("LAMBDA_API_KEY")
+			apiToken = client.GetAPIToken()
 			if apiToken == "" {
-				log.Fatal("API token not provided via --api-token flag or LAMBDA_API_KEY environment variable")
+				log.Fatal("API token not provided via --api-token flag or appropriate environment variable (LAMBDA_API_KEY or NEBIUS_API_KEY based on GOTONI_CLOUD)")
 			}
 		}
 
@@ -115,7 +115,7 @@ func init() {
 	}
 
 	// Extract region keys from the map
-	launchCmd.Flags().StringP("api-token", "a", "", "API token for Lambda Cloud (can also be set via LAMBDA_API_KEY env var)")
+	launchCmd.Flags().StringP("api-token", "a", "", "API token for cloud provider (can also be set via LAMBDA_API_KEY or NEBIUS_API_KEY env vars based on GOTONI_CLOUD)")
 
 	launchCmd.Flags().StringP("region", "r", "", "Region to launch the instance in (e.g., us-east-1, us-west-2)")
 
