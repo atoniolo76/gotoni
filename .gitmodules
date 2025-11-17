@@ -1,0 +1,3 @@
+[submodule "nebiusapi"]
+	path = nebiusapi
+	url = https://github.com/nebius/api.git
