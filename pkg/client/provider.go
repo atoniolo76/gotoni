@@ -1,7 +1,6 @@
 package client
 
 import (
-	"context"
 	"net/http"
 	"os"
 	"time"
@@ -42,16 +41,15 @@ type CloudProvider interface {
 type CloudProviderType string
 
 const (
-	CloudProviderLambda  CloudProviderType = "lambda"
-	CloudProviderNebius  CloudProviderType = "nebius"
+	CloudProviderLambda CloudProviderType = "lambda"
 )
 
 // GetCloudProvider returns the appropriate cloud provider based on the GOTONI_CLOUD environment variable
 func GetCloudProvider() (CloudProvider, CloudProviderType) {
 	cloudType := CloudProviderType(getCloudProviderType())
 	switch cloudType {
-	case CloudProviderNebius:
-		return NewNebiusProvider(), CloudProviderNebius
+	case CloudProviderLambda:
+		return NewLambdaProvider(), CloudProviderLambda
 	default:
 		return NewLambdaProvider(), CloudProviderLambda
 	}
@@ -69,8 +67,8 @@ func getCloudProviderType() string {
 // GetAPIToken returns the appropriate API token based on the cloud provider
 func GetAPIToken(providerType CloudProviderType) string {
 	switch providerType {
-	case CloudProviderNebius:
-		return os.Getenv("NEBIUS_API_KEY")
+	case CloudProviderLambda:
+		return os.Getenv("LAMBDA_API_KEY")
 	default:
 		return os.Getenv("LAMBDA_API_KEY")
 	}

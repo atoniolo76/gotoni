@@ -6,7 +6,6 @@ package cmd
 import (
 	"fmt"
 	"log"
-	"os"
 	"github.com/atoniolo76/gotoni/pkg/client"
 
 	"github.com/spf13/cobra"
@@ -35,7 +34,7 @@ var listCmd = &cobra.Command{
 		if apiToken == "" {
 			apiToken = client.GetAPIToken()
 			if apiToken == "" {
-				log.Fatal("API token not provided via --api-token flag or appropriate environment variable (LAMBDA_API_KEY or NEBIUS_API_KEY based on GOTONI_CLOUD)")
+				log.Fatal("API token not provided via --api-token flag or LAMBDA_API_KEY environment variable")
 			}
 		}
 
@@ -108,7 +107,7 @@ func init() {
 
 	// Cobra supports local flags which will only run when this command
 	// is called directly, e.g.:
-	listCmd.Flags().StringP("api-token", "a", "", "API token for cloud provider (can also be set via LAMBDA_API_KEY or NEBIUS_API_KEY env vars based on GOTONI_CLOUD)")
+	listCmd.Flags().StringP("api-token", "a", "", "API token for cloud provider (can also be set via LAMBDA_API_KEY env var)")
 	listCmd.Flags().BoolP("running", "r", false, "List running instances instead of available instance types")
 	listCmd.Flags().StringP("region", "", "", "Filter available instance types by region (only used when not listing running instances)")
 }

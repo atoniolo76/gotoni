@@ -6,7 +6,6 @@ package cmd
 import (
 	"fmt"
 	"log"
-	"os"
 	"strings"
 	"time"
 	"github.com/atoniolo76/gotoni/pkg/client"
@@ -54,7 +53,7 @@ var launchCmd = &cobra.Command{
 		if apiToken == "" {
 			apiToken = client.GetAPIToken()
 			if apiToken == "" {
-				log.Fatal("API token not provided via --api-token flag or appropriate environment variable (LAMBDA_API_KEY or NEBIUS_API_KEY based on GOTONI_CLOUD)")
+				log.Fatal("API token not provided via --api-token flag or LAMBDA_API_KEY environment variable")
 			}
 		}
 
@@ -115,7 +114,7 @@ func init() {
 	}
 
 	// Extract region keys from the map
-	launchCmd.Flags().StringP("api-token", "a", "", "API token for cloud provider (can also be set via LAMBDA_API_KEY or NEBIUS_API_KEY env vars based on GOTONI_CLOUD)")
+	launchCmd.Flags().StringP("api-token", "a", "", "API token for cloud provider (can also be set via LAMBDA_API_KEY env var)")
 
 	launchCmd.Flags().StringP("region", "r", "", "Region to launch the instance in (e.g., us-east-1, us-west-2)")
 
