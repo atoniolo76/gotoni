@@ -10,7 +10,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
 
@@ -505,7 +504,7 @@ func AddExistingSSHKey(keyPath string, keyName string) (string, string, error) {
 
 	// Copy the key file to ssh directory
 	targetPath := filepath.Join(sshDir, keyName+".pem")
-	
+
 	// Read the source file
 	sourceData, err := os.ReadFile(keyPath)
 	if err != nil {
@@ -672,11 +671,11 @@ func DeleteFilesystem(httpClient *http.Client, apiToken string, filesystemID str
 	}
 
 	url := fmt.Sprintf("https://cloud.lambda.ai/api/v1/filesystems/%s", filesystemID)
-	
+
 	// Use a longer timeout for filesystem deletion (can take time for large filesystems)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
-	
+
 	req, err := http.NewRequestWithContext(ctx, "DELETE", url, nil)
 	if err != nil {
 		return fmt.Errorf("failed to create request: %w", err)
@@ -853,8 +852,8 @@ func GetAPIToken() string {
 // GetAPITokenForProvider returns the API token for a specific provider
 func GetAPITokenForProvider(providerType CloudProviderType) string {
 	switch providerType {
-	case CloudProviderNebius:
-		return os.Getenv("NEBIUS_API_KEY")
+	case CloudProviderLambda:
+		return os.Getenv("LAMBDA_API_KEY")
 	default:
 		return os.Getenv("LAMBDA_API_KEY")
 	}

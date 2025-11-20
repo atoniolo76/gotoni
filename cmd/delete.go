@@ -29,7 +29,7 @@ var deleteCmd = &cobra.Command{
 		if apiToken == "" {
 			apiToken = os.Getenv("LAMBDA_API_KEY")
 			if apiToken == "" {
-				log.Fatal("API token not provided via --api-token flag or appropriate environment variable (LAMBDA_API_KEY or NEBIUS_API_KEY based on GOTONI_CLOUD)")
+				log.Fatal("API token not provided via --api-token flag or LAMBDA_API_KEY environment variable")
 			}
 		}
 
@@ -84,6 +84,6 @@ func init() {
 	rootCmd.AddCommand(deleteCmd)
 
 	// Here you will define your flags and configuration settings.
-	deleteCmd.Flags().StringP("api-token", "a", "", "API token for cloud provider (can also be set via LAMBDA_API_KEY or NEBIUS_API_KEY env vars based on GOTONI_CLOUD)")
+	deleteCmd.Flags().StringP("api-token", "a", "", "API token for cloud provider (can also be set via LAMBDA_API_KEY env var)")
 	deleteCmd.Flags().StringSliceP("instance-ids", "i", []string{}, "Instance IDs to terminate (can also be provided as arguments)")
 }
