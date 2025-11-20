@@ -1,4 +1,4 @@
-package lambda
+package client
 
 import (
 	"context"
@@ -12,7 +12,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/alessiotoni/gotoni/pkg/client"
 )
 
 // LambdaProvider implements the CloudProvider interface for Lambda Cloud
@@ -24,7 +23,7 @@ func NewLambdaProvider() *LambdaProvider {
 }
 
 // LaunchInstance creates a new SSH key (or uses provided existing key), saves it to config, and launches an instance
-func (p *LambdaProvider) LaunchInstance(httpClient *http.Client, apiToken string, instanceType string, region string, quantity int, name string, sshKeyName string, filesystemName string) ([]client.LaunchedInstance, error) {
+func (p *LambdaProvider) LaunchInstance(httpClient *http.Client, apiToken string, instanceType string, region string, quantity int, name string, sshKeyName string, filesystemName string) ([]LaunchedInstance, error) {
 	if quantity <= 0 {
 		quantity = 1 // Default to 1
 	}
@@ -52,7 +51,7 @@ func (p *LambdaProvider) LaunchInstance(httpClient *http.Client, apiToken string
 	}
 
 	// Load current config
-	config, err := client.LoadConfig()
+	config, err := LoadConfig()
 	if err != nil {
 		return nil, fmt.Errorf("failed to load config: %w", err)
 	}
@@ -63,7 +62,7 @@ func (p *LambdaProvider) LaunchInstance(httpClient *http.Client, apiToken string
 	// Validate filesystem region if filesystem is provided
 	var fileSystemNames []string
 	if filesystemName != "" {
-		fsInfo, err := client.GetFilesystemInfo(filesystemName)
+		fsInfo, err := GetFilesystemInfo(filesystemName)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get filesystem info: %w", err)
 		}
@@ -77,11 +76,11 @@ func (p *LambdaProvider) LaunchInstance(httpClient *http.Client, apiToken string
 	}
 
 	// Save config
-	if err := client.SaveConfig(config); err != nil {
+	if err := SaveConfig(config); err != nil {
 		return nil, fmt.Errorf("failed to save config: %w", err)
 	}
 
-	requestBody := client.InstanceLaunchRequest{
+	requestBody := InstanceLaunchRequest{
 		RegionName:       region,
 		InstanceTypeName: instanceType,
 		SSHKeyNames:      []string{finalSSHKeyName},
@@ -121,7 +120,7 @@ func (p *LambdaProvider) LaunchInstance(httpClient *http.Client, apiToken string
 	}
 
 	var apiResponse struct {
-		Data client.InstanceLaunchResponse `json:"data"`
+		Data InstanceLaunchResponse `json:"data"`
 	}
 
 	err = json.Unmarshal(body, &apiResponse)
@@ -130,9 +129,9 @@ func (p *LambdaProvider) LaunchInstance(httpClient *http.Client, apiToken string
 	}
 
 	// Create LaunchedInstance structs with SSH key info
-	instances := make([]client.LaunchedInstance, len(apiResponse.Data.InstanceIDs))
+	instances := make([]LaunchedInstance, len(apiResponse.Data.InstanceIDs))
 	for i, instanceID := range apiResponse.Data.InstanceIDs {
-		instances[i] = client.LaunchedInstance{
+		instances[i] = LaunchedInstance{
 			ID:         instanceID,
 			SSHKeyName: finalSSHKeyName,
 			SSHKeyFile: sshKeyFile,
@@ -143,7 +142,7 @@ func (p *LambdaProvider) LaunchInstance(httpClient *http.Client, apiToken string
 	}
 
 	// Save updated config with instance mappings
-	if err := client.SaveConfig(config); err != nil {
+	if err := SaveConfig(config); err != nil {
 		return nil, fmt.Errorf("failed to save config with instance mappings: %w", err)
 	}
 
@@ -151,7 +150,7 @@ func (p *LambdaProvider) LaunchInstance(httpClient *http.Client, apiToken string
 }
 
 // LaunchAndWait launches instances and waits for them to be ready
-func (p *LambdaProvider) LaunchAndWait(httpClient *http.Client, apiToken string, instanceType string, region string, quantity int, name string, sshKeyName string, timeout time.Duration, filesystemName string) ([]client.LaunchedInstance, error) {
+func (p *LambdaProvider) LaunchAndWait(httpClient *http.Client, apiToken string, instanceType string, region string, quantity int, name string, sshKeyName string, timeout time.Duration, filesystemName string) ([]LaunchedInstance, error) {
 	// Launch the instances
 	instances, err := p.LaunchInstance(httpClient, apiToken, instanceType, region, quantity, name, sshKeyName, filesystemName)
 	if err != nil {
@@ -212,7 +211,7 @@ func (p *LambdaProvider) WaitForInstanceReady(httpClient *http.Client, apiToken 
 }
 
 // GetInstance retrieves details for a specific instance
-func (p *LambdaProvider) GetInstance(httpClient *http.Client, apiToken string, instanceID string) (*client.RunningInstance, error) {
+func (p *LambdaProvider) GetInstance(httpClient *http.Client, apiToken string, instanceID string) (*RunningInstance, error) {
 	url := fmt.Sprintf("https://cloud.lambda.ai/api/v1/instances/%s", instanceID)
 
 	req, err := http.NewRequest("GET", url, nil)
@@ -238,7 +237,7 @@ func (p *LambdaProvider) GetInstance(httpClient *http.Client, apiToken string, i
 	}
 
 	var apiResponse struct {
-		Data client.RunningInstance `json:"data"`
+		Data RunningInstance `json:"data"`
 	}
 
 	err = json.Unmarshal(body, &apiResponse)
@@ -250,7 +249,7 @@ func (p *LambdaProvider) GetInstance(httpClient *http.Client, apiToken string, i
 }
 
 // ListRunningInstances retrieves a list of running instances from Lambda Cloud
-func (p *LambdaProvider) ListRunningInstances(httpClient *http.Client, apiToken string) ([]client.RunningInstance, error) {
+func (p *LambdaProvider) ListRunningInstances(httpClient *http.Client, apiToken string) ([]RunningInstance, error) {
 	req, err := http.NewRequest("GET", "https://cloud.lambda.ai/api/v1/instances", nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
@@ -273,7 +272,7 @@ func (p *LambdaProvider) ListRunningInstances(httpClient *http.Client, apiToken 
 	}
 
 	var response struct {
-		Data []client.RunningInstance `json:"data"`
+		Data []RunningInstance `json:"data"`
 	}
 	err = json.Unmarshal(body, &response)
 	if err != nil {
@@ -284,12 +283,12 @@ func (p *LambdaProvider) ListRunningInstances(httpClient *http.Client, apiToken 
 }
 
 // TerminateInstance terminates instances
-func (p *LambdaProvider) TerminateInstance(httpClient *http.Client, apiToken string, instanceIDs []string) (*client.InstanceTerminateResponse, error) {
+func (p *LambdaProvider) TerminateInstance(httpClient *http.Client, apiToken string, instanceIDs []string) (*InstanceTerminateResponse, error) {
 	if len(instanceIDs) == 0 {
 		return nil, fmt.Errorf("at least one instance ID is required")
 	}
 
-	requestBody := client.InstanceTerminateRequest{
+	requestBody := InstanceTerminateRequest{
 		InstanceIDs: instanceIDs,
 	}
 
@@ -324,7 +323,7 @@ func (p *LambdaProvider) TerminateInstance(httpClient *http.Client, apiToken str
 	}
 
 	var apiResponse struct {
-		Data client.InstanceTerminateResponse `json:"data"`
+		Data InstanceTerminateResponse `json:"data"`
 	}
 
 	err = json.Unmarshal(body, &apiResponse)
@@ -336,7 +335,7 @@ func (p *LambdaProvider) TerminateInstance(httpClient *http.Client, apiToken str
 }
 
 // createSSHKey generates a new SSH key pair on Lambda and returns both keys
-func (p *LambdaProvider) createSSHKey(httpClient *http.Client, apiToken string, name string) (*client.GeneratedSSHKey, error) {
+func (p *LambdaProvider) createSSHKey(httpClient *http.Client, apiToken string, name string) (*GeneratedSSHKey, error) {
 	requestBody := map[string]string{"name": name}
 
 	jsonBody, err := json.Marshal(requestBody)
@@ -369,7 +368,7 @@ func (p *LambdaProvider) createSSHKey(httpClient *http.Client, apiToken string, 
 	}
 
 	var apiResponse struct {
-		Data client.GeneratedSSHKey `json:"data"`
+		Data GeneratedSSHKey `json:"data"`
 	}
 
 	err = json.Unmarshal(body, &apiResponse)
@@ -411,7 +410,7 @@ func (p *LambdaProvider) CreateSSHKeyForProject(httpClient *http.Client, apiToke
 }
 
 // ListSSHKeys retrieves a list of SSH keys from Lambda Cloud
-func (p *LambdaProvider) ListSSHKeys(httpClient *http.Client, apiToken string) ([]client.SSHKey, error) {
+func (p *LambdaProvider) ListSSHKeys(httpClient *http.Client, apiToken string) ([]SSHKey, error) {
 	req, err := http.NewRequest("GET", "https://cloud.lambda.ai/api/v1/ssh-keys", nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
@@ -435,7 +434,7 @@ func (p *LambdaProvider) ListSSHKeys(httpClient *http.Client, apiToken string) (
 	}
 
 	var apiResponse struct {
-		Data []client.SSHKey `json:"data"`
+		Data []SSHKey `json:"data"`
 	}
 
 	err = json.Unmarshal(body, &apiResponse)
@@ -474,7 +473,7 @@ func (p *LambdaProvider) DeleteSSHKey(httpClient *http.Client, apiToken string, 
 }
 
 // GetAvailableInstanceTypes retrieves available instance types from Lambda Cloud
-func (p *LambdaProvider) GetAvailableInstanceTypes(httpClient *http.Client, apiToken string) ([]client.Instance, error) {
+func (p *LambdaProvider) GetAvailableInstanceTypes(httpClient *http.Client, apiToken string) ([]Instance, error) {
 	req, err := http.NewRequest("GET", "https://cloud.lambda.ai/api/v1/instance-types", nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
@@ -496,13 +495,13 @@ func (p *LambdaProvider) GetAvailableInstanceTypes(httpClient *http.Client, apiT
 		return nil, fmt.Errorf("failed to read response body: %w", err)
 	}
 
-	var response client.Response
+	var response Response
 	err = json.Unmarshal(body, &response)
 	if err != nil {
 		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
 	}
 
-	var instances []client.Instance
+	var instances []Instance
 	for _, instance := range response.Data {
 		if len(instance.RegionsWithCapacityAvailable) == 0 {
 			continue
@@ -514,7 +513,7 @@ func (p *LambdaProvider) GetAvailableInstanceTypes(httpClient *http.Client, apiT
 }
 
 // CheckInstanceTypeAvailability checks if a specific instance type is available and returns the regions with capacity
-func (p *LambdaProvider) CheckInstanceTypeAvailability(httpClient *http.Client, apiToken string, instanceTypeName string) ([]client.Region, error) {
+func (p *LambdaProvider) CheckInstanceTypeAvailability(httpClient *http.Client, apiToken string, instanceTypeName string) ([]Region, error) {
 	req, err := http.NewRequest("GET", "https://cloud.lambda.ai/api/v1/instance-types", nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
@@ -537,7 +536,7 @@ func (p *LambdaProvider) CheckInstanceTypeAvailability(httpClient *http.Client, 
 		return nil, fmt.Errorf("failed to read response body: %w", err)
 	}
 
-	var response client.Response
+	var response Response
 	err = json.Unmarshal(body, &response)
 	if err != nil {
 		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
@@ -554,8 +553,8 @@ func (p *LambdaProvider) CheckInstanceTypeAvailability(httpClient *http.Client, 
 }
 
 // CreateFilesystem creates a new filesystem in the specified region and saves it to config
-func (p *LambdaProvider) CreateFilesystem(httpClient *http.Client, apiToken string, name string, region string) (*client.Filesystem, error) {
-	requestBody := client.FilesystemCreateRequest{
+func (p *LambdaProvider) CreateFilesystem(httpClient *http.Client, apiToken string, name string, region string) (*Filesystem, error) {
+	requestBody := FilesystemCreateRequest{
 		Name:   name,
 		Region: region,
 	}
@@ -590,7 +589,7 @@ func (p *LambdaProvider) CreateFilesystem(httpClient *http.Client, apiToken stri
 	}
 
 	var apiResponse struct {
-		Data client.Filesystem `json:"data"`
+		Data Filesystem `json:"data"`
 	}
 
 	err = json.Unmarshal(body, &apiResponse)
@@ -599,17 +598,17 @@ func (p *LambdaProvider) CreateFilesystem(httpClient *http.Client, apiToken stri
 	}
 
 	// Save filesystem to config
-	config, err := client.LoadConfig()
+	config, err := LoadConfig()
 	if err != nil {
 		return nil, fmt.Errorf("failed to save config: %w", err)
 	}
 
-	config.Filesystems[name] = client.FilesystemInfo{
+	config.Filesystems[name] = FilesystemInfo{
 		ID:     apiResponse.Data.ID,
 		Region: apiResponse.Data.Region.Name,
 	}
 
-	if err := client.SaveConfig(config); err != nil {
+	if err := SaveConfig(config); err != nil {
 		return nil, fmt.Errorf("failed to save config: %w", err)
 	}
 
@@ -617,12 +616,12 @@ func (p *LambdaProvider) CreateFilesystem(httpClient *http.Client, apiToken stri
 }
 
 // GetFilesystemInfo returns filesystem info from config by name
-func (p *LambdaProvider) GetFilesystemInfo(filesystemName string) (*client.FilesystemInfo, error) {
-	return client.GetFilesystemInfo(filesystemName)
+func (p *LambdaProvider) GetFilesystemInfo(filesystemName string) (*FilesystemInfo, error) {
+	return GetFilesystemInfo(filesystemName)
 }
 
 // ListFilesystems retrieves a list of filesystems from Lambda Cloud
-func (p *LambdaProvider) ListFilesystems(httpClient *http.Client, apiToken string) ([]client.Filesystem, error) {
+func (p *LambdaProvider) ListFilesystems(httpClient *http.Client, apiToken string) ([]Filesystem, error) {
 	req, err := http.NewRequest("GET", "https://cloud.lambda.ai/api/v1/file-systems", nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
@@ -646,7 +645,7 @@ func (p *LambdaProvider) ListFilesystems(httpClient *http.Client, apiToken strin
 	}
 
 	var apiResponse struct {
-		Data []client.Filesystem `json:"data"`
+		Data []Filesystem `json:"data"`
 	}
 
 	err = json.Unmarshal(body, &apiResponse)
@@ -690,7 +689,7 @@ func (p *LambdaProvider) DeleteFilesystem(httpClient *http.Client, apiToken stri
 }
 
 // GetGlobalFirewallRules retrieves the current global firewall ruleset
-func (p *LambdaProvider) GetGlobalFirewallRules(httpClient *http.Client, apiToken string) (*client.GlobalFirewallRuleset, error) {
+func (p *LambdaProvider) GetGlobalFirewallRules(httpClient *http.Client, apiToken string) (*GlobalFirewallRuleset, error) {
 	url := "https://cloud.lambda.ai/api/v1/firewall-rulesets/global"
 
 	req, err := http.NewRequest("GET", url, nil)
@@ -716,7 +715,7 @@ func (p *LambdaProvider) GetGlobalFirewallRules(httpClient *http.Client, apiToke
 		return nil, fmt.Errorf("failed to read response body: %w", err)
 	}
 
-	var apiResponse client.GlobalFirewallRulesetResponse
+	var apiResponse GlobalFirewallRulesetResponse
 	err = json.Unmarshal(body, &apiResponse)
 	if err != nil {
 		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
@@ -726,10 +725,10 @@ func (p *LambdaProvider) GetGlobalFirewallRules(httpClient *http.Client, apiToke
 }
 
 // UpdateGlobalFirewallRules updates the global firewall ruleset with new rules
-func (p *LambdaProvider) UpdateGlobalFirewallRules(httpClient *http.Client, apiToken string, rules []client.FirewallRule) (*client.GlobalFirewallRuleset, error) {
+func (p *LambdaProvider) UpdateGlobalFirewallRules(httpClient *http.Client, apiToken string, rules []FirewallRule) (*GlobalFirewallRuleset, error) {
 	url := "https://cloud.lambda.ai/api/v1/firewall-rulesets/global"
 
-	patchRequest := client.GlobalFirewallRulesetPatchRequest{
+	patchRequest := GlobalFirewallRulesetPatchRequest{
 		Rules: rules,
 	}
 
@@ -762,7 +761,7 @@ func (p *LambdaProvider) UpdateGlobalFirewallRules(httpClient *http.Client, apiT
 		return nil, fmt.Errorf("failed to read response body: %w", err)
 	}
 
-	var apiResponse client.GlobalFirewallRulesetResponse
+	var apiResponse GlobalFirewallRulesetResponse
 	err = json.Unmarshal(body, &apiResponse)
 	if err != nil {
 		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
@@ -796,7 +795,7 @@ func (p *LambdaProvider) EnsurePortOpen(httpClient *http.Client, apiToken string
 	}
 
 	// Add new rule for the port
-	newRule := client.FirewallRule{
+	newRule := FirewallRule{
 		Protocol:      protocol,
 		PortRange:     []int{port, port},
 		SourceNetwork: "0.0.0.0/0",

@@ -63,13 +63,3 @@ func getCloudProviderType() string {
 	}
 	return cloud
 }
-
-// GetAPIToken returns the appropriate API token based on the cloud provider
-func GetAPIToken(providerType CloudProviderType) string {
-	switch providerType {
-	case CloudProviderLambda:
-		return os.Getenv("LAMBDA_API_KEY")
-	default:
-		return os.Getenv("LAMBDA_API_KEY")
-	}
-}
