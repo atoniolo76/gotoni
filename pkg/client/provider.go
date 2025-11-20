@@ -63,3 +63,19 @@ func getCloudProviderType() string {
 	}
 	return cloud
 }
+
+// GetAPIToken returns the API token from environment variable based on the current cloud provider
+func GetAPIToken() string {
+	_, providerType := GetCloudProvider()
+	return GetAPITokenForProvider(providerType)
+}
+
+// GetAPITokenForProvider returns the API token for a specific provider
+func GetAPITokenForProvider(providerType CloudProviderType) string {
+	switch providerType {
+	case CloudProviderLambda:
+		return os.Getenv("LAMBDA_API_KEY")
+	default:
+		return os.Getenv("LAMBDA_API_KEY")
+	}
+}

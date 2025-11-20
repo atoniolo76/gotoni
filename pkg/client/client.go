@@ -843,22 +843,6 @@ func FilterTasksByType(tasks []Task, taskType string) []Task {
 	return filtered
 }
 
-// GetAPIToken returns the API token from environment variable based on the current cloud provider
-func GetAPIToken() string {
-	_, providerType := GetCloudProvider()
-	return GetAPITokenForProvider(providerType)
-}
-
-// GetAPITokenForProvider returns the API token for a specific provider
-func GetAPITokenForProvider(providerType CloudProviderType) string {
-	switch providerType {
-	case CloudProviderLambda:
-		return os.Getenv("LAMBDA_API_KEY")
-	default:
-		return os.Getenv("LAMBDA_API_KEY")
-	}
-}
-
 // GetGlobalFirewallRules retrieves the current global firewall ruleset
 func GetGlobalFirewallRules(httpClient *http.Client, apiToken string) (*GlobalFirewallRuleset, error) {
 	url := "https://cloud.lambda.ai/api/v1/firewall-rulesets/global"
