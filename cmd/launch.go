@@ -107,8 +107,17 @@ var launchCmd = &cobra.Command{
 			fmt.Printf("Launched instance: %s\n", instance.ID)
 			fmt.Printf("SSH Key: %s\n", instance.SSHKeyName)
 			fmt.Printf("SSH Key File: %s\n", instance.SSHKeyFile)
-			fmt.Printf("Connect with: ssh -i %s ubuntu@<instance-ip>\n", instance.SSHKeyFile)
-			fmt.Printf("Or use: gotoni connect <instance-ip>\n\n")
+			
+			if wait {
+				fmt.Printf("\nInstance is ready!\n")
+				fmt.Printf("Connect via SSH: ssh %s\n", instanceName)
+				fmt.Printf("Open in VS Code: gotoni open %s\n", instanceName)
+			} else {
+				fmt.Printf("\nInstance is launching (SSH config not updated yet)\n")
+				fmt.Printf("Connect with: ssh -i %s ubuntu@<instance-ip>\n", instance.SSHKeyFile)
+				fmt.Printf("Or use: gotoni connect <instance-ip>\n")
+			}
+			fmt.Println()
 		}
 	},
 }
