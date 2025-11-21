@@ -420,51 +420,6 @@ func TerminateInstance(
 	return provider.TerminateInstance(httpClient, apiToken, instanceIDs)
 }
 
-// createSSHKey generates a new SSH key pair on Lambda and returns both keys
-func createSSHKey(httpClient *http.Client, apiToken string, name string) (*GeneratedSSHKey, error) {
-	requestBody := map[string]string{"name": name}
-
-	jsonBody, err := json.Marshal(requestBody)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal request body: %w", err)
-	}
-
-	req, err := http.NewRequest("POST", "https://cloud.lambda.ai/api/v1/ssh-keys", strings.NewReader(string(jsonBody)))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-
-	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", apiToken))
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to execute request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read response body: %w", err)
-	}
-
-	var apiResponse struct {
-		Data GeneratedSSHKey `json:"data"`
-	}
-
-	err = json.Unmarshal(body, &apiResponse)
-	if err != nil {
-		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
-	}
-
-	return &apiResponse.Data, nil
-}
-
 // CreateSSHKeyForProject creates a new SSH key and saves it in the ssh directory
 func CreateSSHKeyForProject(httpClient *http.Client, apiToken string) (string, string, error) {
 	provider, _ := GetCloudProvider()
