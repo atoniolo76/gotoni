@@ -15,10 +15,13 @@ import (
 
 // launchCmd represents the launch command
 var launchCmd = &cobra.Command{
-	Use:   "launch",
+	Use:   "launch <instance-name>",
 	Short: "Launch a new instance on your Neocloud.",
-	Long:  `Launch a new instance on your Neocloud.`,
+	Long:  `Launch a new instance on your Neocloud with the specified name.`,
+	Args:  cobra.ExactArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
+		instanceName := args[0]
+		
 		instanceType, err := cmd.Flags().GetString("instance-type")
 		if err != nil {
 			log.Fatalf("Error getting instance type: %v", err)
@@ -75,10 +78,24 @@ var launchCmd = &cobra.Command{
 
 		if wait {
 			// Launch and wait for instances to be ready
-			launchedInstances, launchErr = client.LaunchAndWait(httpClient, apiToken, instanceType, region, 1, "cli-launch", "", waitTimeout, filesystemName)
+			launchedInstances, launchErr = client.LaunchAndWait(httpClient, apiToken, instanceType, region, 1, instanceName, "", waitTimeout, filesystemName)
+			
+			// If successful and we waited, update SSH config
+			if launchErr == nil {
+				for _, instance := range launchedInstances {
+					// Get instance details to get IP
+					details, err := client.GetInstance(httpClient, apiToken, instance.ID)
+					if err == nil && details.IP != "" {
+						if err := client.UpdateSSHConfig(instanceName, details.IP, instance.SSHKeyFile); err != nil {
+							fmt.Printf("Warning: Failed to update SSH config: %v\n", err)
+						}
+					}
+				}
+			}
 		} else {
 			// Launch the instance (this creates SSH key and saves to config)
-			launchedInstances, launchErr = client.LaunchInstance(httpClient, apiToken, instanceType, region, 1, "cli-launch", "", filesystemName)
+			launchedInstances, launchErr = client.LaunchInstance(httpClient, apiToken, instanceType, region, 1, instanceName, "", filesystemName)
+			fmt.Println("Note: SSH config not updated because IP is not yet available. Use --wait flag to update SSH config automatically.")
 		}
 
 		if launchErr != nil {

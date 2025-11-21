@@ -37,7 +37,11 @@ func (p *LambdaProvider) LaunchInstance(httpClient *http.Client, apiToken string
 	if sshKeyName != "" {
 		// Use the provided existing SSH key name
 		finalSSHKeyName = sshKeyName
-		sshKeyFile = filepath.Join("ssh", sshKeyName+".pem")
+		sshDir, err := getSSHDir()
+		if err != nil {
+			return nil, fmt.Errorf("failed to get ssh directory: %w", err)
+		}
+		sshKeyFile = filepath.Join(sshDir, sshKeyName+".pem")
 		// Check if the private key file exists
 		if _, err := os.Stat(sshKeyFile); os.IsNotExist(err) {
 			return nil, fmt.Errorf("private key file %s does not exist for SSH key %s", sshKeyFile, sshKeyName)
@@ -392,8 +396,11 @@ func (p *LambdaProvider) CreateSSHKeyForProject(httpClient *http.Client, apiToke
 	}
 
 	// Create ssh directory if it doesn't exist
-	sshDir := "ssh"
-	if err := os.MkdirAll(sshDir, 0755); err != nil {
+	sshDir, err := getSSHDir()
+	if err != nil {
+		return "", "", fmt.Errorf("failed to get ssh directory: %w", err)
+	}
+	if err := os.MkdirAll(sshDir, 0700); err != nil {
 		return "", "", fmt.Errorf("failed to create ssh directory: %w", err)
 	}
 
