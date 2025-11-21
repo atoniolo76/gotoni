@@ -2,7 +2,6 @@ package client
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -452,8 +451,11 @@ func AddExistingSSHKey(keyPath string, keyName string) (string, string, error) {
 	}
 
 	// Create ssh directory if it doesn't exist
-	sshDir := "ssh"
-	if err := os.MkdirAll(sshDir, 0755); err != nil {
+	sshDir, err := getSSHDir()
+	if err != nil {
+		return "", "", fmt.Errorf("failed to get ssh directory: %w", err)
+	}
+	if err := os.MkdirAll(sshDir, 0700); err != nil {
 		return "", "", fmt.Errorf("failed to create ssh directory: %w", err)
 	}
 
@@ -486,6 +488,16 @@ func AddExistingSSHKey(keyPath string, keyName string) (string, string, error) {
 	}
 
 	return keyName, targetPath, nil
+}
+
+// getSSHDir returns the directory where SSH keys should be stored
+// ~/.ssh on macOS/Linux, C:\Users\<User>\.ssh on Windows
+func getSSHDir() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("failed to get user home directory: %w", err)
+	}
+	return filepath.Join(home, ".ssh"), nil
 }
 
 // DeleteSSHKey deletes an SSH key from Lambda Cloud by ID
@@ -925,163 +937,3 @@ func EnsurePortOpen(httpClient *http.Client, apiToken string, port int, protocol
 	return nil
 }
 
-// CreateSystemdService creates a systemd user service file
-func (scm *SSHClientManager) CreateSystemdService(instanceIP string, serviceName string, command string, workingDir string, envVars map[string]string, serviceOpts *Task) error {
-	// Ensure systemd user directory exists
-	serviceDirCmd := "mkdir -p ~/.config/systemd/user"
-	if _, err := scm.ExecuteCommand(instanceIP, serviceDirCmd); err != nil {
-		return fmt.Errorf("failed to create systemd user directory: %w", err)
-	}
-
-	// Build environment variables
-	envVarsStr := ""
-	for k, v := range envVars {
-		// Escape quotes in environment variable values
-		escapedV := strings.ReplaceAll(v, `"`, `\"`)
-		envVarsStr += fmt.Sprintf("Environment=\"%s=%s\"\n", k, escapedV)
-	}
-
-	// Add PATH if not already set
-	if _, hasPath := envVars["PATH"]; !hasPath {
-		envVarsStr += "Environment=\"PATH=/home/ubuntu/.local/bin:/usr/local/bin:/usr/bin:/bin\"\n"
-	}
-
-	// Escape the command for the service file
-	// Since ExecStart needs the full command, we'll use a shell wrapper
-	execStart := fmt.Sprintf("/bin/bash -c %s", fmt.Sprintf("%q", command))
-
-	// Set defaults for service options
-	restart := "always"
-	restartSec := 10
-
-	if serviceOpts != nil {
-		if serviceOpts.Restart != "" {
-			restart = serviceOpts.Restart
-		}
-		if serviceOpts.RestartSec > 0 {
-			restartSec = serviceOpts.RestartSec
-		}
-	}
-
-	// Build service section
-	serviceSection := fmt.Sprintf(`[Service]
-Type=simple
-WorkingDirectory=%s
-%sExecStart=%s
-Restart=%s
-RestartSec=%d
-StandardOutput=journal
-StandardError=journal
-`, workingDir, envVarsStr, execStart, restart, restartSec)
-
-	// Create service file content
-	serviceContent := fmt.Sprintf(`[Unit]
-Description=%s
-After=network.target
-
-%s
-[Install]
-WantedBy=default.target
-`, serviceName, serviceSection)
-
-	// Write service file using base64 encoding for reliable transfer
-	serviceFile := fmt.Sprintf("~/.config/systemd/user/%s.service", serviceName)
-
-	// Base64 encode the content to avoid shell escaping issues
-	encodedContent := base64.StdEncoding.EncodeToString([]byte(serviceContent))
-
-	// Decode and write using base64 -d
-	writeCmd := fmt.Sprintf("echo %s | base64 -d > %s", encodedContent, serviceFile)
-	if _, err := scm.ExecuteCommand(instanceIP, writeCmd); err != nil {
-		return fmt.Errorf("failed to write service file: %w", err)
-	}
-
-	// Reload systemd daemon
-	reloadCmd := "systemctl --user daemon-reload"
-	if _, err := scm.ExecuteCommand(instanceIP, reloadCmd); err != nil {
-		return fmt.Errorf("failed to reload systemd daemon: %w", err)
-	}
-
-	return nil
-}
-
-// StartSystemdService starts a systemd user service
-func (scm *SSHClientManager) StartSystemdService(instanceIP string, serviceName string) error {
-	// Ensure lingering is enabled for user services to persist after logout
-	enableCmd := "loginctl enable-linger $USER 2>/dev/null || true"
-	scm.ExecuteCommand(instanceIP, enableCmd)
-
-	// Start the service
-	startCmd := fmt.Sprintf("systemctl --user start %s.service", serviceName)
-	output, err := scm.ExecuteCommand(instanceIP, startCmd)
-	if err != nil {
-		return fmt.Errorf("failed to start service: %w\nOutput: %s", err, output)
-	}
-	return nil
-}
-
-// StopSystemdService stops a systemd user service
-func (scm *SSHClientManager) StopSystemdService(instanceIP string, serviceName string) error {
-	stopCmd := fmt.Sprintf("systemctl --user stop %s.service 2>/dev/null || true", serviceName)
-	_, err := scm.ExecuteCommand(instanceIP, stopCmd)
-	return err
-}
-
-// ListSystemdServices lists all gotoni-managed systemd services
-func (scm *SSHClientManager) ListSystemdServices(instanceIP string) ([]string, error) {
-	// List all user services and filter for gotoni-managed ones
-	// We'll use a naming convention: gotoni-<service-name>
-	cmd := "systemctl --user list-units --type=service --no-pager --no-legend 2>/dev/null | grep -E 'gotoni-' | awk '{print $1}' | sed 's/\\.service$//' | sed 's/^gotoni-//' || echo ''"
-	output, err := scm.ExecuteCommand(instanceIP, cmd)
-	if err != nil {
-		return nil, err
-	}
-
-	services := []string{}
-	if output != "" {
-		lines := strings.Split(strings.TrimSpace(output), "\n")
-		for _, line := range lines {
-			if line != "" {
-				services = append(services, strings.TrimSpace(line))
-			}
-		}
-	}
-	return services, nil
-}
-
-// GetSystemdServiceStatus gets the status of a systemd service
-func (scm *SSHClientManager) GetSystemdServiceStatus(instanceIP string, serviceName string) (string, error) {
-	cmd := fmt.Sprintf("systemctl --user is-active gotoni-%s.service 2>&1 || echo 'inactive'", serviceName)
-	status, err := scm.ExecuteCommand(instanceIP, cmd)
-	if err != nil {
-		return "unknown", err
-	}
-	return strings.TrimSpace(status), nil
-}
-
-// GetSystemdLogs gets logs from a systemd service using journalctl
-func (scm *SSHClientManager) GetSystemdLogs(instanceIP string, serviceName string, lines int) (string, error) {
-	if lines <= 0 {
-		lines = 100 // Default to last 100 lines
-	}
-	cmd := fmt.Sprintf("journalctl --user -u gotoni-%s.service -n %d --no-pager 2>&1 || echo 'Service not found or no logs'", serviceName, lines)
-	return scm.ExecuteCommand(instanceIP, cmd)
-}
-
-// Legacy tmux functions (kept for backward compatibility, but deprecated)
-// ListTmuxSessions lists all tmux sessions on a remote instance
-func (scm *SSHClientManager) ListTmuxSessions(instanceIP string) ([]string, error) {
-	// Now delegates to systemd
-	return scm.ListSystemdServices(instanceIP)
-}
-
-// GetTmuxLogs gets the output/logs from a tmux session
-func (scm *SSHClientManager) GetTmuxLogs(instanceIP string, sessionName string, lines int) (string, error) {
-	// Now delegates to systemd
-	return scm.GetSystemdLogs(instanceIP, sessionName, lines)
-}
-
-// AttachToTmuxSession attaches to a tmux session (returns command to run)
-func AttachToTmuxSessionCommand(instanceIP string, sessionName string, sshKeyFile string) string {
-	return fmt.Sprintf("ssh -i %s -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ubuntu@%s -t 'tmux attach -t %s'", sshKeyFile, instanceIP, sessionName)
-}
