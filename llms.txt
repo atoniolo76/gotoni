@@ -52,9 +52,25 @@ gotoni run [instance-id] <command>
 ### Task Management
 
 #### Add Task
-Interactively add a new task to the configuration:
+Interactively add a new task to the configuration with guided prompts:
 ```bash
 gotoni add-task
+```
+
+The interactive wizard prompts for:
+- **Task name**: Descriptive name for the task
+- **Task type**: Choose between "command" (one-time execution) or "service" (background process)
+- **Command**: Shell command to execute
+- **Dependencies**: Select from existing tasks that must complete first (optional)
+- **Working directory**: Directory to run the command in (optional)
+
+Example interactive session:
+```
+Task name: Install Python packages
+Task type: command
+Command to execute: pip install torch torchvision
+Select dependencies: Install Python, Update system
+Working directory: /home/ubuntu/project
 ```
 
 #### Setup Tasks
@@ -141,30 +157,101 @@ gotoni update
 
 ## Configuration
 
-Configuration is stored in `~/.gotoni/config.yaml`:
+Configuration is stored in `~/.gotoni/config.yaml` and supports three main sections:
 
+### Instances Mapping
+Maps instance IDs to SSH key names for authentication:
 ```yaml
 instances:
   instance-123: lambda-key-1234567890
+  instance-456: my-custom-key
+```
 
+### SSH Keys Mapping
+Maps SSH key names to private key file paths:
+```yaml
 ssh_keys:
   lambda-key-1234567890: ssh/lambda-key-1234567890.pem
+  my-custom-key: ~/.ssh/my-key.pem
+```
 
+### Filesystems Mapping
+Maps filesystem names to their Lambda Cloud IDs and regions:
+```yaml
 filesystems:
   my-data:
     id: fs-123
     region: us-east-1
+  models-storage:
+    id: fs-456
+    region: us-west-2
+```
 
+### Tasks Array
+Defines automation tasks/playbooks with full YAML configuration:
+
+```yaml
 tasks:
-  - name: "Install dependencies"
+  # Simple command task
+  - name: "Update system"
     type: "command"
-    command: "sudo apt-get update"
+    command: "sudo apt-get update && sudo apt-get upgrade -y"
 
-  - name: "Start server"
-    type: "service"
-    command: "python app.py"
+  # Command with working directory and environment
+  - name: "Install Python packages"
+    type: "command"
+    command: "pip install torch torchvision transformers"
+    working_dir: "/home/ubuntu/project"
+    env:
+      CUDA_HOME: "/usr/local/cuda"
+      PYTHONPATH: "/home/ubuntu/project"
     depends_on:
-      - Install dependencies
+      - "Update system"
+
+  # Background command task
+  - name: "Download dataset"
+    type: "command"
+    command: "wget -O dataset.zip https://example.com/data.zip && unzip dataset.zip"
+    background: true
+    working_dir: "/data"
+    depends_on:
+      - "Install Python packages"
+
+  # Service task (managed by systemd)
+  - name: "Start ML training"
+    type: "service"
+    command: "python train.py --config config.yaml"
+    working_dir: "/home/ubuntu/project"
+    env:
+      CUDA_VISIBLE_DEVICES: "0"
+      WANDB_API_KEY: "${WANDB_API_KEY}"
+    restart: "on-failure"
+    restart_sec: 10
+    depends_on:
+      - "Download dataset"
+      - "Install Python packages"
+```
+
+### YAML Field Reference
+
+#### Task Fields
+- `name`: Unique task identifier (required)
+- `type`: "command" or "service" (required)
+- `command`: Shell command to execute (required)
+- `depends_on`: Array of task names that must complete first (optional)
+- `working_dir`: Directory to execute command in (optional, defaults to /home/ubuntu)
+- `env`: Key-value pairs for environment variables (optional)
+- `background`: Run command in background (command type only, optional)
+- `restart`: Restart policy for services: "always", "on-failure", "on-success", "no" (optional, defaults to "always")
+- `restart_sec`: Seconds to wait before restarting (optional, defaults to 10)
+
+#### Conditional Execution
+Tasks can include conditional logic:
+```yaml
+- name: "Install CUDA"
+  type: "command"
+  command: "install_cuda.sh"
+  when: "instance_type == 'gpu_1x_a100_sxm4'"
 ```
 
 ## Task Types
