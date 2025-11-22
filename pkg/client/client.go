@@ -557,8 +557,8 @@ func AddExistingSSHKey(keyPath string, keyName string) (string, string, error) {
 		return "", "", fmt.Errorf("failed to read SSH key file: %w", err)
 	}
 
-	// Write to target location with proper permissions
-	if err := os.WriteFile(targetPath, sourceData, 0600); err != nil {
+	// Write to target location with proper permissions (read-only by owner)
+	if err := os.WriteFile(targetPath, sourceData, 0400); err != nil {
 		return "", "", fmt.Errorf("failed to copy SSH key file: %w", err)
 	}
 

@@ -406,7 +406,7 @@ func (p *LambdaProvider) CreateSSHKeyForProject(httpClient *http.Client, apiToke
 
 	// Save the private key in ssh directory
 	privateKeyFile := filepath.Join(sshDir, keyName+".pem")
-	err = os.WriteFile(privateKeyFile, []byte(generatedKey.PrivateKey), 0600)
+	err = os.WriteFile(privateKeyFile, []byte(generatedKey.PrivateKey), 0400)
 	if err != nil {
 		return "", "", fmt.Errorf("failed to save private key: %w", err)
 	}
