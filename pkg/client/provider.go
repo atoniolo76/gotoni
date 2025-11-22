@@ -9,8 +9,8 @@ import (
 // CloudProvider defines the interface that all cloud providers must implement
 type CloudProvider interface {
 	// Instance Management
-	LaunchInstance(httpClient *http.Client, apiToken string, instanceType string, region string, quantity int, name string, sshKeyName string, filesystemName string) ([]LaunchedInstance, error)
-	LaunchAndWait(httpClient *http.Client, apiToken string, instanceType string, region string, quantity int, name string, sshKeyName string, timeout time.Duration, filesystemName string) ([]LaunchedInstance, error)
+	LaunchInstance(httpClient *http.Client, apiToken string, instanceType string, region string, quantity int, name string, sshKeyName string, filesystemName string, dockerImage string) ([]LaunchedInstance, error)
+	LaunchAndWait(httpClient *http.Client, apiToken string, instanceType string, region string, quantity int, name string, sshKeyName string, timeout time.Duration, filesystemName string, dockerImage string) ([]LaunchedInstance, error)
 	GetInstance(httpClient *http.Client, apiToken string, instanceID string) (*RunningInstance, error)
 	ListRunningInstances(httpClient *http.Client, apiToken string) ([]RunningInstance, error)
 	TerminateInstance(httpClient *http.Client, apiToken string, instanceIDs []string) (*InstanceTerminateResponse, error)

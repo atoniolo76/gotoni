@@ -15,7 +15,7 @@ import (
 
 // logsCmd represents the logs command
 var logsCmd = &cobra.Command{
-	Use:   "logs [instance-id] [service-name]",
+	Use:   "logs [instance-name] [service-name]",
 	Short: "View logs from a systemd service",
 	Long: `View logs from a systemd user service running on a remote instance using journalctl.
 If service-name is not provided, shows logs from all services.`,
@@ -41,22 +41,30 @@ If service-name is not provided, shows logs from all services.`,
 			lines = 100 // Default
 		}
 
-		var instanceID string
+		var instanceDetails *client.RunningInstance
 		var sessionName string
 
 		if len(args) == 0 {
-			log.Fatal("Please provide at least an instance ID. Use 'gotoni logs <instance-id> [service-name]'")
+			log.Fatal("Please provide at least an instance name. Use 'gotoni logs <instance-name> [service-name]'")
 		} else if len(args) == 1 {
-			instanceID = args[0]
+			instanceName := args[0]
+			// Resolve instance name/ID to instance details
+			httpClient := client.NewHTTPClient()
+			instanceDetails, err = client.ResolveInstance(httpClient, apiToken, instanceName)
+			if err != nil {
+				log.Fatalf("Failed to resolve instance '%s': %v", instanceName, err)
+			}
 		} else {
-			instanceID = args[0]
+			instanceName := args[0]
 			sessionName = args[1]
+
+			// Resolve instance name/ID to instance details
+			httpClient := client.NewHTTPClient()
+			instanceDetails, err = client.ResolveInstance(httpClient, apiToken, instanceName)
+			if err != nil {
+				log.Fatalf("Failed to resolve instance '%s': %v", instanceName, err)
+			}
 		}
-
-		// Get instance details
-		httpClient := client.NewHTTPClient()
-
-		instanceDetails, err := client.GetInstance(httpClient, apiToken, instanceID)
 		if err != nil {
 			log.Fatalf("Failed to get instance details: %v", err)
 		}
@@ -66,7 +74,7 @@ If service-name is not provided, shows logs from all services.`,
 		}
 
 		// Get SSH key
-		sshKeyFile, err := client.GetSSHKeyForInstance(instanceID)
+		sshKeyFile, err := client.GetSSHKeyForInstance(instanceDetails.ID)
 		if err != nil {
 			log.Fatalf("Failed to get SSH key: %v", err)
 		}
@@ -75,7 +83,7 @@ If service-name is not provided, shows logs from all services.`,
 		manager := client.NewSSHClientManager()
 		defer manager.CloseAllConnections()
 
-		fmt.Printf("Connecting to instance %s (%s)...\n", instanceID, instanceDetails.IP)
+		fmt.Printf("Connecting to instance %s (%s)...\n", instanceDetails.Name, instanceDetails.IP)
 		if err := manager.ConnectToInstance(instanceDetails.IP, sshKeyFile); err != nil {
 			log.Fatalf("Failed to connect via SSH: %v", err)
 		}
