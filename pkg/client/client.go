@@ -53,16 +53,30 @@ type Region struct {
 }
 
 type InstanceLaunchRequest struct {
-	RegionName       string   `json:"region_name"`
-	InstanceTypeName string   `json:"instance_type_name"`
-	SSHKeyNames      []string `json:"ssh_key_names"`
-	FileSystemNames  []string `json:"file_system_names,omitempty"`
-	Quantity         int      `json:"quantity,omitempty"`
-	Name             string   `json:"name,omitempty"`
+	RegionName       string                          `json:"region_name"`
+	InstanceTypeName string                          `json:"instance_type_name"`
+	SSHKeyNames      []string                        `json:"ssh_key_names"`
+	FileSystemNames  []string                        `json:"file_system_names,omitempty"`
+	FileSystemMounts []RequestedFilesystemMountEntry `json:"file_system_mounts,omitempty"`
+	Quantity         int                             `json:"quantity,omitempty"`
+	Hostname         string                          `json:"hostname,omitempty"`
+	Name             string                          `json:"name,omitempty"`
+	Image            interface{}                     `json:"image,omitempty"` // ImageSpecificationID or ImageSpecificationFamily
+	UserData         string                          `json:"user_data,omitempty"`
+	Tags             []RequestedTagEntry             `json:"tags,omitempty"`
+	FirewallRulesets []FirewallRulesetEntry          `json:"firewall_rulesets,omitempty"`
 }
 
 type InstanceLaunchResponse struct {
 	InstanceIDs []string `json:"instance_ids"`
+}
+
+type InstanceRestartRequest struct {
+	InstanceIDs []string `json:"instance_ids"`
+}
+
+type InstanceRestartResponse struct {
+	RestartedInstances []RunningInstance `json:"restarted_instances"`
 }
 
 type InstanceTerminateRequest struct {
@@ -70,30 +84,27 @@ type InstanceTerminateRequest struct {
 }
 
 type InstanceTerminateResponse struct {
-	TerminatedInstances []TerminatedInstance `json:"terminated_instances"`
-}
-
-type TerminatedInstance struct {
-	ID     string `json:"id"`
-	Name   string `json:"name,omitempty"`
-	Status string `json:"status"`
-	// Add other fields as needed
+	TerminatedInstances []RunningInstance `json:"terminated_instances"`
 }
 
 type RunningInstance struct {
-	ID              string       `json:"id"`
-	Name            string       `json:"name,omitempty"`
-	IP              string       `json:"ip"`
-	PrivateIP       string       `json:"private_ip"`
-	Status          string       `json:"status"`
-	SSHKeyNames     []string     `json:"ssh_key_names"`
-	FileSystemNames []string     `json:"file_system_names"`
-	Region          Region       `json:"region"`
-	InstanceType    InstanceType `json:"instance_type"`
-	Hostname        string       `json:"hostname"`
-	JupyterToken    string       `json:"jupyter_token"`
-	JupyterURL      string       `json:"jupyter_url"`
-	IsReserved      bool         `json:"is_reserved"`
+	ID                string                        `json:"id"`
+	Name              string                        `json:"name,omitempty"`
+	IP                string                        `json:"ip"`
+	PrivateIP         string                        `json:"private_ip"`
+	Status            string                        `json:"status"`
+	SSHKeyNames       []string                      `json:"ssh_key_names"`
+	FileSystemNames   []string                      `json:"file_system_names"`
+	FileSystemMounts  []FilesystemMountEntry        `json:"file_system_mounts,omitempty"`
+	Region            Region                        `json:"region"`
+	InstanceType      InstanceType                  `json:"instance_type"`
+	Hostname          string                        `json:"hostname"`
+	JupyterToken      string                        `json:"jupyter_token"`
+	JupyterURL        string                        `json:"jupyter_url"`
+	IsReserved        bool                          `json:"is_reserved"`
+	Actions           InstanceActionAvailability    `json:"actions"`
+	Tags              []TagEntry                    `json:"tags,omitempty"`
+	FirewallRulesets  []FirewallRulesetEntry        `json:"firewall_rulesets,omitempty"`
 }
 
 type LaunchedInstance struct {
@@ -115,6 +126,65 @@ type SSHKey struct {
 	PublicKey string `json:"public_key"`
 }
 
+// Instance action availability types
+type InstanceActionUnavailableCode string
+
+const (
+	InstanceActionUnavailableVMHasNotLaunched InstanceActionUnavailableCode = "vm-has-not-launched"
+	InstanceActionUnavailableVMIsTooOld      InstanceActionUnavailableCode = "vm-is-too-old"
+	InstanceActionUnavailableVMIsTerminating InstanceActionUnavailableCode = "vm-is-terminating"
+)
+
+type InstanceActionAvailabilityDetails struct {
+	Available       bool                        `json:"available"`
+	ReasonCode      *InstanceActionUnavailableCode `json:"reason_code,omitempty"`
+	ReasonDescription string                     `json:"reason_description,omitempty"`
+}
+
+type InstanceActionAvailability struct {
+	Migrate    InstanceActionAvailabilityDetails `json:"migrate"`
+	Rebuild    InstanceActionAvailabilityDetails `json:"rebuild"`
+	Restart    InstanceActionAvailabilityDetails `json:"restart"`
+	ColdReboot InstanceActionAvailabilityDetails `json:"cold_reboot"`
+	Terminate  InstanceActionAvailabilityDetails `json:"terminate"`
+}
+
+// Tag and filesystem mount types
+type TagEntry struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
+}
+
+type RequestedTagEntry struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
+}
+
+type FilesystemMountEntry struct {
+	MountPoint   string `json:"mount_point"`
+	FileSystemID string `json:"file_system_id"`
+}
+
+type RequestedFilesystemMountEntry struct {
+	MountPoint   string `json:"mount_point"`
+	FileSystemID string `json:"file_system_id"`
+}
+
+// Firewall ruleset types
+type FirewallRulesetEntry struct {
+	ID string `json:"id"`
+}
+
+// Image specification types
+type ImageSpecificationID struct {
+	ID string `json:"id"`
+}
+
+type ImageSpecificationFamily struct {
+	Family string `json:"family"`
+}
+
+// Firewall rule types
 type FirewallRule struct {
 	Protocol      string `json:"protocol"`       // "tcp", "udp", "icmp", or "all"
 	PortRange     []int  `json:"port_range"`     // [min, max] - required for non-icmp protocols
