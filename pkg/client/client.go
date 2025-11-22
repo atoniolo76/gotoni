@@ -410,6 +410,25 @@ func ListRunningInstances(httpClient *http.Client, apiToken string) ([]RunningIn
 	return provider.ListRunningInstances(httpClient, apiToken)
 }
 
+// ResolveInstance resolves an instance name or ID to a RunningInstance
+// If the input matches an instance name, returns that instance
+// If the input matches an instance ID, returns that instance
+// If no match is found, returns an error
+func ResolveInstance(httpClient *http.Client, apiToken string, nameOrID string) (*RunningInstance, error) {
+	runningInstances, err := ListRunningInstances(httpClient, apiToken)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list running instances: %w", err)
+	}
+
+	for _, instance := range runningInstances {
+		if instance.Name == nameOrID || instance.ID == nameOrID {
+			return &instance, nil
+		}
+	}
+
+	return nil, fmt.Errorf("instance '%s' not found among running instances", nameOrID)
+}
+
 func TerminateInstance(
 	httpClient *http.Client,
 	apiToken string,
@@ -936,4 +955,3 @@ func EnsurePortOpen(httpClient *http.Client, apiToken string, port int, protocol
 
 	return nil
 }
-

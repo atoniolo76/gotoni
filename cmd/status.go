@@ -14,7 +14,7 @@ import (
 
 // statusCmd represents the status command
 var statusCmd = &cobra.Command{
-	Use:   "status [instance-id]",
+	Use:   "status [instance-name]",
 	Short: "Check status of services running on an instance",
 	Long: `Check the status of systemd user services running on a remote instance.
 Shows all active services and their status.`,
@@ -32,29 +32,27 @@ Shows all active services and their status.`,
 			}
 		}
 
-		var instanceID string
+		var instanceDetails *client.RunningInstance
 		if len(args) > 0 {
-			instanceID = args[0]
+			instanceName := args[0]
+			// Resolve instance name/ID to instance details
+			httpClient := client.NewHTTPClient()
+			instanceDetails, err = client.ResolveInstance(httpClient, apiToken, instanceName)
+			if err != nil {
+				log.Fatalf("Failed to resolve instance '%s': %v", instanceName, err)
+			}
 		} else {
-			// Use first running instance if no ID provided
+			// Use first running instance if no name provided
 			httpClient := client.NewHTTPClient()
 			runningInstances, err := client.ListRunningInstances(httpClient, apiToken)
 			if err != nil {
 				log.Fatalf("Failed to list running instances: %v", err)
 			}
 			if len(runningInstances) == 0 {
-				log.Fatal("No running instances found. Please provide an instance ID or launch an instance first.")
+				log.Fatal("No running instances found. Please provide an instance name or launch an instance first.")
 			}
-			instanceID = runningInstances[0].ID
-			fmt.Printf("Using instance: %s\n", instanceID)
-		}
-
-		// Get instance details
-		httpClient := client.NewHTTPClient()
-
-		instanceDetails, err := client.GetInstance(httpClient, apiToken, instanceID)
-		if err != nil {
-			log.Fatalf("Failed to get instance details: %v", err)
+			instanceDetails = &runningInstances[0]
+			fmt.Printf("Using instance: %s\n", instanceDetails.Name)
 		}
 
 		if instanceDetails.IP == "" {
@@ -62,7 +60,7 @@ Shows all active services and their status.`,
 		}
 
 		// Get SSH key
-		sshKeyFile, err := client.GetSSHKeyForInstance(instanceID)
+		sshKeyFile, err := client.GetSSHKeyForInstance(instanceDetails.ID)
 		if err != nil {
 			log.Fatalf("Failed to get SSH key: %v", err)
 		}
@@ -71,7 +69,7 @@ Shows all active services and their status.`,
 		manager := client.NewSSHClientManager()
 		defer manager.CloseAllConnections()
 
-		fmt.Printf("Connecting to instance %s (%s)...\n", instanceID, instanceDetails.IP)
+		fmt.Printf("Connecting to instance %s (%s)...\n", instanceDetails.Name, instanceDetails.IP)
 		if err := manager.ConnectToInstance(instanceDetails.IP, sshKeyFile); err != nil {
 			log.Fatalf("Failed to connect via SSH: %v", err)
 		}

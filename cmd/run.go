@@ -15,7 +15,7 @@ import (
 
 // runCmd represents the run command
 var runCmd = &cobra.Command{
-	Use:   "run [instance-id] <command>",
+	Use:   "run [instance-name] <command>",
 	Short: "Run a command on a remote instance",
 	Long: `Run a command directly on a remote instance via SSH.
 Example: gotoni run "ls -la"`,
@@ -34,10 +34,10 @@ Example: gotoni run "ls -la"`,
 			}
 		}
 
-		var instanceID string
+		var instanceDetails *client.RunningInstance
 		var command string
 
-		// Parse arguments: [instance-id] <command>
+		// Parse arguments: [instance-name] <command>
 		if len(args) == 1 {
 			// Only command provided, use first running instance
 			command = args[0]
@@ -47,22 +47,21 @@ Example: gotoni run "ls -la"`,
 				log.Fatalf("Failed to list running instances: %v", err)
 			}
 			if len(runningInstances) == 0 {
-				log.Fatal("No running instances found. Please provide an instance ID or launch an instance first.")
+				log.Fatal("No running instances found. Please provide an instance name or launch an instance first.")
 			}
-			instanceID = runningInstances[0].ID
-			fmt.Printf("Using instance: %s\n", instanceID)
+			instanceDetails = &runningInstances[0]
+			fmt.Printf("Using instance: %s\n", instanceDetails.Name)
 		} else {
-			// Instance ID and command provided
-			instanceID = args[0]
+			// Instance name and command provided
+			instanceName := args[0]
 			command = strings.Join(args[1:], " ")
-		}
 
-		// Get instance details
-		httpClient := client.NewHTTPClient()
-
-		instanceDetails, err := client.GetInstance(httpClient, apiToken, instanceID)
-		if err != nil {
-			log.Fatalf("Failed to get instance details: %v", err)
+			// Resolve instance name/ID to instance details
+			httpClient := client.NewHTTPClient()
+			instanceDetails, err = client.ResolveInstance(httpClient, apiToken, instanceName)
+			if err != nil {
+				log.Fatalf("Failed to resolve instance '%s': %v", instanceName, err)
+			}
 		}
 
 		if instanceDetails.IP == "" {
@@ -70,7 +69,7 @@ Example: gotoni run "ls -la"`,
 		}
 
 		// Get SSH key
-		sshKeyFile, err := client.GetSSHKeyForInstance(instanceID)
+		sshKeyFile, err := client.GetSSHKeyForInstance(instanceDetails.ID)
 		if err != nil {
 			log.Fatalf("Failed to get SSH key: %v", err)
 		}
@@ -79,7 +78,7 @@ Example: gotoni run "ls -la"`,
 		manager := client.NewSSHClientManager()
 		defer manager.CloseAllConnections()
 
-		fmt.Printf("Connecting to instance %s (%s)...\n", instanceID, instanceDetails.IP)
+		fmt.Printf("Connecting to instance %s (%s)...\n", instanceDetails.Name, instanceDetails.IP)
 		if err := manager.ConnectToInstance(instanceDetails.IP, sshKeyFile); err != nil {
 			log.Fatalf("Failed to connect via SSH: %v", err)
 		}

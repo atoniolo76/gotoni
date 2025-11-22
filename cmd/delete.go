@@ -16,9 +16,9 @@ import (
 
 // deleteCmd represents the delete command
 var deleteCmd = &cobra.Command{
-	Use:   "delete [instance-ids...]",
+	Use:   "delete [instance-names...]",
 	Short: "Terminate instances on Lambda Cloud",
-	Long:  `Terminate one or more instances on Lambda Cloud by providing their instance IDs.`,
+	Long:  `Terminate one or more instances on Lambda Cloud by providing their instance names.`,
 	Run: func(cmd *cobra.Command, args []string) {
 		apiToken, err := cmd.Flags().GetString("api-token")
 		if err != nil {
@@ -33,29 +33,39 @@ var deleteCmd = &cobra.Command{
 			}
 		}
 
-		// Get instance IDs from args or flags
-		var instanceIDs []string
+		// Get instance names from args or flags
+		var instanceNames []string
 
 		if len(args) > 0 {
-			// Instance IDs provided as arguments
-			instanceIDs = args
+			// Instance names provided as arguments
+			instanceNames = args
 		} else {
-			// Check for instance IDs flag
-			idsFlag, err := cmd.Flags().GetStringSlice("instance-ids")
+			// Check for instance names flag
+			namesFlag, err := cmd.Flags().GetStringSlice("instance-names")
 			if err != nil {
-				log.Fatalf("Error getting instance IDs: %v", err)
+				log.Fatalf("Error getting instance names: %v", err)
 			}
-			instanceIDs = idsFlag
+			instanceNames = namesFlag
 		}
 
-		if len(instanceIDs) == 0 {
-			log.Fatal("No instance IDs provided. Use 'gotoni delete <instance-id>' or 'gotoni delete --instance-ids <id1,id2>'")
+		if len(instanceNames) == 0 {
+			log.Fatal("No instance names provided. Use 'gotoni delete <instance-name>' or 'gotoni delete --instance-names <name1,name2>'")
 		}
 
 		// Create HTTP client
 		httpClient := client.NewHTTPClient()
 
-		fmt.Printf("Terminating instance(s): %s\n", strings.Join(instanceIDs, ", "))
+		// Resolve instance names to IDs
+		var instanceIDs []string
+		for _, name := range instanceNames {
+			instance, err := client.ResolveInstance(httpClient, apiToken, name)
+			if err != nil {
+				log.Fatalf("Failed to resolve instance '%s': %v", name, err)
+			}
+			instanceIDs = append(instanceIDs, instance.ID)
+		}
+
+		fmt.Printf("Terminating instance(s): %s\n", strings.Join(instanceNames, ", "))
 
 		terminatedResponse, err := client.TerminateInstance(httpClient, apiToken, instanceIDs)
 		if err != nil {
@@ -85,5 +95,5 @@ func init() {
 
 	// Here you will define your flags and configuration settings.
 	deleteCmd.Flags().StringP("api-token", "a", "", "API token for cloud provider (can also be set via LAMBDA_API_KEY env var)")
-	deleteCmd.Flags().StringSliceP("instance-ids", "i", []string{}, "Instance IDs to terminate (can also be provided as arguments)")
+	deleteCmd.Flags().StringSliceP("instance-names", "i", []string{}, "Instance names to terminate (can also be provided as arguments)")
 }
