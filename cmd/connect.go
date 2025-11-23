@@ -84,7 +84,7 @@ var connectCmd = &cobra.Command{
 
 		if cursor || code {
 			// Open in IDE
-			openInIDE(instanceName, remotePath, cursor)
+			openInIDE(instanceName, remotePath, code)
 		} else {
 			// Connect via SSH
 			if err := client.ConnectToInstance(instanceName); err != nil {
@@ -95,16 +95,16 @@ var connectCmd = &cobra.Command{
 }
 
 // openInIDE opens the specified instance in VS Code or Cursor
-func openInIDE(instanceName, remotePath string, useCursor bool) {
+func openInIDE(instanceName, remotePath string, forceCode bool) {
 	// Construct the URI
 	// Format: vscode-remote://ssh-remote+<HOST_ALIAS>/path/to/project
 	// Note: Cursor uses the same URI scheme "vscode-remote://" for compatibility with VS Code extensions
 	uri := fmt.Sprintf("vscode-remote://ssh-remote+%s%s", instanceName, remotePath)
 
 	var binary string
-	if useCursor {
-		binary = "cursor"
-		fmt.Printf("Opening Cursor for instance '%s' at path '%s'...\n", instanceName, remotePath)
+	if forceCode {
+		binary = "code"
+		fmt.Printf("Opening VS Code for instance '%s' at path '%s'...\n", instanceName, remotePath)
 	} else {
 		// Default to 'cursor', fallback to 'code'
 		binary = "cursor"

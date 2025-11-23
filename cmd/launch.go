@@ -8,6 +8,7 @@ import (
 	"log"
 	"strings"
 	"time"
+
 	"github.com/atoniolo76/gotoni/pkg/client"
 
 	"github.com/spf13/cobra"
@@ -21,7 +22,7 @@ var launchCmd = &cobra.Command{
 	Args:  cobra.ExactArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
 		instanceName := args[0]
-		
+
 		instanceType, err := cmd.Flags().GetString("instance-type")
 		if err != nil {
 			log.Fatalf("Error getting instance type: %v", err)
@@ -154,14 +155,44 @@ var launchCmd = &cobra.Command{
 		}
 
 	launchInstance:
-		// Create filesystem if flag is provided
+		// Create or retrieve filesystem if flag is provided
 		if filesystemName != "" {
-			fmt.Printf("Creating filesystem '%s' in region '%s'...\n", filesystemName, actualRegion)
-			fs, err := client.CreateFilesystem(httpClient, apiToken, filesystemName, actualRegion)
+			// Check if filesystem already exists
+			existingFilesystems, err := client.ListFilesystems(httpClient, apiToken)
 			if err != nil {
-				log.Fatalf("Error creating filesystem: %v", err)
+				log.Fatalf("Error listing filesystems: %v", err)
 			}
-			fmt.Printf("Filesystem '%s' created successfully (ID: %s)\n", fs.Name, fs.ID)
+
+			var foundFS *client.Filesystem
+			for i := range existingFilesystems {
+				if existingFilesystems[i].Name == filesystemName {
+					foundFS = &existingFilesystems[i]
+					break
+				}
+			}
+
+			if foundFS != nil {
+				fmt.Printf("Found existing filesystem '%s' (ID: %s)\n", foundFS.Name, foundFS.ID)
+
+				// Verify region
+				if foundFS.Region.Name != actualRegion {
+					log.Fatalf("Filesystem '%s' is in region '%s', but instance is being launched in '%s'. Regions must match.",
+						filesystemName, foundFS.Region.Name, actualRegion)
+				}
+
+				// Update local config to ensure LaunchInstance can find it
+				if err := client.SaveFilesystemInfo(filesystemName, foundFS.ID, foundFS.Region.Name); err != nil {
+					log.Fatalf("Error saving filesystem info: %v", err)
+				}
+
+			} else {
+				fmt.Printf("Creating filesystem '%s' in region '%s'...\n", filesystemName, actualRegion)
+				fs, err := client.CreateFilesystem(httpClient, apiToken, filesystemName, actualRegion)
+				if err != nil {
+					log.Fatalf("Error creating filesystem: %v", err)
+				}
+				fmt.Printf("Filesystem '%s' created successfully (ID: %s)\n", fs.Name, fs.ID)
+			}
 		}
 
 		fmt.Printf("\nLaunching instance...\n")
@@ -173,7 +204,7 @@ var launchCmd = &cobra.Command{
 			launchedInstances, launchErr = client.LaunchInstance(httpClient, apiToken, instanceType, actualRegion, 1, instanceName, "", filesystemName)
 			fmt.Println("Note: SSH config not updated because IP is not yet available. Use --wait flag to update SSH config automatically.")
 		}
-			
+
 		// If successful and we waited, update SSH config
 		if launchErr == nil && wait {
 			for _, instance := range launchedInstances {
@@ -196,7 +227,7 @@ var launchCmd = &cobra.Command{
 			fmt.Printf("Launched instance: %s\n", instance.ID)
 			fmt.Printf("SSH Key: %s\n", instance.SSHKeyName)
 			fmt.Printf("SSH Key File: %s\n", instance.SSHKeyFile)
-			
+
 			if wait {
 				fmt.Printf("\nInstance is ready!\n")
 				fmt.Printf("Connect via SSH: ssh %s\n", instanceName)
