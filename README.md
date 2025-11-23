@@ -35,6 +35,10 @@ gotoni launch my-project \
 
 Once launched, instantly open the remote workspace in your preferred IDE (defaults to Cursor).
 
+> **Prerequisite:** Ensure you have installed the command-line tool for your IDE.
+> - **Cursor:** `Cmd+Shift+P` > "Install 'cursor' command"
+> - **VS Code:** `Cmd+Shift+P` > "Install 'code' command"
+
 ```bash
 gotoni open my-project
 ```

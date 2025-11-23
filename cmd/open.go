@@ -15,8 +15,12 @@ import (
 var openCmd = &cobra.Command{
 	Use:   "open <instance-name> [remote-path]",
 	Short: "Open a remote instance in VS Code or Cursor",
-	Long:  `Open a remote instance in VS Code or Cursor via SSH remote. Defaults to Cursor if available.`,
-	Args:  cobra.MinimumNArgs(1),
+	Long: `Open a remote instance in VS Code or Cursor via SSH remote. Defaults to Cursor if available.
+
+Requirements:
+  - For Cursor: Ensure the 'cursor' command is installed (Cmd+Shift+P > "Install 'cursor' command")
+  - For VS Code: Ensure the 'code' command is installed (Cmd+Shift+P > "Install 'code' command")`,
+	Args: cobra.MinimumNArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
 		target := args[0]
 		remotePath := "/home/ubuntu"
