@@ -16,12 +16,18 @@ import (
 
 // launchCmd represents the launch command
 var launchCmd = &cobra.Command{
-	Use:   "launch <instance-name>",
+	Use:   "launch [instance-name]",
 	Short: "Launch a new instance on your cloud provider.",
 	Long:  `Launch a new instance on your cloud provider with the specified name. Use --wait to automatically wait for the instance type to become available.`,
-	Args:  cobra.ExactArgs(1),
+	Args:  cobra.MaximumNArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
-		instanceName := args[0]
+		var instanceName string
+		if len(args) > 0 {
+			instanceName = args[0]
+		} else {
+			instanceName = fmt.Sprintf("gotoni-%d", time.Now().Unix())
+			fmt.Printf("No instance name provided. Auto-generated name: %s\n", instanceName)
+		}
 
 		instanceType, err := cmd.Flags().GetString("instance-type")
 		if err != nil {
