@@ -7,8 +7,8 @@ import (
 	"path/filepath"
 	"time"
 
+	_ "github.com/glebarez/go-sqlite"
 	"github.com/kirsle/configdir"
-	_ "github.com/mattn/go-sqlite3"
 )
 
 // DB wraps the sql.DB connection
@@ -72,7 +72,7 @@ func InitDB() (*DB, error) {
 		return nil, fmt.Errorf("failed to create database directory: %w", err)
 	}
 
-	db, err := sql.Open("sqlite3", dbPath)
+	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database: %w", err)
 	}
