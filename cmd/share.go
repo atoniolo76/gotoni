@@ -27,12 +27,15 @@ type SharePayload struct {
 
 // shareCmd represents the share command
 var shareCmd = &cobra.Command{
-	Use:   "share <instance-id-or-name>",
+	Use:   "share [instance-id-or-name]",
 	Short: "Securely share an instance's SSH key with another user",
 	Long:  `Securely share an instance's SSH key using the Magic Wormhole protocol. Generates a code that the receiver can use to download the key and automatically configure access.`,
-	Args:  cobra.ExactArgs(1),
+	Args:  cobra.MaximumNArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
-		instanceID := args[0]
+		var instanceID string
+		if len(args) > 0 {
+			instanceID = args[0]
+		}
 
 		// 1. Get API Token
 		apiToken := client.GetAPIToken()
@@ -44,9 +47,25 @@ var shareCmd = &cobra.Command{
 		httpClient := client.NewHTTPClient()
 
 		// 3. Resolve instance to get IP and real ID
-		instance, err := client.ResolveInstance(httpClient, apiToken, instanceID)
-		if err != nil {
-			log.Fatalf("Error resolving instance '%s': %v", instanceID, err)
+		var instance *client.RunningInstance
+		var err error
+
+		if instanceID != "" {
+			instance, err = client.ResolveInstance(httpClient, apiToken, instanceID)
+			if err != nil {
+				log.Fatalf("Error resolving instance '%s': %v", instanceID, err)
+			}
+		} else {
+			// No instance provided, try to find first running instance
+			runningInstances, err := client.ListRunningInstances(httpClient, apiToken)
+			if err != nil {
+				log.Fatalf("Error listing running instances: %v", err)
+			}
+			if len(runningInstances) == 0 {
+				log.Fatal("No running instances found. Please provide an instance ID or name.")
+			}
+			instance = &runningInstances[0]
+			fmt.Printf("Using instance: %s (%s)\n", instance.Name, instance.ID)
 		}
 
 		if instance.IP == "" {

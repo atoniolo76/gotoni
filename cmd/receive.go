@@ -141,7 +141,7 @@ var receiveCmd = &cobra.Command{
 			// Fallback for non-payload transfer
 			fmt.Println("\nTo complete setup, you need to know the Instance IP.")
 			fmt.Printf("Run: ssh -i %s ubuntu@<IP>\n", targetPath)
-			
+
 			fmt.Print("\nEnter Instance IP (optional, press Enter to skip): ")
 			var ip string
 			fmt.Scanln(&ip)
