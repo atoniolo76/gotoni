@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/atoniolo76/gotoni/pkg/db"
 )
 
 // LambdaProvider implements the CloudProvider interface for Lambda Cloud
@@ -54,14 +55,24 @@ func (p *LambdaProvider) LaunchInstance(httpClient *http.Client, apiToken string
 		}
 	}
 
-	// Load current config
-	config, err := LoadConfig()
+	// Init DB
+	database, err := db.InitDB()
 	if err != nil {
-		return nil, fmt.Errorf("failed to load config: %w", err)
+		return nil, fmt.Errorf("failed to init db: %w", err)
 	}
+	defer database.Close()
 
-	// Save SSH key info to config
-	config.SSHKeys[finalSSHKeyName] = sshKeyFile
+	// Save SSH key info to DB
+	// Note: CreateSSHKeyForProject already saves it if it's a new key.
+	// But here we might be reusing an existing key name.
+	// If we are reusing, we should ensure it's in the DB?
+	// Logic: If sshKeyName provided, we verified file exists.
+	// We should make sure DB has record of it.
+	if sshKeyName != "" {
+		if err := database.SaveSSHKey(&db.SSHKey{Name: sshKeyName, PrivateKey: sshKeyFile}); err != nil {
+			return nil, fmt.Errorf("failed to save ssh key to db: %w", err)
+		}
+	}
 
 	// Validate filesystem region if filesystem is provided
 	var fileSystemNames []string
@@ -77,11 +88,6 @@ func (p *LambdaProvider) LaunchInstance(httpClient *http.Client, apiToken string
 		}
 
 		fileSystemNames = []string{filesystemName}
-	}
-
-	// Save config
-	if err := SaveConfig(config); err != nil {
-		return nil, fmt.Errorf("failed to save config: %w", err)
 	}
 
 	requestBody := InstanceLaunchRequest{
@@ -141,13 +147,17 @@ func (p *LambdaProvider) LaunchInstance(httpClient *http.Client, apiToken string
 			SSHKeyFile: sshKeyFile,
 		}
 
-		// Save instance -> SSH key mapping
-		config.Instances[instanceID] = finalSSHKeyName
-	}
-
-	// Save updated config with instance mappings
-	if err := SaveConfig(config); err != nil {
-		return nil, fmt.Errorf("failed to save config with instance mappings: %w", err)
+		// Save instance info to DB
+		// We only have ID and key info right now. Detailed info comes later or via GetInstance.
+		// But we need to store the mapping instanceID -> sshKeyName
+		inst := &db.Instance{
+			ID:         instanceID,
+			SSHKeyName: finalSSHKeyName,
+			// Other fields empty for now, will be updated later or on status check
+		}
+		if err := database.SaveInstance(inst); err != nil {
+			return nil, fmt.Errorf("failed to save instance to db: %w", err)
+		}
 	}
 
 	return instances, nil
@@ -604,19 +614,21 @@ func (p *LambdaProvider) CreateFilesystem(httpClient *http.Client, apiToken stri
 		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
 	}
 
-	// Save filesystem to config
-	config, err := LoadConfig()
+	// Save filesystem to DB
+	database, err := db.InitDB()
 	if err != nil {
-		return nil, fmt.Errorf("failed to save config: %w", err)
+		return nil, fmt.Errorf("failed to init db: %w", err)
 	}
+	defer database.Close()
 
-	config.Filesystems[name] = FilesystemInfo{
+	fs := &db.Filesystem{
+		Name:   name,
 		ID:     apiResponse.Data.ID,
 		Region: apiResponse.Data.Region.Name,
 	}
 
-	if err := SaveConfig(config); err != nil {
-		return nil, fmt.Errorf("failed to save config: %w", err)
+	if err := database.SaveFilesystem(fs); err != nil {
+		return nil, fmt.Errorf("failed to save filesystem to db: %w", err)
 	}
 
 	return &apiResponse.Data, nil

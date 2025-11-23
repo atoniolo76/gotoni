@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"gopkg.in/yaml.v3"
+	"github.com/atoniolo76/gotoni/pkg/db"
 )
 
 // NewHTTPClient creates a new HTTP client with secure defaults
@@ -23,6 +23,11 @@ func NewHTTPClient() *http.Client {
 			// Use default TLS config which verifies certificates
 		},
 	}
+}
+
+// Helper to get DB instance
+func getDB() (*db.DB, error) {
+	return db.InitDB()
 }
 
 type Response struct {
@@ -88,23 +93,23 @@ type InstanceTerminateResponse struct {
 }
 
 type RunningInstance struct {
-	ID                string                        `json:"id"`
-	Name              string                        `json:"name,omitempty"`
-	IP                string                        `json:"ip"`
-	PrivateIP         string                        `json:"private_ip"`
-	Status            string                        `json:"status"`
-	SSHKeyNames       []string                      `json:"ssh_key_names"`
-	FileSystemNames   []string                      `json:"file_system_names"`
-	FileSystemMounts  []FilesystemMountEntry        `json:"file_system_mounts,omitempty"`
-	Region            Region                        `json:"region"`
-	InstanceType      InstanceType                  `json:"instance_type"`
-	Hostname          string                        `json:"hostname"`
-	JupyterToken      string                        `json:"jupyter_token"`
-	JupyterURL        string                        `json:"jupyter_url"`
-	IsReserved        bool                          `json:"is_reserved"`
-	Actions           InstanceActionAvailability    `json:"actions"`
-	Tags              []TagEntry                    `json:"tags,omitempty"`
-	FirewallRulesets  []FirewallRulesetEntry        `json:"firewall_rulesets,omitempty"`
+	ID               string                     `json:"id"`
+	Name             string                     `json:"name,omitempty"`
+	IP               string                     `json:"ip"`
+	PrivateIP        string                     `json:"private_ip"`
+	Status           string                     `json:"status"`
+	SSHKeyNames      []string                   `json:"ssh_key_names"`
+	FileSystemNames  []string                   `json:"file_system_names"`
+	FileSystemMounts []FilesystemMountEntry     `json:"file_system_mounts,omitempty"`
+	Region           Region                     `json:"region"`
+	InstanceType     InstanceType               `json:"instance_type"`
+	Hostname         string                     `json:"hostname"`
+	JupyterToken     string                     `json:"jupyter_token"`
+	JupyterURL       string                     `json:"jupyter_url"`
+	IsReserved       bool                       `json:"is_reserved"`
+	Actions          InstanceActionAvailability `json:"actions"`
+	Tags             []TagEntry                 `json:"tags,omitempty"`
+	FirewallRulesets []FirewallRulesetEntry     `json:"firewall_rulesets,omitempty"`
 }
 
 type LaunchedInstance struct {
@@ -131,14 +136,14 @@ type InstanceActionUnavailableCode string
 
 const (
 	InstanceActionUnavailableVMHasNotLaunched InstanceActionUnavailableCode = "vm-has-not-launched"
-	InstanceActionUnavailableVMIsTooOld      InstanceActionUnavailableCode = "vm-is-too-old"
-	InstanceActionUnavailableVMIsTerminating InstanceActionUnavailableCode = "vm-is-terminating"
+	InstanceActionUnavailableVMIsTooOld       InstanceActionUnavailableCode = "vm-is-too-old"
+	InstanceActionUnavailableVMIsTerminating  InstanceActionUnavailableCode = "vm-is-terminating"
 )
 
 type InstanceActionAvailabilityDetails struct {
-	Available       bool                        `json:"available"`
-	ReasonCode      *InstanceActionUnavailableCode `json:"reason_code,omitempty"`
-	ReasonDescription string                     `json:"reason_description,omitempty"`
+	Available         bool                           `json:"available"`
+	ReasonCode        *InstanceActionUnavailableCode `json:"reason_code,omitempty"`
+	ReasonDescription string                         `json:"reason_description,omitempty"`
 }
 
 type InstanceActionAvailability struct {
@@ -298,70 +303,10 @@ type Task struct {
 	RestartSec int    `yaml:"restart_sec,omitempty"` // Seconds to wait before restarting (default: 10)
 }
 
-// DefaultConfig returns an empty config
-func DefaultConfig() *Config {
-	return &Config{
-		Instances:   make(map[string]string),
-		SSHKeys:     make(map[string]string),
-		Filesystems: make(map[string]FilesystemInfo),
-	}
-}
+// Config replacement using DB
+// We remove LoadConfig and SaveConfig entirely and use DB calls.
 
-// LoadConfig loads the configuration from file
-func LoadConfig() (*Config, error) {
-	configPath := ".gotoni/config.yaml"
-
-	// Check if file exists
-	if _, err := os.Stat(configPath); os.IsNotExist(err) {
-		return DefaultConfig(), nil
-	}
-
-	data, err := os.ReadFile(configPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read config file: %w", err)
-	}
-
-	var config Config
-	if err := yaml.Unmarshal(data, &config); err != nil {
-		return nil, fmt.Errorf("failed to parse config: %w", err)
-	}
-
-	// Initialize maps if they're nil
-	if config.Instances == nil {
-		config.Instances = make(map[string]string)
-	}
-	if config.SSHKeys == nil {
-		config.SSHKeys = make(map[string]string)
-	}
-	if config.Filesystems == nil {
-		config.Filesystems = make(map[string]FilesystemInfo)
-	}
-
-	return &config, nil
-}
-
-// SaveConfig saves the configuration to file
-func SaveConfig(config *Config) error {
-	configPath := ".gotoni/config.yaml"
-
-	// Create directory if it doesn't exist
-	if err := os.MkdirAll(filepath.Dir(configPath), 0755); err != nil {
-		return fmt.Errorf("failed to create config directory: %w", err)
-	}
-
-	data, err := yaml.Marshal(config)
-	if err != nil {
-		return fmt.Errorf("failed to marshal config: %w", err)
-	}
-
-	if err := os.WriteFile(configPath, data, 0644); err != nil {
-		return fmt.Errorf("failed to write config file: %w", err)
-	}
-
-	return nil
-}
-
-// LaunchInstance creates a new SSH key (or uses provided existing key), saves it to config, and launches an instance
+// LaunchInstance creates a new SSH key (or uses provided existing key), saves it to DB, and launches an instance
 func LaunchInstance(
 	httpClient *http.Client,
 	apiToken string,
@@ -406,30 +351,44 @@ func LaunchAndWait(
 
 // ConnectToInstance connects to a remote instance via SSH using the key from config
 func ConnectToInstance(instanceIP string) error {
-	// Load config
-	config, err := LoadConfig()
+	db, err := getDB()
 	if err != nil {
-		return fmt.Errorf("failed to load config: %w", err)
+		return fmt.Errorf("failed to init db: %w", err)
 	}
+	defer db.Close()
 
-	// For now, we'll use the most recent SSH key if we don't have instance-specific mapping
-	// In the future, we could enhance this to accept instance ID instead of IP
-	var sshKeyName string
-	if len(config.SSHKeys) > 0 {
-		// Get the most recently added SSH key (simple heuristic)
-		for name := range config.SSHKeys {
-			sshKeyName = name
-			break // Just get first one for now
+	// Find instance by IP
+	instance, err := db.GetInstanceByIP(instanceIP)
+	if err != nil {
+		// Fallback: Try to find ANY key? Or assume key name?
+		// In original logic, we grabbed "first key".
+		// Let's grab "first key" if no instance found.
+		keys, kerr := db.ListSSHKeys()
+		if kerr != nil || len(keys) == 0 {
+			return fmt.Errorf("instance not found in db and no ssh keys available")
 		}
-	} else {
-		return fmt.Errorf("no SSH keys found in config")
+		// Use first key
+		sshKeyFile := keys[0].PrivateKey
+		// Check existence
+		if _, err := os.Stat(sshKeyFile); os.IsNotExist(err) {
+			return fmt.Errorf("SSH key file %s does not exist", sshKeyFile)
+		}
+
+		// Use ssh command to connect
+		cmd := exec.Command("ssh", "-i", sshKeyFile, "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", fmt.Sprintf("ubuntu@%s", instanceIP))
+		cmd.Stdin = os.Stdin
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		return cmd.Run()
 	}
 
-	sshKeyFile, exists := config.SSHKeys[sshKeyName]
-	if !exists {
-		return fmt.Errorf("SSH key file not found for key: %s", sshKeyName)
+	// Found instance, get key name
+	key, err := db.GetSSHKey(instance.SSHKeyName)
+	if err != nil {
+		return fmt.Errorf("ssh key %s not found for instance: %w", instance.SSHKeyName, err)
 	}
 
+	sshKeyFile := key.PrivateKey
 	if _, err := os.Stat(sshKeyFile); os.IsNotExist(err) {
 		return fmt.Errorf("SSH key file %s does not exist", sshKeyFile)
 	}
@@ -445,34 +404,38 @@ func ConnectToInstance(instanceIP string) error {
 
 // GetSSHKeyForInstance returns the SSH key file for a given instance ID
 func GetSSHKeyForInstance(instanceID string) (string, error) {
-	config, err := LoadConfig()
+	db, err := getDB()
 	if err != nil {
-		return "", fmt.Errorf("failed to load config: %w", err)
+		return "", fmt.Errorf("failed to init db: %w", err)
+	}
+	defer db.Close()
+
+	instance, err := db.GetInstance(instanceID)
+	if err != nil {
+		return "", fmt.Errorf("instance %s not found in db: %w", instanceID, err)
 	}
 
-	sshKeyName, exists := config.Instances[instanceID]
-	if !exists {
-		return "", fmt.Errorf("no SSH key mapping found for instance: %s", instanceID)
+	key, err := db.GetSSHKey(instance.SSHKeyName)
+	if err != nil {
+		return "", fmt.Errorf("ssh key %s not found: %w", instance.SSHKeyName, err)
 	}
 
-	sshKeyFile, exists := config.SSHKeys[sshKeyName]
-	if !exists {
-		return "", fmt.Errorf("SSH key file not found for key: %s", sshKeyName)
+	if _, err := os.Stat(key.PrivateKey); os.IsNotExist(err) {
+		return "", fmt.Errorf("SSH key file %s does not exist", key.PrivateKey)
 	}
 
-	return sshKeyFile, nil
+	return key.PrivateKey, nil
 }
 
 // RemoveInstanceFromConfig removes an instance from the config
 func RemoveInstanceFromConfig(instanceID string) error {
-	config, err := LoadConfig()
+	db, err := getDB()
 	if err != nil {
-		return fmt.Errorf("failed to load config: %w", err)
+		return fmt.Errorf("failed to init db: %w", err)
 	}
+	defer db.Close()
 
-	delete(config.Instances, instanceID)
-
-	return SaveConfig(config)
+	return db.DeleteInstance(instanceID)
 }
 
 func ListRunningInstances(httpClient *http.Client, apiToken string) ([]RunningInstance, error) {
@@ -562,18 +525,15 @@ func AddExistingSSHKey(keyPath string, keyName string) (string, string, error) {
 		return "", "", fmt.Errorf("failed to copy SSH key file: %w", err)
 	}
 
-	// Load config
-	config, err := LoadConfig()
+	// Save to DB
+	database, err := getDB()
 	if err != nil {
-		return "", "", fmt.Errorf("failed to load config: %w", err)
+		return "", "", fmt.Errorf("failed to init db: %w", err)
 	}
+	defer database.Close()
 
-	// Add to config
-	config.SSHKeys[keyName] = targetPath
-
-	// Save config
-	if err := SaveConfig(config); err != nil {
-		return "", "", fmt.Errorf("failed to save config: %w", err)
+	if err := database.SaveSSHKey(&db.SSHKey{Name: keyName, PrivateKey: targetPath}); err != nil {
+		return "", "", fmt.Errorf("failed to save key to db: %w", err)
 	}
 
 	return keyName, targetPath, nil
@@ -651,19 +611,21 @@ func CreateFilesystem(httpClient *http.Client, apiToken string, name string, reg
 		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
 	}
 
-	// Save filesystem to config
-	config, err := LoadConfig()
+	// Save filesystem to DB
+	database, err := getDB()
 	if err != nil {
-		return nil, fmt.Errorf("failed to load config: %w", err)
+		return nil, fmt.Errorf("failed to init db: %w", err)
 	}
+	defer database.Close()
 
-	config.Filesystems[name] = FilesystemInfo{
+	fs := &db.Filesystem{
+		Name:   name,
 		ID:     apiResponse.Data.ID,
 		Region: apiResponse.Data.Region.Name,
 	}
 
-	if err := SaveConfig(config); err != nil {
-		return nil, fmt.Errorf("failed to save config: %w", err)
+	if err := database.SaveFilesystem(fs); err != nil {
+		return nil, fmt.Errorf("failed to save filesystem to db: %w", err)
 	}
 
 	return &apiResponse.Data, nil
@@ -671,17 +633,82 @@ func CreateFilesystem(httpClient *http.Client, apiToken string, name string, reg
 
 // GetFilesystemInfo returns filesystem info from config by name
 func GetFilesystemInfo(filesystemName string) (*FilesystemInfo, error) {
-	config, err := LoadConfig()
+	db, err := getDB()
 	if err != nil {
-		return nil, fmt.Errorf("failed to load config: %w", err)
+		return nil, fmt.Errorf("failed to init db: %w", err)
+	}
+	defer db.Close()
+
+	fs, err := db.GetFilesystem(filesystemName)
+	if err != nil {
+		return nil, fmt.Errorf("filesystem %s not found in db: %w", filesystemName, err)
 	}
 
-	fsInfo, exists := config.Filesystems[filesystemName]
-	if !exists {
-		return nil, fmt.Errorf("filesystem %s not found in config", filesystemName)
+	return &FilesystemInfo{
+		ID:     fs.ID,
+		Region: fs.Region,
+	}, nil
+}
+
+// SaveFilesystemInfo saves filesystem info to DB
+func SaveFilesystemInfo(name, id, region string) error {
+	database, err := getDB()
+	if err != nil {
+		return fmt.Errorf("failed to init db: %w", err)
+	}
+	defer database.Close()
+
+	return database.SaveFilesystem(&db.Filesystem{
+		Name:   name,
+		ID:     id,
+		Region: region,
+	})
+}
+
+// ListTasks retrieves all tasks from DB
+func ListTasks() ([]Task, error) {
+	database, err := getDB()
+	if err != nil {
+		return nil, fmt.Errorf("failed to init db: %w", err)
+	}
+	defer database.Close()
+
+	dbTasks, err := database.ListTasks()
+	if err != nil {
+		return nil, fmt.Errorf("failed to list tasks from db: %w", err)
 	}
 
-	return &fsInfo, nil
+	var tasks []Task
+	for _, t := range dbTasks {
+		var env map[string]string
+		if t.Env != "" {
+			if err := json.Unmarshal([]byte(t.Env), &env); err != nil {
+				return nil, fmt.Errorf("failed to unmarshal env for task %s: %w", t.Name, err)
+			}
+		}
+
+		var dependsOn []string
+		if t.DependsOn != "" {
+			if err := json.Unmarshal([]byte(t.DependsOn), &dependsOn); err != nil {
+				return nil, fmt.Errorf("failed to unmarshal depends_on for task %s: %w", t.Name, err)
+			}
+		}
+
+		tasks = append(tasks, Task{
+			Name:       t.Name,
+			Type:       t.Type,
+			Command:    t.Command,
+			Background: t.Background,
+			WorkingDir: t.WorkingDir,
+			Env:        env,
+			DependsOn:  dependsOn,
+			When:       t.WhenCondition,
+			Restart:    t.Restart,
+			RestartSec: t.RestartSec,
+		})
+	}
+
+	return tasks, nil
 }
 
 // ListFilesystems retrieves a list of filesystems from Lambda Cloud

@@ -16,8 +16,9 @@ import (
 var provisionCmd = &cobra.Command{
 	Use:   "provision [instance-name]",
 	Short: "Run setup tasks/playbooks on an instance",
-	Long: `Run tasks defined in .gotoni/config.yaml on a remote instance.
-Tasks can include commands, file uploads, scripts, and background services.`,
+	Long: `Run automated setup tasks on a remote instance.
+Tasks can include commands, file uploads, scripts, and background services.
+Tasks are managed locally and can be executed to provision fresh instances with your required environment.`,
 	Run: func(cmd *cobra.Command, args []string) {
 		apiToken, err := cmd.Flags().GetString("api-token")
 		if err != nil {
@@ -32,14 +33,14 @@ Tasks can include commands, file uploads, scripts, and background services.`,
 			}
 		}
 
-		// Load config
-		config, err := client.LoadConfig()
+		// Load tasks
+		tasks, err := client.ListTasks()
 		if err != nil {
-			log.Fatalf("Failed to load config: %v", err)
+			log.Fatalf("Failed to list tasks: %v", err)
 		}
 
-		if len(config.Tasks) == 0 {
-			log.Fatal("No tasks defined in config. Add tasks to .gotoni/config.yaml")
+		if len(tasks) == 0 {
+			log.Fatal("No tasks defined. Add tasks using 'gotoni tasks add' (if implemented) or similar.")
 		}
 
 		var instanceDetails *client.RunningInstance
@@ -86,7 +87,7 @@ Tasks can include commands, file uploads, scripts, and background services.`,
 		fmt.Printf("Connected!\n\n")
 
 		// Filter and execute only command tasks
-		commandTasks := client.FilterTasksByType(config.Tasks, "command")
+		commandTasks := client.FilterTasksByType(tasks, "command")
 		if len(commandTasks) == 0 {
 			log.Fatal("No command tasks found.")
 		}
