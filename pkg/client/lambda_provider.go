@@ -171,13 +171,47 @@ func (p *LambdaProvider) LaunchAndWait(httpClient *http.Client, apiToken string,
 		return nil, fmt.Errorf("failed to launch instances: %w", err)
 	}
 
+	// Init DB for updating instance details
+	database, err := db.InitDB()
+	if err != nil {
+		return nil, fmt.Errorf("failed to init db: %w", err)
+	}
+	defer database.Close()
+
 	// Wait for each instance to become ready
-	for _, instance := range instances {
+	for i, instance := range instances {
 		fmt.Printf("Waiting for instance %s to become ready...\n", instance.ID)
 		if err := p.WaitForInstanceReady(httpClient, apiToken, instance.ID, timeout); err != nil {
 			return nil, fmt.Errorf("instance %s failed to become ready: %w", instance.ID, err)
 		}
 		fmt.Printf("Instance %s is now ready!\n", instance.ID)
+
+		// Get full instance details now that it's ready
+		instanceDetails, err := p.GetInstance(httpClient, apiToken, instance.ID)
+		if err != nil {
+			fmt.Printf("Warning: Failed to get instance details: %v\n", err)
+			continue
+		}
+
+		// Update database with full details
+		inst := &db.Instance{
+			ID:             instance.ID,
+			Name:           name,
+			Region:         region,
+			Status:         instanceDetails.Status,
+			SSHKeyName:     instance.SSHKeyName,
+			FilesystemName: filesystemName,
+			InstanceType:   instanceDetails.InstanceType.Name,
+			IPAddress:      instanceDetails.IP,
+		}
+		if err := database.SaveInstance(inst); err != nil {
+			fmt.Printf("Warning: Failed to update instance in db: %v\n", err)
+		}
+
+		// Update the returned instance with IP
+		instances[i].ID = instance.ID
+		instances[i].SSHKeyName = instance.SSHKeyName
+		instances[i].SSHKeyFile = instance.SSHKeyFile
 	}
 
 	return instances, nil
