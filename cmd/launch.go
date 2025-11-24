@@ -17,9 +17,18 @@ import (
 // launchCmd represents the launch command
 var launchCmd = &cobra.Command{
 	Use:   "launch [instance-name]",
-	Short: "Launch a new instance on your cloud provider.",
-	Long:  `Launch a new instance on your cloud provider with the specified name. Use --wait to automatically wait for the instance type to become available.`,
-	Args:  cobra.MaximumNArgs(1),
+	Short: "Launch a new instance and optionally run automation tasks",
+	Long: `Launch a new instance on your cloud provider with the specified name. 
+Use --wait to automatically wait for the instance type to become available.
+Use --tasks to specify automation tasks to run after the instance is ready.
+
+Examples:
+  # Launch and wait for instance
+  gotoni launch my-instance -t gpu_1x_a100 -r us-west-1 --wait
+  
+  # Launch with tasks
+  gotoni launch my-instance -t gpu_1x_a100 -r us-west-1 --wait --tasks "Install Docker,Setup Environment"`,
+	Args: cobra.MaximumNArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
 		var instanceName string
 		if len(args) > 0 {
@@ -67,6 +76,11 @@ var launchCmd = &cobra.Command{
 		filesystemName, err := cmd.Flags().GetString("filesystem")
 		if err != nil {
 			log.Fatalf("Error getting filesystem flag: %v", err)
+		}
+
+		taskNames, err := cmd.Flags().GetStringSlice("tasks")
+		if err != nil {
+			log.Fatalf("Error getting tasks flag: %v", err)
 		}
 
 		// Validate region requirement
@@ -245,6 +259,68 @@ var launchCmd = &cobra.Command{
 			}
 			fmt.Println()
 		}
+
+		// Execute tasks if specified
+		if len(taskNames) > 0 && wait {
+			if len(launchedInstances) == 0 {
+				log.Fatal("No instances launched, cannot execute tasks")
+			}
+
+			// Get instance details for IP
+			instanceDetails, err := client.GetInstance(httpClient, apiToken, launchedInstances[0].ID)
+			if err != nil {
+				log.Fatalf("Failed to get instance details for task execution: %v", err)
+			}
+
+			if instanceDetails.IP == "" {
+				log.Fatal("Instance has no IP address, cannot execute tasks")
+			}
+
+			fmt.Printf("\n=== Executing Tasks ===\n\n")
+
+			// Load all tasks from database
+			allTasks, err := client.ListTasks()
+			if err != nil {
+				log.Fatalf("Failed to load tasks: %v", err)
+			}
+
+			// Build task map
+			taskMap := make(map[string]client.Task)
+			for _, task := range allTasks {
+				taskMap[task.Name] = task
+			}
+
+			// Select tasks by name in order
+			var selectedTasks []client.Task
+			for _, taskName := range taskNames {
+				task, found := taskMap[taskName]
+				if !found {
+					log.Fatalf("Task '%s' not found. Use 'gotoni tasks list' to see available tasks.", taskName)
+				}
+				selectedTasks = append(selectedTasks, task)
+			}
+
+			// Create SSH client manager
+			manager := client.NewSSHClientManager()
+			defer manager.CloseAllConnections()
+
+			// Connect to instance
+			fmt.Printf("Connecting to instance %s via SSH...\n", instanceDetails.IP)
+			if err := manager.ConnectToInstance(instanceDetails.IP, launchedInstances[0].SSHKeyFile); err != nil {
+				log.Fatalf("Failed to connect via SSH: %v", err)
+			}
+			fmt.Printf("Connected!\n\n")
+
+			// Execute tasks
+			if err := client.ExecuteTasks(manager, instanceDetails.IP, selectedTasks); err != nil {
+				log.Fatalf("Failed to execute tasks: %v", err)
+			}
+
+			fmt.Printf("\n✓ All tasks completed successfully!\n")
+		} else if len(taskNames) > 0 && !wait {
+			fmt.Println("\nWarning: Tasks specified but --wait flag not set. Tasks will not be executed.")
+			fmt.Println("Use --wait flag to execute tasks after instance is ready.")
+		}
 	},
 }
 
@@ -283,6 +359,8 @@ func init() {
 	launchCmd.Flags().DurationP("wait-timeout", "", 10*time.Minute, "Timeout for waiting for instance to become ready after launching")
 
 	launchCmd.Flags().StringP("filesystem", "f", "", "Create and mount a filesystem with the specified name (will be created in the same region as the instance)")
+
+	launchCmd.Flags().StringSlice("tasks", []string{}, "Comma-separated list of task names to execute after launch (requires --wait)")
 
 	launchCmd.MarkFlagRequired("instance-type")
 	// Region is required unless --wait is used (which auto-selects region)

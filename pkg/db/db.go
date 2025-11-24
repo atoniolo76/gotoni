@@ -330,3 +330,9 @@ func (d *DB) ListTasks() ([]Task, error) {
 	}
 	return tasks, nil
 }
+
+// DeleteTask deletes a task by name
+func (d *DB) DeleteTask(name string) error {
+	_, err := d.Exec("DELETE FROM tasks WHERE name = ?", name)
+	return err
+}
