@@ -102,23 +102,33 @@ var receiveCmd = &cobra.Command{
 			instanceName = strings.TrimSuffix(fileName, filepath.Ext(fileName))
 		}
 
-		targetPath := filepath.Join(sshDir, fileName)
+	targetPath := filepath.Join(sshDir, fileName)
 
-		// 4. Save file with secure permissions
-		// Open destination file with 0600 permissions (read/write owner)
-		err = os.WriteFile(targetPath, fileContent, 0600)
-		if err != nil {
-			log.Fatalf("Failed to write key file: %v", err)
+	// 4. Remove existing file if it exists (it might be read-only)
+	if _, err := os.Stat(targetPath); err == nil {
+		// File exists, make it writable first then remove it
+		os.Chmod(targetPath, 0600)
+		if err := os.Remove(targetPath); err != nil {
+			log.Fatalf("Failed to remove existing key file: %v", err)
 		}
+		fmt.Printf("Removed existing key file: %s\n", targetPath)
+	}
 
-		// Now lock it down to read-only (0400)
-		if err := os.Chmod(targetPath, 0400); err != nil {
-			log.Printf("Warning: failed to set secure permissions (0400): %v", err)
-		}
+	// 5. Save file with secure permissions
+	// Open destination file with 0600 permissions (read/write owner)
+	err = os.WriteFile(targetPath, fileContent, 0600)
+	if err != nil {
+		log.Fatalf("Failed to write key file: %v", err)
+	}
+
+	// Now lock it down to read-only (0400)
+	if err := os.Chmod(targetPath, 0400); err != nil {
+		log.Printf("Warning: failed to set secure permissions (0400): %v", err)
+	}
 
 	fmt.Printf("Successfully received key: %s\n", targetPath)
 
-	// 5. Save to database
+	// 6. Save to database
 	fmt.Println("Adding key to gotoni database...")
 	database, err := db.InitDB()
 	if err != nil {
@@ -131,7 +141,7 @@ var receiveCmd = &cobra.Command{
 		}
 	}
 
-	// 6. Update SSH config (~/.ssh/config)
+	// 7. Update SSH config (~/.ssh/config)
 	if instanceIP != "" {
 		fmt.Printf("Configuring SSH access for %s (%s)...\n", instanceName, instanceIP)
 		if err := client.UpdateSSHConfig(instanceName, instanceIP, targetPath); err != nil {
