@@ -85,7 +85,7 @@ gotoni launch ml-instance
   -t gpu_1x_a100
   -r us-west-1
   --wait
-  --tasks "Install Build Tools,Clone llama.cpp,Build llama.cpp"
+  --tasks "install depedencies,run vllm"
 ```
 
 
