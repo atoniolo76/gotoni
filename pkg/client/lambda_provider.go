@@ -421,6 +421,17 @@ func (p *LambdaProvider) CreateSSHKeyForProject(httpClient *http.Client, apiToke
 		return "", "", fmt.Errorf("failed to save private key: %w", err)
 	}
 
+	// Save SSH key to database
+	database, err := db.InitDB()
+	if err != nil {
+		return "", "", fmt.Errorf("failed to init db: %w", err)
+	}
+	defer database.Close()
+
+	if err := database.SaveSSHKey(&db.SSHKey{Name: keyName, PrivateKey: privateKeyFile}); err != nil {
+		return "", "", fmt.Errorf("failed to save ssh key to db: %w", err)
+	}
+
 	fmt.Printf("Created new SSH key '%s' and saved private key to %s\n", keyName, privateKeyFile)
 	fmt.Printf("Use: ssh -i %s ubuntu@<instance-ip>\n", privateKeyFile)
 	return generatedKey.Name, privateKeyFile, nil
