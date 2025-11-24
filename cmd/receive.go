@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	"github.com/atoniolo76/gotoni/pkg/client"
+	"github.com/atoniolo76/gotoni/pkg/db"
 	"github.com/psanford/wormhole-william/wormhole"
 	"github.com/spf13/cobra"
 )
@@ -115,45 +116,46 @@ var receiveCmd = &cobra.Command{
 			log.Printf("Warning: failed to set secure permissions (0400): %v", err)
 		}
 
-		fmt.Printf("Successfully received key: %s\n", targetPath)
+	fmt.Printf("Successfully received key: %s\n", targetPath)
 
-		// 5. Add to gotoni configuration
-		fmt.Println("Adding key to gotoni configuration...")
-
-		addedKeyName, finalPath, err := client.AddExistingSSHKey(targetPath, instanceName)
-		if err != nil {
-			log.Printf("Warning: Failed to add key to gotoni config: %v", err)
-			log.Printf("You can manually add it later with: gotoni ssh-keys add %s --name %s", targetPath, instanceName)
-		} else {
-			fmt.Printf("Registered as key: %s\n", addedKeyName)
-			fmt.Printf("Key path: %s\n", finalPath)
+	// 5. Save to database
+	fmt.Println("Adding key to gotoni database...")
+	database, err := db.InitDB()
+	if err != nil {
+		log.Printf("Warning: Failed to init database: %v", err)
+	} else {
+		defer database.Close()
+		keyName := strings.TrimSuffix(fileName, filepath.Ext(fileName))
+		if err := database.SaveSSHKey(&db.SSHKey{Name: keyName, PrivateKey: targetPath}); err != nil {
+			log.Printf("Warning: Failed to save key to database: %v", err)
 		}
+	}
 
-		// 6. Update SSH config (~/.ssh/config)
-		if instanceIP != "" {
-			fmt.Printf("Configuring SSH access for %s (%s)...\n", instanceName, instanceIP)
-			if err := client.UpdateSSHConfig(instanceName, instanceIP, targetPath); err != nil {
+	// 6. Update SSH config (~/.ssh/config)
+	if instanceIP != "" {
+		fmt.Printf("Configuring SSH access for %s (%s)...\n", instanceName, instanceIP)
+		if err := client.UpdateSSHConfig(instanceName, instanceIP, targetPath); err != nil {
+			log.Printf("Failed to update SSH config: %v", err)
+		} else {
+			fmt.Printf("\n✓ You can now connect with: ssh %s\n", instanceName)
+		}
+	} else {
+		// Fallback for non-payload transfer
+		fmt.Println("\nTo complete setup, you need to know the Instance IP.")
+		fmt.Printf("Run: ssh -i %s ubuntu@<IP>\n", targetPath)
+
+		fmt.Print("\nEnter Instance IP (optional, press Enter to skip): ")
+		var ip string
+		fmt.Scanln(&ip)
+
+		if ip != "" {
+			if err := client.UpdateSSHConfig(instanceName, ip, targetPath); err != nil {
 				log.Printf("Failed to update SSH config: %v", err)
 			} else {
 				fmt.Printf("\n✓ You can now connect with: ssh %s\n", instanceName)
 			}
-		} else {
-			// Fallback for non-payload transfer
-			fmt.Println("\nTo complete setup, you need to know the Instance IP.")
-			fmt.Printf("Run: ssh -i %s ubuntu@<IP>\n", targetPath)
-
-			fmt.Print("\nEnter Instance IP (optional, press Enter to skip): ")
-			var ip string
-			fmt.Scanln(&ip)
-
-			if ip != "" {
-				if err := client.UpdateSSHConfig(instanceName, ip, targetPath); err != nil {
-					log.Printf("Failed to update SSH config: %v", err)
-				} else {
-					fmt.Printf("\n✓ You can now connect with: ssh %s\n", instanceName)
-				}
-			}
 		}
+	}
 	},
 }
 
