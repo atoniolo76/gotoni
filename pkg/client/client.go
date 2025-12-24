@@ -104,12 +104,10 @@ type RunningInstance struct {
 	Region           Region                     `json:"region"`
 	InstanceType     InstanceType               `json:"instance_type"`
 	Hostname         string                     `json:"hostname"`
-	JupyterToken     string                     `json:"jupyter_token"`
-	JupyterURL       string                     `json:"jupyter_url"`
-	IsReserved       bool                       `json:"is_reserved"`
 	Actions          InstanceActionAvailability `json:"actions"`
 	Tags             []TagEntry                 `json:"tags,omitempty"`
 	FirewallRulesets []FirewallRulesetEntry     `json:"firewall_rulesets,omitempty"`
+	IsBusy           bool
 }
 
 type LaunchedInstance struct {
@@ -347,6 +345,11 @@ func LaunchAndWait(
 ) ([]LaunchedInstance, error) {
 	provider, _ := GetCloudProvider()
 	return provider.LaunchAndWait(httpClient, apiToken, instanceType, region, quantity, name, sshKeyName, timeout, filesystemName)
+}
+
+func RunCommandOnInstance(instanceIP string) error {
+	db, err := getDB()
+	if 
 }
 
 // ConnectToInstance connects to a remote instance via SSH using the key from config
