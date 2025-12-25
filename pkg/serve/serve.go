@@ -92,7 +92,6 @@ func PrefixMatch(prefixTree *PrefixTree, prefix string) *Node {
 	currentNode := root
 
 	while
-
 }
 
 func prefixTreePolicy(request string, instances []client.RunningInstance) *client.RunningInstance {
