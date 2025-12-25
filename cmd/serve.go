@@ -5,6 +5,7 @@ import (
 	"log"
 
 	"github.com/atoniolo76/gotoni/pkg/client"
+	"github.com/atoniolo76/gotoni/pkg/db"
 
 	"github.com/spf13/cobra"
 )
@@ -28,14 +29,51 @@ var serveCmd = &cobra.Command{
 
 		httpClient := client.NewHTTPClient()
 		runningInstances, err := client.ListRunningInstances(httpClient, apiToken)
+		if err != nil {
+			log.Fatalf("Error listing running instances: %v", err)
+		}
 
 		if len(runningInstances) == 0 {
 			fmt.Println("No running instances found.")
 			return
 		}
 
-		manager := client.SSHClientManager{}
+		// Initialize database
+		database, err := db.InitDB()
+		if err != nil {
+			log.Fatalf("Error initializing database: %v", err)
+		}
+		defer database.Close()
 
-		client.ExecuteTask(SSH)
+		// Create SSH client manager
+		manager := client.NewSSHClientManager()
+
+		// Connect to each running instance
+		for _, instance := range runningInstances {
+			// Look up instance in database to get SSH key name
+			dbInstance, err := database.GetInstanceByIP(instance.IPAddress)
+			if err != nil {
+				log.Printf("Warning: Could not find instance %s in database: %v", instance.IPAddress, err)
+				continue
+			}
+
+			// Get SSH key from database
+			sshKey, err := database.GetSSHKey(dbInstance.SSHKeyName)
+			if err != nil {
+				log.Printf("Warning: Could not find SSH key %s for instance %s: %v", dbInstance.SSHKeyName, instance.IPAddress, err)
+				continue
+			}
+
+			// Connect to instance
+			err = manager.ConnectToInstance(instance.IPAddress, sshKey.PrivateKey)
+			if err != nil {
+				log.Printf("Warning: Failed to connect to instance %s: %v", instance.IPAddress, err)
+				continue
+			}
+
+			fmt.Printf("Connected to instance %s (%s)\n", instance.IPAddress, dbInstance.Name)
+		}
+
+		fmt.Printf("Successfully connected to %d instances\n", len(manager.clients))
 	},
 }
