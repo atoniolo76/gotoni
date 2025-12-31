@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/atoniolo76/gotoni/pkg/client"
+	"github.com/atoniolo76/gotoni/pkg/remote"
 	"github.com/atoniolo76/gotoni/pkg/db"
 
 	"github.com/spf13/cobra"

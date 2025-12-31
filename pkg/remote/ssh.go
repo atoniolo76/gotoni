@@ -1,4 +1,4 @@
-package client
+package remote
 
 import (
 	"encoding/base64"
@@ -34,6 +34,13 @@ type SSHCommand struct {
 type SSHResult struct {
 	Error  error
 	Output string
+}
+
+type ClusterCommandResult struct {
+	InstanceID string
+	InstanceIP string
+	Output     string
+	Error      error
 }
 
 func NewSSHClientManager() *SSHClientManager {

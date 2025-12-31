@@ -1,59 +1,94 @@
 /*
 Copyright © 2025 ALESSIO TONIOLO
 
-serve.go contians the logic for load balancing and request routing
+serve.go contains trie data structures and load balancing logic
 */
 package serve
 
 import (
-	"net/http"
-
-	"github.com/atoniolo76/gotoni/pkg/client"
+	"github.com/atoniolo76/gotoni/pkg/remote"
 )
 
-func LaunchCluster(httpClient *http.Client, apiToken string) *Cluster {
-	provider, _ := client.GetCloudProvider()
+// Ternary Search Trie implementation (from pkg/policy/trie.go)
 
-	// Get available instance types from the cloud provider
-	availableInstances, err := provider.GetAvailableInstanceTypes(httpClient, apiToken)
-	if err != nil {
-		// Handle error - for now just return empty cluster
-		return &Cluster{}
+type TernaryNode struct {
+	data            byte
+	storedInstances []*remote.RunningInstance
+	low             *TernaryNode
+	equal           *TernaryNode
+	high            *TernaryNode
+}
+
+func TernaryInsert(prefix string, instance *remote.RunningInstance, root **TernaryNode) {
+	if *root == nil {
+		*root = &TernaryNode{data: prefix[0]}
 	}
+	currentRoot := *root
+	for i := 0; i < len(prefix); i++ {
+		char := prefix[i]
 
-	// Target regions: us-west, us-east, us-south
-	targetRegions := []string{"us-west-1", "us-east-1", "us-south-1"}
+		if currentRoot.data > char {
+			if currentRoot.low == nil {
+				currentRoot.low = &TernaryNode{data: char}
+			}
+			currentRoot = currentRoot.low
 
-	// Launch one instance per region using the first available instance type for each region
-	for i, targetRegion := range targetRegions {
-		// Find the first instance type that has capacity in this region
-		for _, instance := range availableInstances {
-			// Check if this instance is available in the target region
-			for _, region := range instance.RegionsWithCapacityAvailable {
-				if region.Name == targetRegion {
-					// Launch one instance of this type in this region
-					copyRegion := targetRegion
-					targetRegions[i] = ""
-					go provider.LaunchInstance(httpClient, apiToken, instance.InstanceType.Name, copyRegion, 1, "gotoni-cluster", "", "")
-					break
+		} else if currentRoot.data < char {
+			if currentRoot.high == nil {
+				currentRoot.high = &TernaryNode{data: char}
+			}
+			currentRoot = currentRoot.high
+
+		} else {
+			if i == len(prefix)-1 {
+				currentRoot.storedInstances = append(currentRoot.storedInstances, instance)
+			} else {
+				if currentRoot.equal == nil {
+					currentRoot.equal = &TernaryNode{data: prefix[i+1]}
 				}
+				currentRoot = currentRoot.equal
 			}
 		}
 	}
-
-	return &Cluster{}
 }
+
+func TernarySearch(prefix string, root *TernaryNode) []*remote.RunningInstance {
+	currentRoot := root
+	for i := 0; i < len(prefix); i++ {
+		if currentRoot == nil {
+			return nil
+		}
+
+		char := prefix[i]
+		if currentRoot.data > char {
+			currentRoot = currentRoot.low
+
+		} else if currentRoot.data < char {
+			currentRoot = currentRoot.high
+
+		} else {
+			if i == len(prefix)-1 {
+				return currentRoot.storedInstances
+			} else {
+				currentRoot = currentRoot.equal
+			}
+		}
+	}
+	return nil
+}
+
+// Prefix Tree implementation (from pkg/serve/cluster.go)
 
 type PrefixTree struct {
-	Root *Node
+	Root *PrefixNode
 }
 
-type Node struct {
+type PrefixNode struct {
 	Prefix          string
-	Left            *Node
-	Right           *Node
-	Parent          *Node
-	StoredInstances []*client.RunningInstance
+	Left            *PrefixNode
+	Right           *PrefixNode
+	Parent          *PrefixNode
+	StoredInstances []*remote.RunningInstance
 }
 
 func NewPrefixTree() *PrefixTree {
@@ -62,39 +97,81 @@ func NewPrefixTree() *PrefixTree {
 	}
 }
 
-func InsertPrefix(prefixTree *PrefixTree, prefix string, root *Node, instance *client.RunningInstance) {
+func InsertPrefix(prefixTree *PrefixTree, prefix string, root *PrefixNode, instance *remote.RunningInstance) *PrefixNode {
 	if root == nil {
-		root = &Node{
+		root = &PrefixNode{
 			Prefix:          prefix,
 			Left:            nil,
 			Right:           nil,
 			Parent:          nil,
-			StoredInstances: []*client.RunningInstance{instance},
+			StoredInstances: []*remote.RunningInstance{instance},
 		}
-		return
+		if prefixTree.Root == nil {
+			prefixTree.Root = root
+		}
+		return root
 	}
 
 	if prefix < root.Prefix {
-		InsertPrefix(prefixTree, prefix, root.Left, instance)
+		root.Left = InsertPrefix(prefixTree, prefix, root.Left, instance)
+		if root.Left != nil {
+			root.Left.Parent = root
+		}
 	} else if prefix > root.Prefix {
-		InsertPrefix(prefixTree, prefix, root.Right, instance)
+		root.Right = InsertPrefix(prefixTree, prefix, root.Right, instance)
+		if root.Right != nil {
+			root.Right.Parent = root
+		}
 	} else {
 		root.StoredInstances = append(root.StoredInstances, instance)
 	}
+	return root
 }
 
-var load = make(map[*client.RunningInstance]int, 3)
+var load = make(map[*remote.RunningInstance]int, 3)
 
-func PrefixMatch(prefixTree *PrefixTree, prefix string) *Node {
+func PrefixMatch(prefixTree *PrefixTree, prefix string) *PrefixNode {
 	root := prefixTree.Root
-	current := 0
 	match := root
 	currentNode := root
+	current := 0
 
-	while
+	for currentNode != nil && current < len(prefix) {
+		if current >= len(currentNode.Prefix) {
+			break
+		}
+		if prefix[current] < currentNode.Prefix[current] {
+			currentNode = currentNode.Left
+		} else if prefix[current] > currentNode.Prefix[current] {
+			currentNode = currentNode.Right
+		} else {
+			match = currentNode
+			current++
+			if current == len(prefix) {
+				break
+			}
+			// Continue with next character
+		}
+	}
+
+	return match
 }
 
-func prefixTreePolicy(request string, instances []client.RunningInstance) *client.RunningInstance {
+func PrefixTreePolicy(request string, instances []remote.RunningInstance) *remote.RunningInstance {
 	prefixTree := NewPrefixTree()
 
+	// Build prefix tree from instances
+	for _, instance := range instances {
+		// Use instance ID as prefix for simplicity
+		prefixTree.Root = InsertPrefix(prefixTree, instance.ID, prefixTree.Root, &instance)
+	}
+
+	// Find matching instance based on request
+	node := PrefixMatch(prefixTree, request)
+	if node != nil && len(node.StoredInstances) > 0 {
+		// Return first instance (could implement load balancing here)
+		return node.StoredInstances[0]
+	}
+
+	return nil
 }
