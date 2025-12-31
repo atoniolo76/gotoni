@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/atoniolo76/gotoni/pkg/client"
+	"github.com/atoniolo76/gotoni/pkg/remote"
 
 	"github.com/spf13/cobra"
 )
@@ -90,16 +90,16 @@ Examples:
 
 		// If API token not provided via flag, get from environment
 		if apiToken == "" {
-			apiToken = client.GetAPIToken()
+			apiToken = remote.GetAPIToken()
 			if apiToken == "" {
 				log.Fatal("API token not provided via --api-token flag or LAMBDA_API_KEY environment variable")
 			}
 		}
 
 		// Create HTTP client
-		httpClient := client.NewHTTPClient()
+		httpClient := remote.NewHTTPClient()
 
-		var launchedInstances []client.LaunchedInstance
+		var launchedInstances []remote.LaunchedInstance
 		var launchErr error
 		var actualRegion = region
 
@@ -133,7 +133,7 @@ Examples:
 				case <-ticker.C:
 					fmt.Printf("[%s] Checking availability for %s...\n", time.Now().Format("15:04:05"), instanceType)
 
-					regions, err := client.CheckInstanceTypeAvailability(httpClient, apiToken, instanceType)
+					regions, err := remote.CheckInstanceTypeAvailability(httpClient, apiToken, instanceType)
 					if err != nil {
 						fmt.Printf("Error checking availability: %v\n", err)
 						continue
@@ -178,12 +178,12 @@ Examples:
 		// Create or retrieve filesystem if flag is provided
 		if filesystemName != "" {
 			// Check if filesystem already exists
-			existingFilesystems, err := client.ListFilesystems(httpClient, apiToken)
+			existingFilesystems, err := remote.ListFilesystems(httpClient, apiToken)
 			if err != nil {
 				log.Fatalf("Error listing filesystems: %v", err)
 			}
 
-			var foundFS *client.Filesystem
+			var foundFS *remote.Filesystem
 			for i := range existingFilesystems {
 				if existingFilesystems[i].Name == filesystemName {
 					foundFS = &existingFilesystems[i]
@@ -201,13 +201,13 @@ Examples:
 				}
 
 				// Update local config to ensure LaunchInstance can find it
-				if err := client.SaveFilesystemInfo(filesystemName, foundFS.ID, foundFS.Region.Name); err != nil {
+				if err := remote.SaveFilesystemInfo(filesystemName, foundFS.ID, foundFS.Region.Name); err != nil {
 					log.Fatalf("Error saving filesystem info: %v", err)
 				}
 
 			} else {
 				fmt.Printf("Creating filesystem '%s' in region '%s'...\n", filesystemName, actualRegion)
-				fs, err := client.CreateFilesystem(httpClient, apiToken, filesystemName, actualRegion)
+				fs, err := remote.CreateFilesystem(httpClient, apiToken, filesystemName, actualRegion)
 				if err != nil {
 					log.Fatalf("Error creating filesystem: %v", err)
 				}
@@ -218,10 +218,10 @@ Examples:
 		fmt.Printf("\nLaunching instance...\n")
 		if wait {
 			// Launch and wait for instances to be ready
-			launchedInstances, launchErr = client.LaunchAndWait(httpClient, apiToken, instanceType, actualRegion, 1, instanceName, "", waitTimeout, filesystemName)
+			launchedInstances, launchErr = remote.LaunchAndWait(httpClient, apiToken, instanceType, actualRegion, 1, instanceName, "", waitTimeout, filesystemName)
 		} else {
 			// Launch the instance (this creates SSH key and saves to config)
-			launchedInstances, launchErr = client.LaunchInstance(httpClient, apiToken, instanceType, actualRegion, 1, instanceName, "", filesystemName)
+			launchedInstances, launchErr = remote.LaunchInstance(httpClient, apiToken, instanceType, actualRegion, 1, instanceName, "", filesystemName)
 			fmt.Println("Note: SSH config not updated because IP is not yet available. Use --wait flag to update SSH config automatically.")
 		}
 
@@ -229,9 +229,9 @@ Examples:
 		if launchErr == nil && wait {
 			for _, instance := range launchedInstances {
 				// Get instance details to get IP
-				details, err := client.GetInstance(httpClient, apiToken, instance.ID)
+				details, err := remote.GetInstance(httpClient, apiToken, instance.ID)
 				if err == nil && details.IP != "" {
-					if err := client.UpdateSSHConfig(instanceName, details.IP, instance.SSHKeyFile); err != nil {
+					if err := remote.UpdateSSHConfig(instanceName, details.IP, instance.SSHKeyFile); err != nil {
 						fmt.Printf("Warning: Failed to update SSH config: %v\n", err)
 					}
 				}
@@ -267,7 +267,7 @@ Examples:
 			}
 
 			// Get instance details for IP
-			instanceDetails, err := client.GetInstance(httpClient, apiToken, launchedInstances[0].ID)
+			instanceDetails, err := remote.GetInstance(httpClient, apiToken, launchedInstances[0].ID)
 			if err != nil {
 				log.Fatalf("Failed to get instance details for task execution: %v", err)
 			}
@@ -279,19 +279,19 @@ Examples:
 			fmt.Printf("\n=== Executing Tasks ===\n\n")
 
 			// Load all tasks from database
-			allTasks, err := client.ListTasks()
+			allTasks, err := remote.ListTasks()
 			if err != nil {
 				log.Fatalf("Failed to load tasks: %v", err)
 			}
 
 			// Build task map
-			taskMap := make(map[string]client.Task)
+			taskMap := make(map[string]remote.Task)
 			for _, task := range allTasks {
 				taskMap[task.Name] = task
 			}
 
 			// Select tasks by name in order
-			var selectedTasks []client.Task
+			var selectedTasks []remote.Task
 			for _, taskName := range taskNames {
 				task, found := taskMap[taskName]
 				if !found {
@@ -301,7 +301,7 @@ Examples:
 			}
 
 			// Create SSH client manager
-			manager := client.NewSSHClientManager()
+			manager := remote.NewSSHClientManager()
 			defer manager.CloseAllConnections()
 
 			// Connect to instance
@@ -312,7 +312,7 @@ Examples:
 			fmt.Printf("Connected!\n\n")
 
 			// Execute tasks
-			if err := client.ExecuteTasks(manager, instanceDetails.IP, selectedTasks); err != nil {
+			if err := remote.ExecuteTasks(manager, instanceDetails.IP, selectedTasks); err != nil {
 				log.Fatalf("Failed to execute tasks: %v", err)
 			}
 
@@ -337,7 +337,7 @@ func init() {
 	// is called directly, e.g.:
 	// Extract instance type keys from the map
 	var instanceOptions []string
-	for key := range client.MatchingInstanceTypes {
+	for key := range remote.MatchingInstanceTypes {
 		instanceOptions = append(instanceOptions, key)
 	}
 

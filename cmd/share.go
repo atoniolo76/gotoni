@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/atoniolo76/gotoni/pkg/client"
+	"github.com/atoniolo76/gotoni/pkg/remote"
 	"github.com/psanford/wormhole-william/wormhole"
 	"github.com/spf13/cobra"
 )
@@ -38,26 +38,26 @@ var shareCmd = &cobra.Command{
 		}
 
 		// 1. Get API Token
-		apiToken := client.GetAPIToken()
+		apiToken := remote.GetAPIToken()
 		if apiToken == "" {
 			log.Fatal("API token not provided via LAMBDA_API_KEY environment variable")
 		}
 
 		// 2. Create HTTP client
-		httpClient := client.NewHTTPClient()
+		httpClient := remote.NewHTTPClient()
 
 		// 3. Resolve instance to get IP and real ID
-		var instance *client.RunningInstance
+		var instance *remote.RunningInstance
 		var err error
 
 		if instanceID != "" {
-			instance, err = client.ResolveInstance(httpClient, apiToken, instanceID)
+			instance, err = remote.ResolveInstance(httpClient, apiToken, instanceID)
 			if err != nil {
 				log.Fatalf("Error resolving instance '%s': %v", instanceID, err)
 			}
 		} else {
 			// No instance provided, try to find first running instance
-			runningInstances, err := client.ListRunningInstances(httpClient, apiToken)
+			runningInstances, err := remote.ListRunningInstances(httpClient, apiToken)
 			if err != nil {
 				log.Fatalf("Error listing running instances: %v", err)
 			}
@@ -73,7 +73,7 @@ var shareCmd = &cobra.Command{
 		}
 
 		// 4. Lookup SSH key for the instance
-		sshKeyPath, err := client.GetSSHKeyForInstance(instance.ID)
+		sshKeyPath, err := remote.GetSSHKeyForInstance(instance.ID)
 		if err != nil {
 			// If we can't find it by ID, try to find it by name mapping or ask user?
 			// For now, fail if not found in local config

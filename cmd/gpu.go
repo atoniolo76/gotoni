@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/atoniolo76/gotoni/pkg/client"
+	"github.com/atoniolo76/gotoni/pkg/remote"
 
 	"github.com/spf13/cobra"
 )
@@ -32,7 +32,7 @@ Use the included plot.py script to visualize the CSV data.`,
 		}
 
 		if apiToken == "" {
-			apiToken = client.GetAPIToken()
+			apiToken = remote.GetAPIToken()
 			if apiToken == "" {
 				log.Fatal("API token not provided via --api-token flag or LAMBDA_API_KEY environment variable")
 			}
@@ -56,8 +56,8 @@ Use the included plot.py script to visualize the CSV data.`,
 		if len(args) > 0 {
 			instanceID = args[0]
 		} else {
-			httpClient := client.NewHTTPClient()
-			runningInstances, err := client.ListRunningInstances(httpClient, apiToken)
+			httpClient := remote.NewHTTPClient()
+			runningInstances, err := remote.ListRunningInstances(httpClient, apiToken)
 			if err != nil {
 				log.Fatalf("Failed to list running instances: %v", err)
 			}
@@ -68,9 +68,9 @@ Use the included plot.py script to visualize the CSV data.`,
 			fmt.Printf("Using instance: %s\n", instanceID)
 		}
 
-		httpClient := client.NewHTTPClient()
+		httpClient := remote.NewHTTPClient()
 
-		instanceDetails, err := client.GetInstance(httpClient, apiToken, instanceID)
+		instanceDetails, err := remote.GetInstance(httpClient, apiToken, instanceID)
 		if err != nil {
 			log.Fatalf("Failed to get instance details: %v", err)
 		}
@@ -79,12 +79,12 @@ Use the included plot.py script to visualize the CSV data.`,
 			log.Fatalf("Instance IP address is empty. Instance status: %s. The instance may still be booting. Please wait a moment and try again, or check the instance status with 'gotoni list'.", instanceDetails.Status)
 		}
 
-		sshKeyFile, err := client.GetSSHKeyForInstance(instanceID)
+		sshKeyFile, err := remote.GetSSHKeyForInstance(instanceID)
 		if err != nil {
 			log.Fatalf("Failed to get SSH key: %v", err)
 		}
 
-		manager := client.NewSSHClientManager()
+		manager := remote.NewSSHClientManager()
 		defer manager.CloseAllConnections()
 
 		fmt.Printf("Connecting to instance %s (%s)...\n", instanceID, instanceDetails.IP)
@@ -97,7 +97,7 @@ Use the included plot.py script to visualize the CSV data.`,
 	},
 }
 
-func trackGPU(manager *client.SSHClientManager, instanceIP string, logFile string, interval float64) {
+func trackGPU(manager *remote.SSHClientManager, instanceIP string, logFile string, interval float64) {
 	// Create directory if needed
 	logDir := filepath.Dir(logFile)
 	if logDir != "." && logDir != "" {

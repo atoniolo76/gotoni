@@ -7,7 +7,7 @@ import (
 	"log"
 	"strings"
 
-	"github.com/atoniolo76/gotoni/pkg/client"
+	"github.com/atoniolo76/gotoni/pkg/remote"
 	"github.com/spf13/cobra"
 )
 
@@ -46,10 +46,10 @@ Requirements:
 			// For IDE opening, we ideally need the SSH config name
 
 			// Try to resolve to verify it exists, but use the provided name as the host alias
-			apiToken := client.GetAPIToken()
+			apiToken := remote.GetAPIToken()
 			if apiToken != "" {
-				httpClient := client.NewHTTPClient()
-				_, err := client.ResolveInstance(httpClient, apiToken, target)
+				httpClient := remote.NewHTTPClient()
+				_, err := remote.ResolveInstance(httpClient, apiToken, target)
 				if err == nil {
 					// It exists in cloud, assume it's configured in SSH
 					instanceName = target
