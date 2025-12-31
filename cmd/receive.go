@@ -13,7 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/atoniolo76/gotoni/pkg/client"
+	"github.com/atoniolo76/gotoni/pkg/remote"
 	"github.com/atoniolo76/gotoni/pkg/db"
 	"github.com/psanford/wormhole-william/wormhole"
 	"github.com/spf13/cobra"

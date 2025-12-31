@@ -1,4 +1,4 @@
-package client
+package remote
 
 import (
 	"encoding/base64"
@@ -19,8 +19,8 @@ func TestLaunchInstanceWithExistingSSHKey(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to get working directory: %v", err)
 	}
-	// If we're in pkg/client, go up two levels to project root
-	if strings.HasSuffix(wd, "/pkg/client") {
+	// If we're in pkg/remote, go up two levels to project root
+	if strings.HasSuffix(wd, "/pkg/remote") {
 		projectRoot := filepath.Dir(filepath.Dir(wd))
 		if err := os.Chdir(projectRoot); err != nil {
 			t.Fatalf("Failed to change to project root: %v", err)
@@ -69,8 +69,8 @@ func TestCTCAlignmentPlaybook(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to get working directory: %v", err)
 	}
-	// If we're in pkg/client, go up two levels to project root
-	if strings.HasSuffix(wd, "/pkg/client") {
+	// If we're in pkg/remote, go up two levels to project root
+	if strings.HasSuffix(wd, "/pkg/remote") {
 		projectRoot := filepath.Dir(filepath.Dir(wd))
 		if err := os.Chdir(projectRoot); err != nil {
 			t.Fatalf("Failed to change to project root: %v", err)
@@ -150,31 +150,37 @@ func TestCTCAlignmentPlaybook(t *testing.T) {
 	}
 	t.Logf("Successfully connected to instance via SSH!")
 
-	// Load config to get tasks
-	config, err := LoadConfig()
+	// Get tasks from database
+	db, err := getDB()
 	if err != nil {
-		t.Fatalf("Failed to load config: %v", err)
+		t.Fatalf("Failed to init db: %v", err)
+	}
+	defer db.Close()
+
+	tasks, err := db.ListTasks()
+	if err != nil {
+		t.Fatalf("Failed to list tasks: %v", err)
 	}
 
-	if len(config.Tasks) == 0 {
-		t.Fatal("No tasks defined in config.yaml")
+	if len(tasks) == 0 {
+		t.Fatal("No tasks defined in database")
 	}
 
 	// Filter setup tasks (command type)
-	setupTasks := FilterTasksByType(config.Tasks, "command")
+	setupTasks := FilterTasksByType(tasks, "command")
 	if len(setupTasks) == 0 {
-		t.Fatal("No command tasks found in config.yaml")
+		t.Fatal("No command tasks found in database")
 	}
 
 	// Execute setup tasks synchronously
-	t.Logf("Executing %d setup task(s) from config.yaml...", len(setupTasks))
+	t.Logf("Executing %d setup task(s) from database...", len(setupTasks))
 	if err := ExecuteTasks(manager, instanceDetails.IP, setupTasks); err != nil {
 		t.Fatalf("Failed to execute setup tasks: %v", err)
 	}
 	t.Logf("Setup tasks completed successfully!")
 
 	// Filter service tasks
-	serviceTasks := FilterTasksByType(config.Tasks, "service")
+	serviceTasks := FilterTasksByType(tasks, "service")
 	if len(serviceTasks) == 0 {
 		t.Fatal("No service tasks found in config.yaml")
 	}

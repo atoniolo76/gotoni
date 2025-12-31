@@ -1,4 +1,4 @@
-package client
+package remote
 
 import (
 	"fmt"
@@ -16,8 +16,8 @@ func TestLaunchInstanceAndRunSSHCommand(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to get working directory: %v", err)
 	}
-	// If we're in pkg/client, go up two levels to project root
-	if strings.HasSuffix(wd, "/pkg/client") {
+	// If we're in pkg/remote, go up two levels to project root
+	if strings.HasSuffix(wd, "/pkg/remote") {
 		projectRoot := filepath.Dir(filepath.Dir(wd))
 		if err := os.Chdir(projectRoot); err != nil {
 			t.Fatalf("Failed to change to project root: %v", err)
@@ -100,8 +100,8 @@ func TestSSHToExistingInstance(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to get working directory: %v", err)
 	}
-	// If we're in pkg/client, go up two levels to project root
-	if strings.HasSuffix(wd, "/pkg/client") {
+	// If we're in pkg/remote, go up two levels to project root
+	if strings.HasSuffix(wd, "/pkg/remote") {
 		projectRoot := filepath.Dir(filepath.Dir(wd))
 		if err := os.Chdir(projectRoot); err != nil {
 			t.Fatalf("Failed to change to project root: %v", err)
