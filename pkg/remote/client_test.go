@@ -1,4 +1,4 @@
-package client
+package remote
 
 import (
 	"encoding/base64"
@@ -19,8 +19,8 @@ func TestLaunchInstanceWithExistingSSHKey(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to get working directory: %v", err)
 	}
-	// If we're in pkg/client, go up two levels to project root
-	if strings.HasSuffix(wd, "/pkg/client") {
+	// If we're in pkg/remote, go up two levels to project root
+	if strings.HasSuffix(wd, "/pkg/remote") {
 		projectRoot := filepath.Dir(filepath.Dir(wd))
 		if err := os.Chdir(projectRoot); err != nil {
 			t.Fatalf("Failed to change to project root: %v", err)
@@ -69,8 +69,8 @@ func TestCTCAlignmentPlaybook(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to get working directory: %v", err)
 	}
-	// If we're in pkg/client, go up two levels to project root
-	if strings.HasSuffix(wd, "/pkg/client") {
+	// If we're in pkg/remote, go up two levels to project root
+	if strings.HasSuffix(wd, "/pkg/remote") {
 		projectRoot := filepath.Dir(filepath.Dir(wd))
 		if err := os.Chdir(projectRoot); err != nil {
 			t.Fatalf("Failed to change to project root: %v", err)
@@ -150,31 +150,76 @@ func TestCTCAlignmentPlaybook(t *testing.T) {
 	}
 	t.Logf("Successfully connected to instance via SSH!")
 
-	// Load config to get tasks
-	config, err := LoadConfig()
+	// Get tasks from database
+	db, err := getDB()
 	if err != nil {
-		t.Fatalf("Failed to load config: %v", err)
+		t.Fatalf("Failed to init db: %v", err)
+	}
+	defer db.Close()
+
+	dbTasks, err := db.ListTasks()
+	if err != nil {
+		t.Fatalf("Failed to list tasks: %v", err)
 	}
 
-	if len(config.Tasks) == 0 {
-		t.Fatal("No tasks defined in config.yaml")
+	if len(dbTasks) == 0 {
+		t.Fatal("No tasks defined in database")
+	}
+
+	// Convert db.Task to remote.Task
+	tasks := make([]Task, len(dbTasks))
+	for i, dbTask := range dbTasks {
+		tasks[i] = Task{
+			Name:       dbTask.Name,
+			Type:       dbTask.Type,
+			Command:    dbTask.Command,
+			Background: dbTask.Background,
+			WorkingDir: dbTask.WorkingDir,
+			When:       dbTask.WhenCondition,
+			Restart:    dbTask.Restart,
+			RestartSec: dbTask.RestartSec,
+		}
+
+		// Parse Env JSON string to map
+		if dbTask.Env != "" {
+			envMap := make(map[string]string)
+			if err := json.Unmarshal([]byte(dbTask.Env), &envMap); err != nil {
+				t.Logf("Warning: Failed to parse Env JSON for task %s: %v", dbTask.Name, err)
+				envMap = make(map[string]string) // Leave empty on error
+			}
+			tasks[i].Env = envMap
+		} else {
+			tasks[i].Env = make(map[string]string)
+		}
+
+		// Parse DependsOn JSON string to slice
+		if dbTask.DependsOn != "" {
+			var dependsOnSlice []string
+			if err := json.Unmarshal([]byte(dbTask.DependsOn), &dependsOnSlice); err != nil {
+				t.Logf("Warning: Failed to parse DependsOn JSON for task %s: %v", dbTask.Name, err)
+				dependsOnSlice = make([]string, 0) // Leave empty on error
+			}
+			tasks[i].DependsOn = dependsOnSlice
+		} else {
+			tasks[i].DependsOn = make([]string, 0)
+		}
 	}
 
 	// Filter setup tasks (command type)
-	setupTasks := FilterTasksByType(config.Tasks, "command")
+	setupTasks := FilterTasksByType(tasks, "command")
 	if len(setupTasks) == 0 {
-		t.Fatal("No command tasks found in config.yaml")
+		t.Fatal("No command tasks found in database")
 	}
 
 	// Execute setup tasks synchronously
-	t.Logf("Executing %d setup task(s) from config.yaml...", len(setupTasks))
+	t.Logf("Executing %d setup task(s) from database...", len(setupTasks))
 	if err := ExecuteTasks(manager, instanceDetails.IP, setupTasks); err != nil {
 		t.Fatalf("Failed to execute setup tasks: %v", err)
 	}
 	t.Logf("Setup tasks completed successfully!")
 
 	// Filter service tasks
-	serviceTasks := FilterTasksByType(config.Tasks, "service")
+	serviceTasks := FilterTasksByType(tasks, "service")
 	if len(serviceTasks) == 0 {
 		t.Fatal("No service tasks found in config.yaml")
 	}

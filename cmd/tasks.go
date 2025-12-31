@@ -8,8 +8,8 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/atoniolo76/gotoni/pkg/client"
 	"github.com/atoniolo76/gotoni/pkg/db"
+	"github.com/atoniolo76/gotoni/pkg/remote"
 	"github.com/spf13/cobra"
 )
 
@@ -128,7 +128,7 @@ var tasksListCmd = &cobra.Command{
 	Short: "List all automation tasks",
 	Long:  `Display all tasks that can be executed on instances.`,
 	Run: func(cmd *cobra.Command, args []string) {
-		tasks, err := client.ListTasks()
+		tasks, err := remote.ListTasks()
 		if err != nil {
 			log.Fatalf("Failed to list tasks: %v", err)
 		}
@@ -207,4 +207,3 @@ func init() {
 	tasksAddCmd.MarkFlagRequired("name")
 	tasksAddCmd.MarkFlagRequired("command")
 }
-

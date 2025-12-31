@@ -1,4 +1,4 @@
-package client
+package remote
 
 import (
 	"context"
@@ -349,7 +349,13 @@ func LaunchAndWait(
 
 func RunCommandOnInstance(instanceIP string) error {
 	db, err := getDB()
-	if 
+	if err != nil {
+		return fmt.Errorf("failed to init db: %w", err)
+	}
+	defer db.Close()
+
+	// TODO: Implement command execution logic
+	return fmt.Errorf("RunCommandOnInstance not implemented")
 }
 
 // ConnectToInstance connects to a remote instance via SSH using the key from config

@@ -8,7 +8,7 @@ import (
 	"log"
 	"strings"
 
-	"github.com/atoniolo76/gotoni/pkg/client"
+	"github.com/atoniolo76/gotoni/pkg/remote"
 
 	"github.com/spf13/cobra"
 )
@@ -27,7 +27,7 @@ If service-name is not provided, shows logs from all services.`,
 
 		// If API token not provided via flag, get from config or environment
 		if apiToken == "" {
-			apiToken = client.GetAPIToken()
+			apiToken = remote.GetAPIToken()
 			if apiToken == "" {
 				log.Fatal("API token not provided via --api-token flag or LAMBDA_API_KEY environment variable")
 			}
@@ -41,7 +41,7 @@ If service-name is not provided, shows logs from all services.`,
 			lines = 100 // Default
 		}
 
-		var instanceDetails *client.RunningInstance
+		var instanceDetails *remote.RunningInstance
 		var sessionName string
 
 		if len(args) == 0 {
@@ -49,8 +49,8 @@ If service-name is not provided, shows logs from all services.`,
 		} else if len(args) == 1 {
 			instanceName := args[0]
 			// Resolve instance name/ID to instance details
-			httpClient := client.NewHTTPClient()
-			instanceDetails, err = client.ResolveInstance(httpClient, apiToken, instanceName)
+			httpClient := remote.NewHTTPClient()
+			instanceDetails, err = remote.ResolveInstance(httpClient, apiToken, instanceName)
 			if err != nil {
 				log.Fatalf("Failed to resolve instance '%s': %v", instanceName, err)
 			}
@@ -59,8 +59,8 @@ If service-name is not provided, shows logs from all services.`,
 			sessionName = args[1]
 
 			// Resolve instance name/ID to instance details
-			httpClient := client.NewHTTPClient()
-			instanceDetails, err = client.ResolveInstance(httpClient, apiToken, instanceName)
+			httpClient := remote.NewHTTPClient()
+			instanceDetails, err = remote.ResolveInstance(httpClient, apiToken, instanceName)
 			if err != nil {
 				log.Fatalf("Failed to resolve instance '%s': %v", instanceName, err)
 			}
@@ -74,13 +74,13 @@ If service-name is not provided, shows logs from all services.`,
 		}
 
 		// Get SSH key
-		sshKeyFile, err := client.GetSSHKeyForInstance(instanceDetails.ID)
+		sshKeyFile, err := remote.GetSSHKeyForInstance(instanceDetails.ID)
 		if err != nil {
 			log.Fatalf("Failed to get SSH key: %v", err)
 		}
 
 		// Create SSH manager and connect
-		manager := client.NewSSHClientManager()
+		manager := remote.NewSSHClientManager()
 		defer manager.CloseAllConnections()
 
 		fmt.Printf("Connecting to instance %s (%s)...\n", instanceDetails.Name, instanceDetails.IP)

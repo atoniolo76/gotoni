@@ -10,7 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/atoniolo76/gotoni/pkg/client"
+	"github.com/atoniolo76/gotoni/pkg/remote"
 
 	"github.com/spf13/cobra"
 )
@@ -34,7 +34,7 @@ var sshKeysListCmd = &cobra.Command{
 		}
 
 		// Create HTTP client
-		httpClient := client.NewHTTPClient()
+		httpClient := remote.NewHTTPClient()
 
 		// If API token not provided via flag, get from environment
 		if apiToken == "" {
@@ -44,7 +44,7 @@ var sshKeysListCmd = &cobra.Command{
 			}
 		}
 
-		sshKeys, err := client.ListSSHKeys(httpClient, apiToken)
+		sshKeys, err := remote.ListSSHKeys(httpClient, apiToken)
 		if err != nil {
 			log.Fatalf("Error listing SSH keys: %v", err)
 		}
@@ -108,13 +108,13 @@ var sshKeysDeleteCmd = &cobra.Command{
 		}
 
 		// Create HTTP client
-		httpClient := client.NewHTTPClient()
+		httpClient := remote.NewHTTPClient()
 
 		fmt.Printf("Deleting SSH key(s): %s\n", strings.Join(sshKeyIDs, ", "))
 
 		var deletedCount int
 		for _, sshKeyID := range sshKeyIDs {
-			if err := client.DeleteSSHKey(httpClient, apiToken, sshKeyID); err != nil {
+			if err := remote.DeleteSSHKey(httpClient, apiToken, sshKeyID); err != nil {
 				log.Printf("Error deleting SSH key %s: %v", sshKeyID, err)
 				continue
 			}
@@ -141,7 +141,7 @@ var sshKeysAddCmd = &cobra.Command{
 			log.Fatalf("Error getting key name: %v", err)
 		}
 
-		addedKeyName, targetPath, err := client.AddExistingSSHKey(keyPath, keyName)
+		addedKeyName, targetPath, err := remote.AddExistingSSHKey(keyPath, keyName)
 		if err != nil {
 			log.Fatalf("Error adding SSH key: %v", err)
 		}
@@ -168,7 +168,7 @@ var sshKeysGetCmd = &cobra.Command{
 		}
 
 		// Get SSH key file path for the instance
-		sshKeyPath, err := client.GetSSHKeyForInstance(instanceID)
+		sshKeyPath, err := remote.GetSSHKeyForInstance(instanceID)
 		if err != nil {
 			log.Fatalf("Error getting SSH key for instance: %v", err)
 		}

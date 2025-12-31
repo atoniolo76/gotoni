@@ -9,7 +9,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/atoniolo76/gotoni/pkg/client"
+	"github.com/atoniolo76/gotoni/pkg/remote"
 
 	"github.com/spf13/cobra"
 )
@@ -33,7 +33,7 @@ var filesystemsListCmd = &cobra.Command{
 		}
 
 		// Create HTTP client
-		httpClient := client.NewHTTPClient()
+		httpClient := remote.NewHTTPClient()
 
 		// If API token not provided via flag, get from environment
 		if apiToken == "" {
@@ -43,7 +43,7 @@ var filesystemsListCmd = &cobra.Command{
 			}
 		}
 
-		filesystems, err := client.ListFilesystems(httpClient, apiToken)
+		filesystems, err := remote.ListFilesystems(httpClient, apiToken)
 		if err != nil {
 			log.Fatalf("Error listing filesystems: %v", err)
 		}
@@ -122,13 +122,13 @@ var filesystemsDeleteCmd = &cobra.Command{
 		}
 
 		// Create HTTP client
-		httpClient := client.NewHTTPClient()
+		httpClient := remote.NewHTTPClient()
 
 		fmt.Printf("Deleting filesystem(s): %s\n", strings.Join(filesystemIDs, ", "))
 
 		var deletedCount int
 		for _, filesystemID := range filesystemIDs {
-			if err := client.DeleteFilesystem(httpClient, apiToken, filesystemID); err != nil {
+			if err := remote.DeleteFilesystem(httpClient, apiToken, filesystemID); err != nil {
 				log.Printf("Error deleting filesystem %s: %v", filesystemID, err)
 				continue
 			}
