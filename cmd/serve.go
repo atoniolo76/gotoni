@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/atoniolo76/gotoni/pkg/remote"
 	"github.com/atoniolo76/gotoni/pkg/db"
+	"github.com/atoniolo76/gotoni/pkg/remote"
 
 	"github.com/spf13/cobra"
 )
@@ -21,14 +21,14 @@ var serveCmd = &cobra.Command{
 		}
 
 		if apiToken == "" {
-			apiToken = client.GetAPIToken()
+			apiToken = remote.GetAPIToken()
 			if apiToken == "" {
 				log.Fatal("API token not provided via --api-token flag or LAMBDA_API_KEY environment variable")
 			}
 		}
 
-		httpClient := client.NewHTTPClient()
-		runningInstances, err := client.ListRunningInstances(httpClient, apiToken)
+		httpClient := remote.NewHTTPClient()
+		runningInstances, err := remote.ListRunningInstances(httpClient, apiToken)
 		if err != nil {
 			log.Fatalf("Error listing running instances: %v", err)
 		}
@@ -46,34 +46,34 @@ var serveCmd = &cobra.Command{
 		defer database.Close()
 
 		// Create SSH client manager
-		manager := client.NewSSHClientManager()
+		manager := remote.NewSSHClientManager()
 
 		// Connect to each running instance
 		for _, instance := range runningInstances {
 			// Look up instance in database to get SSH key name
-			dbInstance, err := database.GetInstanceByIP(instance.IPAddress)
+			dbInstance, err := database.GetInstanceByIP(instance.IP)
 			if err != nil {
-				log.Printf("Warning: Could not find instance %s in database: %v", instance.IPAddress, err)
+				log.Printf("Warning: Could not find instance %s in database: %v", instance.IP, err)
 				continue
 			}
 
 			// Get SSH key from database
 			sshKey, err := database.GetSSHKey(dbInstance.SSHKeyName)
 			if err != nil {
-				log.Printf("Warning: Could not find SSH key %s for instance %s: %v", dbInstance.SSHKeyName, instance.IPAddress, err)
+				log.Printf("Warning: Could not find SSH key %s for instance %s: %v", dbInstance.SSHKeyName, instance.IP, err)
 				continue
 			}
 
 			// Connect to instance
-			err = manager.ConnectToInstance(instance.IPAddress, sshKey.PrivateKey)
+			err = manager.ConnectToInstance(instance.IP, sshKey.PrivateKey)
 			if err != nil {
-				log.Printf("Warning: Failed to connect to instance %s: %v", instance.IPAddress, err)
+				log.Printf("Warning: Failed to connect to instance %s: %v", instance.IP, err)
 				continue
 			}
 
-			fmt.Printf("Connected to instance %s (%s)\n", instance.IPAddress, dbInstance.Name)
+			fmt.Printf("Connected to instance %s (%s)\n", instance.IP, dbInstance.Name)
 		}
 
-		fmt.Printf("Successfully connected to %d instances\n", len(manager.clients))
+		fmt.Println("Successfully connected to cluster instances")
 	},
 }

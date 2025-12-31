@@ -53,12 +53,12 @@ var deleteCmd = &cobra.Command{
 		}
 
 		// Create HTTP client
-		httpClient := client.NewHTTPClient()
+		httpClient := remote.NewHTTPClient()
 
 		// Resolve instance names to IDs
 		var instanceIDs []string
 		for _, name := range instanceNames {
-			instance, err := client.ResolveInstance(httpClient, apiToken, name)
+			instance, err := remote.ResolveInstance(httpClient, apiToken, name)
 			if err != nil {
 				log.Fatalf("Failed to resolve instance '%s': %v", name, err)
 			}
@@ -67,7 +67,7 @@ var deleteCmd = &cobra.Command{
 
 		fmt.Printf("Terminating instance(s): %s\n", strings.Join(instanceNames, ", "))
 
-		terminatedResponse, err := client.TerminateInstance(httpClient, apiToken, instanceIDs)
+		terminatedResponse, err := remote.TerminateInstance(httpClient, apiToken, instanceIDs)
 		if err != nil {
 			log.Fatalf("Error terminating instance: %v", err)
 		}
@@ -76,7 +76,7 @@ var deleteCmd = &cobra.Command{
 		// Remove all requested instance IDs, not just the ones in the response
 		// (in case some were already terminated or not returned by API)
 		for _, instanceID := range instanceIDs {
-			if err := client.RemoveInstanceFromConfig(instanceID); err != nil {
+			if err := remote.RemoveInstanceFromConfig(instanceID); err != nil {
 				log.Printf("Warning: failed to remove instance %s from config: %v", instanceID, err)
 			} else {
 				fmt.Printf("Removed instance %s from config\n", instanceID)

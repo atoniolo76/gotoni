@@ -64,10 +64,10 @@ var connectCmd = &cobra.Command{
 				instanceName = target
 			} else {
 				// For SSH, try to resolve to IP first, fallback to name
-				apiToken := client.GetAPIToken()
+				apiToken := remote.GetAPIToken()
 				if apiToken != "" {
-					httpClient := client.NewHTTPClient()
-					instance, err := client.ResolveInstance(httpClient, apiToken, target)
+					httpClient := remote.NewHTTPClient()
+					instance, err := remote.ResolveInstance(httpClient, apiToken, target)
 					if err == nil {
 						// Found instance, use IP for SSH
 						instanceName = instance.IP
@@ -87,7 +87,7 @@ var connectCmd = &cobra.Command{
 			openInIDE(instanceName, remotePath, code)
 		} else {
 			// Connect via SSH
-			if err := client.ConnectToInstance(instanceName); err != nil {
+			if err := remote.ConnectToInstance(instanceName); err != nil {
 				log.Fatalf("Failed to connect to instance: %v", err)
 			}
 		}

@@ -33,26 +33,26 @@ var firewallListCmd = &cobra.Command{
 		}
 
 		if apiToken == "" {
-			apiToken = client.GetAPIToken()
+			apiToken = remote.GetAPIToken()
 			if apiToken == "" {
 				log.Fatal("API token not provided via --api-token flag or LAMBDA_API_KEY environment variable")
 			}
 		}
 
-		httpClient := client.NewHTTPClient()
-		rules, err := client.ListFirewallRules(httpClient, apiToken)
+		httpClient := remote.NewHTTPClient()
+		ruleset, err := remote.GetGlobalFirewallRules(httpClient, apiToken)
 		if err != nil {
 			log.Fatalf("Error listing firewall rules: %v", err)
 		}
 
-		if len(rules) == 0 {
+		if len(ruleset.Rules) == 0 {
 			fmt.Println("No firewall rules configured.")
 			return
 		}
 
 		fmt.Println("Current firewall rules:")
 		fmt.Println()
-		for i, rule := range rules {
+		for i, rule := range ruleset.Rules {
 			fmt.Printf("Rule %d:\n", i+1)
 			fmt.Printf("  Protocol:       %s\n", rule.Protocol)
 			if len(rule.PortRange) == 2 {
@@ -91,7 +91,7 @@ Note: Firewall rules do not apply to the us-south-1 region.`,
 		}
 
 		if apiToken == "" {
-			apiToken = client.GetAPIToken()
+			apiToken = remote.GetAPIToken()
 			if apiToken == "" {
 				log.Fatal("API token not provided via --api-token flag or LAMBDA_API_KEY environment variable")
 			}
@@ -100,7 +100,7 @@ Note: Firewall rules do not apply to the us-south-1 region.`,
 		jsonRules, _ := cmd.Flags().GetString("json")
 		shorthandRules, _ := cmd.Flags().GetStringArray("rule")
 
-		var rules []client.FirewallRule
+		var rules []remote.FirewallRule
 
 		if jsonRules != "" {
 			// Parse JSON format
@@ -121,15 +121,15 @@ Note: Firewall rules do not apply to the us-south-1 region.`,
 			log.Fatal("Either --json or --rule must be provided")
 		}
 
-		httpClient := client.NewHTTPClient()
-		resultRules, err := client.ReplaceFirewallRules(httpClient, apiToken, rules)
+		httpClient := remote.NewHTTPClient()
+		resultRuleset, err := remote.UpdateGlobalFirewallRules(httpClient, apiToken, rules)
 		if err != nil {
 			log.Fatalf("Error replacing firewall rules: %v", err)
 		}
 
 		fmt.Println("Firewall rules replaced successfully!")
-		fmt.Printf("Applied %d rule(s):\n\n", len(resultRules))
-		for i, rule := range resultRules {
+		fmt.Printf("Applied %d rule(s):\n\n", len(resultRuleset.Rules))
+		for i, rule := range resultRuleset.Rules {
 			fmt.Printf("Rule %d:\n", i+1)
 			fmt.Printf("  Protocol:       %s\n", rule.Protocol)
 			if len(rule.PortRange) == 2 {
@@ -143,10 +143,10 @@ Note: Firewall rules do not apply to the us-south-1 region.`,
 }
 
 // parseShorthandRule parses a rule in format "protocol:port_or_range:source_network:description"
-func parseShorthandRule(s string) (client.FirewallRule, error) {
+func parseShorthandRule(s string) (remote.FirewallRule, error) {
 	parts := strings.SplitN(s, ":", 4)
 	if len(parts) < 4 {
-		return client.FirewallRule{}, fmt.Errorf("invalid format, expected protocol:port_or_range:source_network:description")
+		return remote.FirewallRule{}, fmt.Errorf("invalid format, expected protocol:port_or_range:source_network:description")
 	}
 
 	protocol := strings.ToLower(parts[0])
@@ -157,10 +157,10 @@ func parseShorthandRule(s string) (client.FirewallRule, error) {
 	// Validate protocol
 	validProtocols := map[string]bool{"tcp": true, "udp": true, "icmp": true, "all": true}
 	if !validProtocols[protocol] {
-		return client.FirewallRule{}, fmt.Errorf("invalid protocol '%s', must be one of: tcp, udp, icmp, all", protocol)
+		return remote.FirewallRule{}, fmt.Errorf("invalid protocol '%s', must be one of: tcp, udp, icmp, all", protocol)
 	}
 
-	rule := client.FirewallRule{
+	rule := remote.FirewallRule{
 		Protocol:      protocol,
 		SourceNetwork: sourceNetwork,
 		Description:   description,
@@ -172,27 +172,27 @@ func parseShorthandRule(s string) (client.FirewallRule, error) {
 			// Range format: 80-443
 			rangeParts := strings.Split(portStr, "-")
 			if len(rangeParts) != 2 {
-				return client.FirewallRule{}, fmt.Errorf("invalid port range format '%s'", portStr)
+				return remote.FirewallRule{}, fmt.Errorf("invalid port range format '%s'", portStr)
 			}
 			minPort, err := strconv.Atoi(rangeParts[0])
 			if err != nil {
-				return client.FirewallRule{}, fmt.Errorf("invalid min port '%s': %v", rangeParts[0], err)
+				return remote.FirewallRule{}, fmt.Errorf("invalid min port '%s': %v", rangeParts[0], err)
 			}
 			maxPort, err := strconv.Atoi(rangeParts[1])
 			if err != nil {
-				return client.FirewallRule{}, fmt.Errorf("invalid max port '%s': %v", rangeParts[1], err)
+				return remote.FirewallRule{}, fmt.Errorf("invalid max port '%s': %v", rangeParts[1], err)
 			}
 			rule.PortRange = []int{minPort, maxPort}
 		} else {
 			// Single port: 22
 			port, err := strconv.Atoi(portStr)
 			if err != nil {
-				return client.FirewallRule{}, fmt.Errorf("invalid port '%s': %v", portStr, err)
+				return remote.FirewallRule{}, fmt.Errorf("invalid port '%s': %v", portStr, err)
 			}
 			rule.PortRange = []int{port, port}
 		}
 	} else if protocol != "icmp" {
-		return client.FirewallRule{}, fmt.Errorf("port_range is required for protocol '%s'", protocol)
+		return remote.FirewallRule{}, fmt.Errorf("port_range is required for protocol '%s'", protocol)
 	}
 
 	return rule, nil
@@ -211,4 +211,3 @@ func init() {
 	firewallReplaceCmd.Flags().StringP("json", "j", "", "JSON array of firewall rules")
 	firewallReplaceCmd.Flags().StringArrayP("rule", "r", []string{}, "Firewall rule in shorthand format: protocol:port_or_range:source_network:description")
 }
-

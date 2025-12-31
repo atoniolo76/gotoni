@@ -25,17 +25,17 @@ var availableCmd = &cobra.Command{
 		}
 
 		// Create HTTP client
-		httpClient := client.NewHTTPClient()
+		httpClient := remote.NewHTTPClient()
 
 		// If API token not provided via flag, get from environment
 		if apiToken == "" {
-			apiToken = client.GetAPIToken()
+			apiToken = remote.GetAPIToken()
 			if apiToken == "" {
 				log.Fatal("API token not provided via --api-token flag or LAMBDA_API_KEY environment variable")
 			}
 		}
 
-		availableInstanceTypes, err := client.GetAvailableInstanceTypes(httpClient, apiToken)
+		availableInstanceTypes, err := remote.GetAvailableInstanceTypes(httpClient, apiToken)
 		if err != nil {
 			log.Fatalf("Error getting available instance types: %v", err)
 		}
