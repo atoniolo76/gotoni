@@ -13,8 +13,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/atoniolo76/gotoni/pkg/remote"
 	"github.com/atoniolo76/gotoni/pkg/db"
+	"github.com/atoniolo76/gotoni/pkg/remote"
 	"github.com/psanford/wormhole-william/wormhole"
 	"github.com/spf13/cobra"
 )
@@ -102,70 +102,70 @@ var receiveCmd = &cobra.Command{
 			instanceName = strings.TrimSuffix(fileName, filepath.Ext(fileName))
 		}
 
-	targetPath := filepath.Join(sshDir, fileName)
+		targetPath := filepath.Join(sshDir, fileName)
 
-	// 4. Remove existing file if it exists (it might be read-only)
-	if _, err := os.Stat(targetPath); err == nil {
-		// File exists, make it writable first then remove it
-		os.Chmod(targetPath, 0600)
-		if err := os.Remove(targetPath); err != nil {
-			log.Fatalf("Failed to remove existing key file: %v", err)
+		// 4. Remove existing file if it exists (it might be read-only)
+		if _, err := os.Stat(targetPath); err == nil {
+			// File exists, make it writable first then remove it
+			os.Chmod(targetPath, 0600)
+			if err := os.Remove(targetPath); err != nil {
+				log.Fatalf("Failed to remove existing key file: %v", err)
+			}
+			fmt.Printf("Removed existing key file: %s\n", targetPath)
 		}
-		fmt.Printf("Removed existing key file: %s\n", targetPath)
-	}
 
-	// 5. Save file with secure permissions
-	// Open destination file with 0600 permissions (read/write owner)
-	err = os.WriteFile(targetPath, fileContent, 0600)
-	if err != nil {
-		log.Fatalf("Failed to write key file: %v", err)
-	}
-
-	// Now lock it down to read-only (0400)
-	if err := os.Chmod(targetPath, 0400); err != nil {
-		log.Printf("Warning: failed to set secure permissions (0400): %v", err)
-	}
-
-	fmt.Printf("Successfully received key: %s\n", targetPath)
-
-	// 6. Save to database
-	fmt.Println("Adding key to gotoni database...")
-	database, err := db.InitDB()
-	if err != nil {
-		log.Printf("Warning: Failed to init database: %v", err)
-	} else {
-		defer database.Close()
-		keyName := strings.TrimSuffix(fileName, filepath.Ext(fileName))
-		if err := database.SaveSSHKey(&db.SSHKey{Name: keyName, PrivateKey: targetPath}); err != nil {
-			log.Printf("Warning: Failed to save key to database: %v", err)
+		// 5. Save file with secure permissions
+		// Open destination file with 0600 permissions (read/write owner)
+		err = os.WriteFile(targetPath, fileContent, 0600)
+		if err != nil {
+			log.Fatalf("Failed to write key file: %v", err)
 		}
-	}
 
-	// 7. Update SSH config (~/.ssh/config)
-	if instanceIP != "" {
-		fmt.Printf("Configuring SSH access for %s (%s)...\n", instanceName, instanceIP)
-		if err := client.UpdateSSHConfig(instanceName, instanceIP, targetPath); err != nil {
-			log.Printf("Failed to update SSH config: %v", err)
+		// Now lock it down to read-only (0400)
+		if err := os.Chmod(targetPath, 0400); err != nil {
+			log.Printf("Warning: failed to set secure permissions (0400): %v", err)
+		}
+
+		fmt.Printf("Successfully received key: %s\n", targetPath)
+
+		// 6. Save to database
+		fmt.Println("Adding key to gotoni database...")
+		database, err := db.InitDB()
+		if err != nil {
+			log.Printf("Warning: Failed to init database: %v", err)
 		} else {
-			fmt.Printf("\n✓ You can now connect with: ssh %s\n", instanceName)
+			defer database.Close()
+			keyName := strings.TrimSuffix(fileName, filepath.Ext(fileName))
+			if err := database.SaveSSHKey(&db.SSHKey{Name: keyName, PrivateKey: targetPath}); err != nil {
+				log.Printf("Warning: Failed to save key to database: %v", err)
+			}
 		}
-	} else {
-		// Fallback for non-payload transfer
-		fmt.Println("\nTo complete setup, you need to know the Instance IP.")
-		fmt.Printf("Run: ssh -i %s ubuntu@<IP>\n", targetPath)
 
-		fmt.Print("\nEnter Instance IP (optional, press Enter to skip): ")
-		var ip string
-		fmt.Scanln(&ip)
-
-		if ip != "" {
-			if err := client.UpdateSSHConfig(instanceName, ip, targetPath); err != nil {
+		// 7. Update SSH config (~/.ssh/config)
+		if instanceIP != "" {
+			fmt.Printf("Configuring SSH access for %s (%s)...\n", instanceName, instanceIP)
+			if err := remote.UpdateSSHConfig(instanceName, instanceIP, targetPath); err != nil {
 				log.Printf("Failed to update SSH config: %v", err)
 			} else {
 				fmt.Printf("\n✓ You can now connect with: ssh %s\n", instanceName)
 			}
+		} else {
+			// Fallback for non-payload transfer
+			fmt.Println("\nTo complete setup, you need to know the Instance IP.")
+			fmt.Printf("Run: ssh -i %s ubuntu@<IP>\n", targetPath)
+
+			fmt.Print("\nEnter Instance IP (optional, press Enter to skip): ")
+			var ip string
+			fmt.Scanln(&ip)
+
+			if ip != "" {
+				if err := remote.UpdateSSHConfig(instanceName, ip, targetPath); err != nil {
+					log.Printf("Failed to update SSH config: %v", err)
+				} else {
+					fmt.Printf("\n✓ You can now connect with: ssh %s\n", instanceName)
+				}
+			}
 		}
-	}
 	},
 }
 

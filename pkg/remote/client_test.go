@@ -157,13 +157,52 @@ func TestCTCAlignmentPlaybook(t *testing.T) {
 	}
 	defer db.Close()
 
-	tasks, err := db.ListTasks()
+	dbTasks, err := db.ListTasks()
 	if err != nil {
 		t.Fatalf("Failed to list tasks: %v", err)
 	}
 
-	if len(tasks) == 0 {
+	if len(dbTasks) == 0 {
 		t.Fatal("No tasks defined in database")
+	}
+
+	// Convert db.Task to remote.Task
+	tasks := make([]Task, len(dbTasks))
+	for i, dbTask := range dbTasks {
+		tasks[i] = Task{
+			Name:       dbTask.Name,
+			Type:       dbTask.Type,
+			Command:    dbTask.Command,
+			Background: dbTask.Background,
+			WorkingDir: dbTask.WorkingDir,
+			When:       dbTask.WhenCondition,
+			Restart:    dbTask.Restart,
+			RestartSec: dbTask.RestartSec,
+		}
+
+		// Parse Env JSON string to map
+		if dbTask.Env != "" {
+			envMap := make(map[string]string)
+			if err := json.Unmarshal([]byte(dbTask.Env), &envMap); err != nil {
+				t.Logf("Warning: Failed to parse Env JSON for task %s: %v", dbTask.Name, err)
+				envMap = make(map[string]string) // Leave empty on error
+			}
+			tasks[i].Env = envMap
+		} else {
+			tasks[i].Env = make(map[string]string)
+		}
+
+		// Parse DependsOn JSON string to slice
+		if dbTask.DependsOn != "" {
+			var dependsOnSlice []string
+			if err := json.Unmarshal([]byte(dbTask.DependsOn), &dependsOnSlice); err != nil {
+				t.Logf("Warning: Failed to parse DependsOn JSON for task %s: %v", dbTask.Name, err)
+				dependsOnSlice = make([]string, 0) // Leave empty on error
+			}
+			tasks[i].DependsOn = dependsOnSlice
+		} else {
+			tasks[i].DependsOn = make([]string, 0)
+		}
 	}
 
 	// Filter setup tasks (command type)

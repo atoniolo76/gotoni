@@ -28,21 +28,21 @@ Example: gotoni run "ls -la"`,
 
 		// If API token not provided via flag, get from config or environment
 		if apiToken == "" {
-			apiToken = client.GetAPIToken()
+			apiToken = remote.GetAPIToken()
 			if apiToken == "" {
 				log.Fatal("API token not provided via --api-token flag or LAMBDA_API_KEY environment variable")
 			}
 		}
 
-		var instanceDetails *client.RunningInstance
+		var instanceDetails *remote.RunningInstance
 		var command string
 
 		// Parse arguments: [instance-name] <command>
 		if len(args) == 1 {
 			// Only command provided, use first running instance
 			command = args[0]
-			httpClient := client.NewHTTPClient()
-			runningInstances, err := client.ListRunningInstances(httpClient, apiToken)
+			httpClient := remote.NewHTTPClient()
+			runningInstances, err := remote.ListRunningInstances(httpClient, apiToken)
 			if err != nil {
 				log.Fatalf("Failed to list running instances: %v", err)
 			}
@@ -57,8 +57,8 @@ Example: gotoni run "ls -la"`,
 			command = strings.Join(args[1:], " ")
 
 			// Resolve instance name/ID to instance details
-			httpClient := client.NewHTTPClient()
-			instanceDetails, err = client.ResolveInstance(httpClient, apiToken, instanceName)
+			httpClient := remote.NewHTTPClient()
+			instanceDetails, err = remote.ResolveInstance(httpClient, apiToken, instanceName)
 			if err != nil {
 				log.Fatalf("Failed to resolve instance '%s': %v", instanceName, err)
 			}
@@ -69,13 +69,13 @@ Example: gotoni run "ls -la"`,
 		}
 
 		// Get SSH key
-		sshKeyFile, err := client.GetSSHKeyForInstance(instanceDetails.ID)
+		sshKeyFile, err := remote.GetSSHKeyForInstance(instanceDetails.ID)
 		if err != nil {
 			log.Fatalf("Failed to get SSH key: %v", err)
 		}
 
 		// Create SSH manager and connect
-		manager := client.NewSSHClientManager()
+		manager := remote.NewSSHClientManager()
 		defer manager.CloseAllConnections()
 
 		fmt.Printf("Connecting to instance %s (%s)...\n", instanceDetails.Name, instanceDetails.IP)

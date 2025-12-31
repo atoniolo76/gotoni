@@ -35,14 +35,14 @@ Examples:
 
 		// If API token not provided via flag, get from config or environment
 		if apiToken == "" {
-			apiToken = client.GetAPIToken()
+			apiToken = remote.GetAPIToken()
 			if apiToken == "" {
 				log.Fatal("API token not provided via --api-token flag or LAMBDA_API_KEY environment variable")
 			}
 		}
 
 		// Load tasks
-		tasks, err := client.ListTasks()
+		tasks, err := remote.ListTasks()
 		if err != nil {
 			log.Fatalf("Failed to list tasks: %v", err)
 		}
@@ -51,19 +51,19 @@ Examples:
 			log.Fatal("No tasks defined. Add tasks using 'gotoni tasks add --name \"Task Name\" --command \"your command\"'")
 		}
 
-		var instanceDetails *client.RunningInstance
+		var instanceDetails *remote.RunningInstance
 		if len(args) > 0 {
 			instanceName := args[0]
 			// Resolve instance name/ID to instance details
-			httpClient := client.NewHTTPClient()
-			instanceDetails, err = client.ResolveInstance(httpClient, apiToken, instanceName)
+			httpClient := remote.NewHTTPClient()
+			instanceDetails, err = remote.ResolveInstance(httpClient, apiToken, instanceName)
 			if err != nil {
 				log.Fatalf("Failed to resolve instance '%s': %v", instanceName, err)
 			}
 		} else {
 			// Use first running instance if no name provided
-			httpClient := client.NewHTTPClient()
-			runningInstances, err := client.ListRunningInstances(httpClient, apiToken)
+			httpClient := remote.NewHTTPClient()
+			runningInstances, err := remote.ListRunningInstances(httpClient, apiToken)
 			if err != nil {
 				log.Fatalf("Failed to list running instances: %v", err)
 			}
@@ -79,13 +79,13 @@ Examples:
 		}
 
 		// Get SSH key
-		sshKeyFile, err := client.GetSSHKeyForInstance(instanceDetails.ID)
+		sshKeyFile, err := remote.GetSSHKeyForInstance(instanceDetails.ID)
 		if err != nil {
 			log.Fatalf("Failed to get SSH key: %v", err)
 		}
 
 		// Create SSH manager and connect
-		manager := client.NewSSHClientManager()
+		manager := remote.NewSSHClientManager()
 		defer manager.CloseAllConnections()
 
 		fmt.Printf("Connecting to instance %s (%s)...\n", instanceDetails.Name, instanceDetails.IP)
@@ -95,13 +95,13 @@ Examples:
 		fmt.Printf("Connected!\n\n")
 
 		// Filter and execute only command tasks
-		commandTasks := client.FilterTasksByType(tasks, "command")
+		commandTasks := remote.FilterTasksByType(tasks, "command")
 		if len(commandTasks) == 0 {
 			log.Fatal("No command tasks found.")
 		}
 
 		fmt.Printf("Executing %d command task(s)...\n\n", len(commandTasks))
-		if err := client.ExecuteTasks(manager, instanceDetails.IP, commandTasks); err != nil {
+		if err := remote.ExecuteTasks(manager, instanceDetails.IP, commandTasks); err != nil {
 			log.Fatalf("Failed to execute tasks: %v", err)
 		}
 
