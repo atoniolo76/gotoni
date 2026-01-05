@@ -12,7 +12,7 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// choosing an instance is no fun. TODO: build gotoni into a tool for choosing best instannces based on workload and cost.
+// choosing an instance is no fun. TODO: build gotoni into a tool for choosing best instances based on workload and cost.
 
 // pricingCmd represents the pricing command
 var pricingCmd = &cobra.Command{
@@ -25,9 +25,9 @@ var pricingCmd = &cobra.Command{
 			log.Fatalf("Error getting API token: %v", err)
 		}
 
-		getCurrentUsageRate, err := cmd.Flags().GetBool("current-usage")
+		showRunningInstances, err := cmd.Flags().GetBool("running")
 		if err != nil {
-			log.Fatalf("Error getting current-usage flag: %v", err)
+			log.Fatalf("Error getting running flag: %v", err)
 		}
 
 		// Create HTTP client
@@ -41,25 +41,43 @@ var pricingCmd = &cobra.Command{
 			}
 		}
 
-		availableInstanceTypes, err := remote.GetAvailableInstanceTypes(httpClient, apiToken)
-		if err != nil {
-			log.Fatalf("Error getting available instance types: %v", err)
-		}
-
-		fmt.Println("Lambda Cloud Instance Pricing:")
-		fmt.Println()
-
-		totalCents := 0
-		for _, instance := range availableInstanceTypes {
-			price := instance.InstanceType.PriceCentsPerHour
-			totalCents += price
-			if !getCurrentUsageRate {
-				fmt.Printf("%-25s %s\n", instance.InstanceType.Name, formatPrice(price))
+		if showRunningInstances {
+			// Show current running instances and their costs
+			runningInstances, err := remote.ListRunningInstances(httpClient, apiToken)
+			if err != nil {
+				log.Fatalf("Error getting running instances: %v", err)
 			}
-		}
 
-		if getCurrentUsageRate {
-			fmt.Printf("%-25s %s\n", "Total", formatPrice(totalCents))
+			fmt.Println("Current Running Instances:")
+			fmt.Println()
+
+			if len(runningInstances) == 0 {
+				fmt.Println("No running instances found.")
+				return
+			}
+
+			totalCents := 0
+			for _, instance := range runningInstances {
+				price := instance.InstanceType.PriceCentsPerHour
+				totalCents += price
+				fmt.Printf("%-25s %-15s %s/hour\n", instance.Name, instance.InstanceType.Name, formatPrice(price))
+			}
+			fmt.Println()
+			fmt.Printf("%-41s %s/hour\n", "Total Current Cost", formatPrice(totalCents))
+		} else {
+			// Show available instance types pricing
+			availableInstanceTypes, err := remote.GetAvailableInstanceTypes(httpClient, apiToken)
+			if err != nil {
+				log.Fatalf("Error getting available instance types: %v", err)
+			}
+
+			fmt.Println("Lambda Cloud Instance Pricing:")
+			fmt.Println()
+
+			for _, instance := range availableInstanceTypes {
+				price := instance.InstanceType.PriceCentsPerHour
+				fmt.Printf("%-25s %s/hour\n", instance.InstanceType.Name, formatPrice(price))
+			}
 		}
 
 	},
@@ -75,5 +93,5 @@ func init() {
 	rootCmd.AddCommand(pricingCmd)
 
 	pricingCmd.Flags().StringP("api-token", "a", "", "API token for cloud provider (can also be set via LAMBDA_API_KEY env var)")
-	pricingCmd.Flags().BoolP("current-usage", "c", false, "Get current usage rate for all running instances")
+	pricingCmd.Flags().BoolP("running", "r", false, "Show current running instances and their costs instead of available instance types")
 }
