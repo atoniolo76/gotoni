@@ -40,21 +40,18 @@ func CreateClusterAndRunEcho(httpClient *http.Client, apiToken string) error {
 
 	fmt.Printf("Found %d instances in cluster\n", len(cluster.Instances))
 
-	// Create cluster manager
-	clusterMgr := NewClusterManager(cluster)
-	defer clusterMgr.DisconnectFromCluster()
-
 	// Connect to all instances
 	fmt.Println("Connecting to cluster instances...")
-	if err := clusterMgr.ConnectToCluster(); err != nil {
+	if err := cluster.Connect(); err != nil {
 		return fmt.Errorf("failed to connect to cluster: %w", err)
 	}
+	defer cluster.Disconnect()
 
 	// Run echo command on all instances
 	echoCommand := "echo 'Hello from cluster instance!'"
 	fmt.Printf("Running command on all instances: %s\n", echoCommand)
 
-	results := clusterMgr.ExecuteOnCluster(echoCommand)
+	results := cluster.ExecuteOnCluster(echoCommand)
 
 	// Display results
 	fmt.Println("\nCommand execution results:")
