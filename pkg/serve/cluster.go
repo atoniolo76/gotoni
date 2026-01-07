@@ -6,6 +6,7 @@ cluster.go contains cluster management and load balancing logic
 package serve
 
 import (
+	"database/sql"
 	"fmt"
 	"log"
 	"net/http"
@@ -33,6 +34,8 @@ type InstanceType struct {
 }
 
 type Cluster struct {
+	ID        int64
+	Name      string
 	Instances []remote.RunningInstance
 	sshMgr    *remote.SSHClientManager
 	database  *db.DB
@@ -78,10 +81,41 @@ func LaunchClusterFromSpec(httpClient *http.Client, apiToken string, spec *Clust
 	}
 
 	cluster := &Cluster{
+		Name:      spec.Name,
 		Instances: []remote.RunningInstance{}, // Will be populated after instances are ready
 		sshMgr:    remote.NewSSHClientManager(),
 		database:  database,
 	}
+
+	// Save cluster to database
+	dbCluster := &db.Cluster{
+		Name:           spec.Name,
+		SSHKeyName:     spec.SSHKeyName,
+		FilesystemName: spec.FilesystemName,
+		Status:         "launching",
+		CreatedAt:      time.Now(),
+	}
+	clusterID, err := database.SaveCluster(dbCluster)
+	if err != nil {
+		return nil, fmt.Errorf("failed to save cluster to database: %w", err)
+	}
+	cluster.ID = clusterID
+
+	// Save replica specifications to database
+	for _, replica := range spec.Replicas {
+		dbReplica := &db.ClusterReplica{
+			ClusterID:    clusterID,
+			InstanceType: replica.InstanceType,
+			Region:       replica.Region,
+			Quantity:     replica.Quantity,
+			Name:         replica.Name,
+		}
+		_, err := database.SaveClusterReplica(dbReplica)
+		if err != nil {
+			log.Printf("Warning: failed to save replica spec to database: %v", err)
+		}
+	}
+
 	var allLaunchedInstances []remote.LaunchedInstance
 
 	// Launch instances according to spec
@@ -121,6 +155,18 @@ func LaunchClusterFromSpec(httpClient *http.Client, apiToken string, spec *Clust
 			log.Printf("Warning: some instances may not be fully ready: %v", err)
 		}
 		cluster.Instances = runningInstances
+
+		// Save instance associations to database
+		for _, instance := range runningInstances {
+			if err := database.AddInstanceToCluster(clusterID, instance.ID); err != nil {
+				log.Printf("Warning: failed to save instance %s to cluster in database: %v", instance.ID, err)
+			}
+		}
+	}
+
+	// Update cluster status to running
+	if err := database.UpdateClusterStatus(spec.Name, "running"); err != nil {
+		log.Printf("Warning: failed to update cluster status: %v", err)
 	}
 
 	log.Printf("Cluster %s launched with %d running instances", spec.Name, len(cluster.Instances))
@@ -813,7 +859,23 @@ func (c *Cluster) Disconnect() {
 
 	c.sshMgr.CloseAllConnections()
 	c.connected = false
+
+	// Update cluster status in database
+	if c.database != nil && c.Name != "" {
+		if err := c.database.UpdateClusterStatus(c.Name, "disconnected"); err != nil {
+			log.Printf("Warning: failed to update cluster status: %v", err)
+		}
+	}
+
 	log.Println("Disconnected from all cluster instances")
+}
+
+// Close closes the cluster and its database connection
+func (c *Cluster) Close() {
+	c.Disconnect()
+	if c.database != nil {
+		c.database.Close()
+	}
 }
 
 // Helper functions for creating common task types
@@ -852,4 +914,244 @@ func NewForegroundTask(name, command, workingDir string, envVars map[string]stri
 	task.Env = envVars
 	task.Restart = "no" // Don't restart foreground tasks
 	return task
+}
+
+// GetCluster loads a cluster from the database by name and populates running instances
+func GetCluster(httpClient *http.Client, apiToken string, name string) (*Cluster, error) {
+	database, err := db.InitDB()
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize database: %w", err)
+	}
+
+	// Get cluster from database
+	dbCluster, err := database.GetCluster(name)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, fmt.Errorf("cluster %s not found", name)
+		}
+		return nil, fmt.Errorf("failed to get cluster from database: %w", err)
+	}
+
+	cluster := &Cluster{
+		ID:       dbCluster.ID,
+		Name:     dbCluster.Name,
+		sshMgr:   remote.NewSSHClientManager(),
+		database: database,
+	}
+
+	// Get instance IDs associated with this cluster
+	instanceIDs, err := database.GetClusterInstances(dbCluster.ID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get cluster instances: %w", err)
+	}
+
+	// Get running instances from the provider
+	if len(instanceIDs) > 0 {
+		provider, _ := remote.GetCloudProvider()
+		allRunning, err := provider.ListRunningInstances(httpClient, apiToken)
+		if err != nil {
+			return nil, fmt.Errorf("failed to list running instances: %w", err)
+		}
+
+		// Filter to only include instances in this cluster
+		instanceIDMap := make(map[string]bool)
+		for _, id := range instanceIDs {
+			instanceIDMap[id] = true
+		}
+
+		for _, instance := range allRunning {
+			if instanceIDMap[instance.ID] {
+				cluster.Instances = append(cluster.Instances, instance)
+			}
+		}
+	}
+
+	return cluster, nil
+}
+
+// ListClusters returns all clusters from the database
+func ListClusters() ([]db.Cluster, error) {
+	database, err := db.InitDB()
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize database: %w", err)
+	}
+	defer database.Close()
+
+	return database.ListClusters()
+}
+
+// DeleteClusterByName deletes a cluster from the database (does not terminate instances)
+func DeleteClusterByName(name string) error {
+	database, err := db.InitDB()
+	if err != nil {
+		return fmt.Errorf("failed to initialize database: %w", err)
+	}
+	defer database.Close()
+
+	return database.DeleteCluster(name)
+}
+
+// TerminateCluster terminates all instances in a cluster and removes it from the database
+func TerminateCluster(httpClient *http.Client, apiToken string, name string) error {
+	database, err := db.InitDB()
+	if err != nil {
+		return fmt.Errorf("failed to initialize database: %w", err)
+	}
+	defer database.Close()
+
+	// Get cluster from database
+	dbCluster, err := database.GetCluster(name)
+	if err != nil {
+		return fmt.Errorf("failed to get cluster: %w", err)
+	}
+
+	// Get instance IDs
+	instanceIDs, err := database.GetClusterInstances(dbCluster.ID)
+	if err != nil {
+		return fmt.Errorf("failed to get cluster instances: %w", err)
+	}
+
+	// Terminate instances
+	if len(instanceIDs) > 0 {
+		_, err := remote.TerminateInstance(httpClient, apiToken, instanceIDs)
+		if err != nil {
+			log.Printf("Warning: failed to terminate some instances: %v", err)
+		}
+	}
+
+	// Update cluster status
+	if err := database.UpdateClusterStatus(name, "terminated"); err != nil {
+		log.Printf("Warning: failed to update cluster status: %v", err)
+	}
+
+	// Delete cluster from database
+	return database.DeleteCluster(name)
+}
+
+// GetClusterSpec retrieves the cluster specification from the database
+func GetClusterSpec(name string) (*ClusterSpec, error) {
+	database, err := db.InitDB()
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize database: %w", err)
+	}
+	defer database.Close()
+
+	// Get cluster from database
+	dbCluster, err := database.GetCluster(name)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get cluster: %w", err)
+	}
+
+	// Get replicas
+	dbReplicas, err := database.GetClusterReplicas(dbCluster.ID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get cluster replicas: %w", err)
+	}
+
+	spec := &ClusterSpec{
+		Name:           dbCluster.Name,
+		SSHKeyName:     dbCluster.SSHKeyName,
+		FilesystemName: dbCluster.FilesystemName,
+		Replicas:       make([]ClusterReplicaSpec, 0, len(dbReplicas)),
+	}
+
+	for _, replica := range dbReplicas {
+		spec.Replicas = append(spec.Replicas, ClusterReplicaSpec{
+			InstanceType: replica.InstanceType,
+			Region:       replica.Region,
+			Quantity:     replica.Quantity,
+			Name:         replica.Name,
+		})
+	}
+
+	return spec, nil
+}
+
+// RefreshClusterInstances updates the cluster's running instances from the provider
+func (c *Cluster) RefreshClusterInstances(httpClient *http.Client, apiToken string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Get instance IDs from database
+	instanceIDs, err := c.database.GetClusterInstances(c.ID)
+	if err != nil {
+		return fmt.Errorf("failed to get cluster instances: %w", err)
+	}
+
+	if len(instanceIDs) == 0 {
+		c.Instances = []remote.RunningInstance{}
+		return nil
+	}
+
+	// Get running instances from provider
+	provider, _ := remote.GetCloudProvider()
+	allRunning, err := provider.ListRunningInstances(httpClient, apiToken)
+	if err != nil {
+		return fmt.Errorf("failed to list running instances: %w", err)
+	}
+
+	// Filter to only include instances in this cluster
+	instanceIDMap := make(map[string]bool)
+	for _, id := range instanceIDs {
+		instanceIDMap[id] = true
+	}
+
+	c.Instances = []remote.RunningInstance{}
+	for _, instance := range allRunning {
+		if instanceIDMap[instance.ID] {
+			c.Instances = append(c.Instances, instance)
+		}
+	}
+
+	return nil
+}
+
+// AddInstance adds an instance to the cluster
+func (c *Cluster) AddInstance(instance remote.RunningInstance) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Add to database
+	if err := c.database.AddInstanceToCluster(c.ID, instance.ID); err != nil {
+		return fmt.Errorf("failed to add instance to cluster in database: %w", err)
+	}
+
+	// Add to in-memory list
+	c.Instances = append(c.Instances, instance)
+	return nil
+}
+
+// RemoveInstance removes an instance from the cluster
+func (c *Cluster) RemoveInstance(instanceID string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Remove from database
+	if err := c.database.RemoveInstanceFromCluster(c.ID, instanceID); err != nil {
+		return fmt.Errorf("failed to remove instance from cluster in database: %w", err)
+	}
+
+	// Remove from in-memory list
+	for i, instance := range c.Instances {
+		if instance.ID == instanceID {
+			c.Instances = append(c.Instances[:i], c.Instances[i+1:]...)
+			break
+		}
+	}
+
+	return nil
+}
+
+// GetStatus returns the cluster status from the database
+func (c *Cluster) GetStatus() (string, error) {
+	dbCluster, err := c.database.GetClusterByID(c.ID)
+	if err != nil {
+		return "", fmt.Errorf("failed to get cluster status: %w", err)
+	}
+	return dbCluster.Status, nil
+}
+
+// SetStatus updates the cluster status in the database
+func (c *Cluster) SetStatus(status string) error {
+	return c.database.UpdateClusterStatus(c.Name, status)
 }

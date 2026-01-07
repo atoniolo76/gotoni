@@ -58,6 +58,33 @@ type Task struct {
 	RestartSec    int
 }
 
+// Cluster represents a cluster record
+type Cluster struct {
+	ID             int64
+	Name           string
+	SSHKeyName     string
+	FilesystemName string
+	Status         string
+	CreatedAt      time.Time
+}
+
+// ClusterReplica represents a replica specification within a cluster
+type ClusterReplica struct {
+	ID           int64
+	ClusterID    int64
+	InstanceType string
+	Region       string
+	Quantity     int
+	Name         string
+}
+
+// ClusterInstance represents an instance belonging to a cluster
+type ClusterInstance struct {
+	ID         int64
+	ClusterID  int64
+	InstanceID string // Reference to the instance ID in instances table
+}
+
 // InitDB initializes the database connection and creates tables if they don't exist
 func InitDB() (*DB, error) {
 	configPath := configdir.LocalConfig("gotoni")
@@ -125,6 +152,30 @@ func (d *DB) migrate() error {
 			when_condition TEXT,
 			restart TEXT,
 			restart_sec INTEGER
+		);`,
+		`CREATE TABLE IF NOT EXISTS clusters (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			name TEXT UNIQUE,
+			ssh_key_name TEXT,
+			filesystem_name TEXT,
+			status TEXT,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		);`,
+		`CREATE TABLE IF NOT EXISTS cluster_replicas (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			cluster_id INTEGER,
+			instance_type TEXT,
+			region TEXT,
+			quantity INTEGER,
+			name TEXT,
+			FOREIGN KEY (cluster_id) REFERENCES clusters(id) ON DELETE CASCADE
+		);`,
+		`CREATE TABLE IF NOT EXISTS cluster_instances (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			cluster_id INTEGER,
+			instance_id TEXT,
+			FOREIGN KEY (cluster_id) REFERENCES clusters(id) ON DELETE CASCADE,
+			FOREIGN KEY (instance_id) REFERENCES instances(id) ON DELETE CASCADE
 		);`,
 	}
 
@@ -334,5 +385,183 @@ func (d *DB) ListTasks() ([]Task, error) {
 // DeleteTask deletes a task by name
 func (d *DB) DeleteTask(name string) error {
 	_, err := d.Exec("DELETE FROM tasks WHERE name = ?", name)
+	return err
+}
+
+// SaveCluster saves a cluster to the database
+func (d *DB) SaveCluster(cluster *Cluster) (int64, error) {
+	query := `
+	INSERT INTO clusters (name, ssh_key_name, filesystem_name, status, created_at)
+	VALUES (?, ?, ?, ?, ?)
+	ON CONFLICT(name) DO UPDATE SET
+		ssh_key_name = excluded.ssh_key_name,
+		filesystem_name = excluded.filesystem_name,
+		status = excluded.status;
+	`
+	result, err := d.Exec(query, cluster.Name, cluster.SSHKeyName, cluster.FilesystemName, cluster.Status, cluster.CreatedAt)
+	if err != nil {
+		return 0, err
+	}
+
+	// If it was an update, get the existing ID
+	if cluster.ID != 0 {
+		return cluster.ID, nil
+	}
+
+	return result.LastInsertId()
+}
+
+// GetCluster retrieves a cluster by name
+func (d *DB) GetCluster(name string) (*Cluster, error) {
+	query := `SELECT id, name, ssh_key_name, filesystem_name, status, created_at FROM clusters WHERE name = ?`
+	row := d.QueryRow(query, name)
+
+	var cluster Cluster
+	err := row.Scan(&cluster.ID, &cluster.Name, &cluster.SSHKeyName, &cluster.FilesystemName, &cluster.Status, &cluster.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return &cluster, nil
+}
+
+// GetClusterByID retrieves a cluster by ID
+func (d *DB) GetClusterByID(id int64) (*Cluster, error) {
+	query := `SELECT id, name, ssh_key_name, filesystem_name, status, created_at FROM clusters WHERE id = ?`
+	row := d.QueryRow(query, id)
+
+	var cluster Cluster
+	err := row.Scan(&cluster.ID, &cluster.Name, &cluster.SSHKeyName, &cluster.FilesystemName, &cluster.Status, &cluster.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return &cluster, nil
+}
+
+// ListClusters retrieves all clusters
+func (d *DB) ListClusters() ([]Cluster, error) {
+	query := `SELECT id, name, ssh_key_name, filesystem_name, status, created_at FROM clusters`
+	rows, err := d.Query(query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var clusters []Cluster
+	for rows.Next() {
+		var cluster Cluster
+		err := rows.Scan(&cluster.ID, &cluster.Name, &cluster.SSHKeyName, &cluster.FilesystemName, &cluster.Status, &cluster.CreatedAt)
+		if err != nil {
+			return nil, err
+		}
+		clusters = append(clusters, cluster)
+	}
+	return clusters, nil
+}
+
+// DeleteCluster deletes a cluster by name (cascades to replicas and instances)
+func (d *DB) DeleteCluster(name string) error {
+	// Get cluster ID first
+	cluster, err := d.GetCluster(name)
+	if err != nil {
+		return err
+	}
+
+	// Delete cluster instances
+	_, err = d.Exec("DELETE FROM cluster_instances WHERE cluster_id = ?", cluster.ID)
+	if err != nil {
+		return err
+	}
+
+	// Delete cluster replicas
+	_, err = d.Exec("DELETE FROM cluster_replicas WHERE cluster_id = ?", cluster.ID)
+	if err != nil {
+		return err
+	}
+
+	// Delete cluster
+	_, err = d.Exec("DELETE FROM clusters WHERE id = ?", cluster.ID)
+	return err
+}
+
+// UpdateClusterStatus updates the status of a cluster
+func (d *DB) UpdateClusterStatus(name, status string) error {
+	_, err := d.Exec("UPDATE clusters SET status = ? WHERE name = ?", status, name)
+	return err
+}
+
+// SaveClusterReplica saves a cluster replica specification
+func (d *DB) SaveClusterReplica(replica *ClusterReplica) (int64, error) {
+	query := `INSERT INTO cluster_replicas (cluster_id, instance_type, region, quantity, name) VALUES (?, ?, ?, ?, ?)`
+	result, err := d.Exec(query, replica.ClusterID, replica.InstanceType, replica.Region, replica.Quantity, replica.Name)
+	if err != nil {
+		return 0, err
+	}
+	return result.LastInsertId()
+}
+
+// GetClusterReplicas retrieves all replicas for a cluster
+func (d *DB) GetClusterReplicas(clusterID int64) ([]ClusterReplica, error) {
+	query := `SELECT id, cluster_id, instance_type, region, quantity, name FROM cluster_replicas WHERE cluster_id = ?`
+	rows, err := d.Query(query, clusterID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var replicas []ClusterReplica
+	for rows.Next() {
+		var replica ClusterReplica
+		err := rows.Scan(&replica.ID, &replica.ClusterID, &replica.InstanceType, &replica.Region, &replica.Quantity, &replica.Name)
+		if err != nil {
+			return nil, err
+		}
+		replicas = append(replicas, replica)
+	}
+	return replicas, nil
+}
+
+// DeleteClusterReplicas deletes all replicas for a cluster
+func (d *DB) DeleteClusterReplicas(clusterID int64) error {
+	_, err := d.Exec("DELETE FROM cluster_replicas WHERE cluster_id = ?", clusterID)
+	return err
+}
+
+// AddInstanceToCluster adds an instance to a cluster
+func (d *DB) AddInstanceToCluster(clusterID int64, instanceID string) error {
+	query := `INSERT INTO cluster_instances (cluster_id, instance_id) VALUES (?, ?)`
+	_, err := d.Exec(query, clusterID, instanceID)
+	return err
+}
+
+// GetClusterInstances retrieves all instance IDs for a cluster
+func (d *DB) GetClusterInstances(clusterID int64) ([]string, error) {
+	query := `SELECT instance_id FROM cluster_instances WHERE cluster_id = ?`
+	rows, err := d.Query(query, clusterID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var instanceIDs []string
+	for rows.Next() {
+		var instanceID string
+		err := rows.Scan(&instanceID)
+		if err != nil {
+			return nil, err
+		}
+		instanceIDs = append(instanceIDs, instanceID)
+	}
+	return instanceIDs, nil
+}
+
+// RemoveInstanceFromCluster removes an instance from a cluster
+func (d *DB) RemoveInstanceFromCluster(clusterID int64, instanceID string) error {
+	_, err := d.Exec("DELETE FROM cluster_instances WHERE cluster_id = ? AND instance_id = ?", clusterID, instanceID)
+	return err
+}
+
+// ClearClusterInstances removes all instances from a cluster
+func (d *DB) ClearClusterInstances(clusterID int64) error {
+	_, err := d.Exec("DELETE FROM cluster_instances WHERE cluster_id = ?", clusterID)
 	return err
 }
