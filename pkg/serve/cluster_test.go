@@ -2,20 +2,24 @@ package serve
 
 import (
 	"fmt"
-	"log"
 	"net/http"
 	"os"
 	"strings"
+	"testing"
 	"time"
 
 	"github.com/atoniolo76/gotoni/pkg/remote"
 )
 
-func TestClusterLlamaCpp() {
+func TestClusterLlamaCpp(t *testing.T) {
 	fmt.Println("=== Testing Cluster Llama.cpp Server Deployment ===")
 
 	httpClient := remote.NewHTTPClient()
 	apiToken := os.Getenv("LAMBDA_API_KEY")
+
+	if apiToken == "" {
+		t.Skip("LAMBDA_API_KEY not set, skipping integration test")
+	}
 
 	// Define cluster specification for GPU instances across regions
 	clusterSpec := &ClusterSpec{
@@ -45,21 +49,24 @@ func TestClusterLlamaCpp() {
 	fmt.Println("Launching cluster with specification...")
 	cluster, err := LaunchClusterFromSpec(httpClient, apiToken, clusterSpec)
 	if err != nil {
-		log.Fatalf("Failed to launch cluster: %v", err)
+		t.Fatalf("Failed to launch cluster: %v", err)
 	}
 
+	if len(cluster.Instances) == 0 {
+		t.Fatal("No instances launched in cluster")
+	}
 	fmt.Printf("Cluster launched with %d instances\n", len(cluster.Instances))
 
 	// Wait for healthy instances
 	if err := waitForHealthyCluster(cluster, 3, 10*time.Minute); err != nil {
-		log.Fatalf("Failed to get healthy cluster: %v", err)
+		t.Fatalf("Failed to get healthy cluster: %v", err)
 	}
 
 	// 2. Connect to the cluster instances
 	fmt.Println("2. Connecting to cluster instances...")
 
 	if err := cluster.Connect(); err != nil {
-		log.Fatalf("Failed to connect to cluster: %v", err)
+		t.Fatalf("Failed to connect to cluster: %v", err)
 	}
 	defer cluster.Disconnect()
 
@@ -149,8 +156,8 @@ func TestClusterLlamaCpp() {
 	}
 
 	// 6. Test cluster heartbeat
-	fmt.Println("6. Testing cluster heartbeat...")
-	TestClusterHeartbeat(cluster)
+	fmt.Println("6. Test cluster heartbeat...")
+	testClusterHeartbeat(t, cluster)
 
 	// 7. Test API endpoints (if services are accessible)
 	fmt.Println("7. Testing llama.cpp API endpoints...")
@@ -189,7 +196,7 @@ func testAPIEndpoints(cluster *Cluster, instances []remote.RunningInstance) {
 }
 
 // ExampleLlamaCppDeployment shows a complete deployment workflow
-func ExampleLlamaCppDeployment() {
+func exampleLlamaCppDeployment() {
 	fmt.Println("=== Example: Complete Llama.cpp Cluster Deployment ===")
 
 	// This would typically be called from main() or a CLI command
@@ -226,7 +233,8 @@ func ExampleLlamaCppDeployment() {
 
 	// 6. Connect to cluster
 	if err := cluster.Connect(); err != nil {
-		log.Fatalf("Failed to connect: %v", err)
+		fmt.Printf("Failed to connect: %v\n", err)
+		return
 	}
 
 	// 7. Deploy llama.cpp servers using background execution (tmux)
@@ -285,13 +293,13 @@ func waitForHealthyCluster(cluster *Cluster, minHealthy int, timeout time.Durati
 			return fmt.Errorf("timeout: only %d/%d healthy instances after %v", healthyCount, heartbeat.TotalInstances, timeout)
 		}
 
-		log.Printf("Currently %d healthy instances. Waiting for more to become available...", healthyCount)
+		fmt.Printf("Currently %d healthy instances. Waiting for more to become available...\n", healthyCount)
 		time.Sleep(pollInterval)
 	}
 }
 
-// TestClusterHeartbeat demonstrates the heartbeat functionality
-func TestClusterHeartbeat(cluster *Cluster) {
+// testClusterHeartbeat tests the heartbeat functionality (helper function)
+func testClusterHeartbeat(t *testing.T, cluster *Cluster) {
 	fmt.Println("=== Testing Cluster Heartbeat ===")
 
 	// Perform heartbeat check
@@ -331,7 +339,7 @@ func TestClusterHeartbeat(cluster *Cluster) {
 }
 
 // ExampleClusterSpecs demonstrates different cluster configurations
-func ExampleClusterSpecs() {
+func exampleClusterSpecs() {
 	fmt.Println("=== Example Cluster Specifications ===")
 
 	httpClient := remote.NewHTTPClient()
@@ -341,7 +349,7 @@ func ExampleClusterSpecs() {
 	fmt.Println("Available GPU Instance Types:")
 	gpuTypes, err := FilterInstanceTypesByGPU(httpClient, apiToken)
 	if err != nil {
-		log.Printf("Failed to get GPU types: %v", err)
+		fmt.Printf("Failed to get GPU types: %v\n", err)
 	} else {
 		for _, gpuType := range gpuTypes {
 			fmt.Printf("  %s\n", gpuType.FormatInstanceType())
@@ -351,7 +359,7 @@ func ExampleClusterSpecs() {
 	fmt.Println("\nBudget Instance Types (under $2/hour):")
 	budgetTypes, err := GetInstanceTypesByPriceRange(httpClient, apiToken, 0, 200)
 	if err != nil {
-		log.Printf("Failed to get budget types: %v", err)
+		fmt.Printf("Failed to get budget types: %v\n", err)
 	} else {
 		for _, budgetType := range budgetTypes {
 			fmt.Printf("  %s\n", budgetType.FormatInstanceType())
@@ -436,8 +444,8 @@ func ExampleClusterSpecs() {
 	}
 }
 
-// BenchmarkClusterLoad shows how to benchmark cluster performance
-func BenchmarkClusterLoad(cluster *Cluster, instances []remote.RunningInstance) {
+// benchmarkClusterLoad demonstrates cluster load benchmarking
+func benchmarkClusterLoad(cluster *Cluster, instances []remote.RunningInstance) {
 	fmt.Println("=== Benchmarking Cluster Load ===")
 
 	// First check cluster health
