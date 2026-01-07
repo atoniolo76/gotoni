@@ -788,6 +788,32 @@ func DeleteFilesystem(httpClient *http.Client, apiToken string, filesystemID str
 	return nil
 }
 
+// executeBackgroundCommand executes a command in the background using tmux
+func executeBackgroundCommand(manager *SSHClientManager, instanceIP, cmd, workingDir string, task Task) error {
+	sessionName := fmt.Sprintf("gotoni-%s", strings.ReplaceAll(task.Name, " ", "_"))
+
+	// Build the full command with working directory
+	if workingDir != "" {
+		cmd = fmt.Sprintf("cd %s && %s", workingDir, cmd)
+	}
+
+	// Kill existing session if it exists
+	manager.ExecuteCommand(instanceIP, fmt.Sprintf("tmux kill-session -t %s 2>/dev/null || true", sessionName))
+
+	// Create new detached session with the command
+	tmuxCmd := fmt.Sprintf("tmux new-session -d -s %s '%s'", sessionName, cmd)
+
+	fmt.Printf("Starting task %s in background using tmux (session: %s)\n", task.Name, sessionName)
+
+	output, err := manager.ExecuteCommand(instanceIP, tmuxCmd)
+	if err != nil {
+		return fmt.Errorf("failed to start background task: %w\nOutput: %s", err, output)
+	}
+
+	fmt.Printf("Task %s started successfully in background (session: %s)\n", task.Name, sessionName)
+	return nil
+}
+
 // ExecuteTask executes a single task on a remote instance
 func ExecuteTask(manager *SSHClientManager, instanceIP string, task Task, completedTasks map[string]bool) error {
 	// Check dependencies
@@ -797,85 +823,41 @@ func ExecuteTask(manager *SSHClientManager, instanceIP string, task Task, comple
 		}
 	}
 
-	fmt.Printf("Executing task: %s (type: %s)\n", task.Name, task.Type)
+	fmt.Printf("Executing task: %s\n", task.Name)
 
+	// Build the base command with environment variables
 	var cmd string
-
-	switch task.Type {
-	case "command":
-		// Build command with environment variables and working directory
-		if len(task.Env) > 0 {
-			envVars := []string{}
-			for k, v := range task.Env {
-				envVars = append(envVars, fmt.Sprintf("%s=%s", k, v))
-			}
-			cmd = fmt.Sprintf("%s %s", strings.Join(envVars, " "), task.Command)
-		} else {
-			cmd = task.Command
+	if len(task.Env) > 0 {
+		envVars := []string{}
+		for k, v := range task.Env {
+			envVars = append(envVars, fmt.Sprintf("%s=%s", k, v))
 		}
-
-		if task.WorkingDir != "" {
-			cmd = fmt.Sprintf("cd %s && %s", task.WorkingDir, cmd)
-		}
-
-		if task.Background {
-			// Run in background using systemd
-			serviceName := fmt.Sprintf("gotoni-%s", strings.ReplaceAll(task.Name, " ", "_"))
-			// Stop existing service if it exists
-			manager.StopSystemdService(instanceIP, serviceName)
-			// Create systemd service file
-			workingDir := task.WorkingDir
-			if workingDir == "" {
-				workingDir = "/home/ubuntu"
-			}
-			if err := manager.CreateSystemdService(instanceIP, serviceName, cmd, workingDir, task.Env, &task); err != nil {
-				return fmt.Errorf("task %s failed to create systemd service: %w", task.Name, err)
-			}
-			// Start the service
-			if err := manager.StartSystemdService(instanceIP, serviceName); err != nil {
-				return fmt.Errorf("task %s failed to start systemd service: %w", task.Name, err)
-			}
-			fmt.Printf("Task %s started in background (systemd service: %s)\n", task.Name, serviceName)
-			return nil
-		}
-
-		output, err := manager.ExecuteCommand(instanceIP, cmd)
-		if err != nil {
-			return fmt.Errorf("task %s failed: %w\nOutput: %s", task.Name, err, output)
-		}
-		fmt.Printf("Task %s completed. Output:\n%s\n", task.Name, output)
-
-	case "service":
-		// Service is like command but always runs in background using systemd
-		if task.Command == "" {
-			return fmt.Errorf("task %s: service requires command", task.Name)
-		}
+		cmd = fmt.Sprintf("%s %s", strings.Join(envVars, " "), task.Command)
+	} else {
 		cmd = task.Command
-		// Note: we don't prepend env vars here as they'll be set in the systemd service file
-		// Environment variables are handled via CreateSystemdService
+	}
 
-		// Use systemd to run service in background
-		serviceName := fmt.Sprintf("gotoni-%s", strings.ReplaceAll(task.Name, " ", "_"))
-		// Stop existing service if it exists
-		manager.StopSystemdService(instanceIP, serviceName)
-		// Create systemd service file
+	// Handle background execution
+	if task.Background {
 		workingDir := task.WorkingDir
 		if workingDir == "" {
 			workingDir = "/home/ubuntu"
 		}
-		if err := manager.CreateSystemdService(instanceIP, serviceName, cmd, workingDir, task.Env, &task); err != nil {
-			return fmt.Errorf("task %s failed to create systemd service: %w", task.Name, err)
-		}
-		// Start the service
-		if err := manager.StartSystemdService(instanceIP, serviceName); err != nil {
-			return fmt.Errorf("task %s failed to start systemd service: %w", task.Name, err)
-		}
-		fmt.Printf("Task %s started as systemd service '%s'\n", task.Name, serviceName)
 
-	default:
-		return fmt.Errorf("unknown task type: %s (must be 'command' or 'service')", task.Type)
+		return executeBackgroundCommand(manager, instanceIP, cmd, workingDir, task)
 	}
 
+	// Foreground execution
+	if task.WorkingDir != "" {
+		cmd = fmt.Sprintf("cd %s && %s", task.WorkingDir, cmd)
+	}
+
+	output, err := manager.ExecuteCommand(instanceIP, cmd)
+	if err != nil {
+		return fmt.Errorf("task %s failed: %w\nOutput: %s", task.Name, err, output)
+	}
+
+	fmt.Printf("Task %s completed. Output:\n%s\n", task.Name, output)
 	return nil
 }
 
