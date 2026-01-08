@@ -4,15 +4,23 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/atoniolo76/gotoni/pkg/remote"
+	"github.com/joho/godotenv"
 )
 
 func TestClusterLlamaCpp(t *testing.T) {
 	fmt.Println("=== Testing Cluster Llama.cpp Server Deployment ===")
+
+	// Load environment variables from .env file
+	if err := godotenv.Load("../../.env"); err != nil {
+		t.Logf("Warning: Could not load .env file: %v", err)
+	}
 
 	httpClient := remote.NewHTTPClient()
 	apiToken := os.Getenv("LAMBDA_API_KEY")
@@ -21,48 +29,79 @@ func TestClusterLlamaCpp(t *testing.T) {
 		t.Skip("LAMBDA_API_KEY not set, skipping integration test")
 	}
 
-	// Define cluster specification for GPU instances across regions
-	clusterSpec := &ClusterSpec{
-		Name: "llama-test-cluster",
-		Replicas: []ClusterReplicaSpec{
-			{
-				InstanceType: "gpu_8x_b200_sxm6",
-				Region:       "australia-east-1",
-				Quantity:     1,
-				Name:         "llama-australia",
-			},
-			{
-				InstanceType: "gpu_1x_h100_pcie",
-				Region:       "us-west-3",
-				Quantity:     1,
-				Name:         "llama-west",
-			},
-			{
-				InstanceType: "gpu_1x_a100_sxm4",
-				Region:       "us-east-1",
-				Quantity:     1,
-				Name:         "llama-east",
-			},
-		},
+	// Get Loki endpoint from environment variable (defaults to example IP)
+	// Set LOKI_ENDPOINT environment variable to customize, e.g.:
+	// export LOKI_ENDPOINT="http://your-loki-server:3100/loki/api/v1/push"
+	lokiEndpoint := os.Getenv("LOKI_ENDPOINT")
+	if lokiEndpoint == "" {
+		lokiEndpoint = "http://192.168.1.100:3100/loki/api/v1/push" // Default example endpoint
 	}
 
-	fmt.Println("Launching cluster with specification...")
-	cluster, err := LaunchClusterFromSpec(httpClient, apiToken, clusterSpec)
+	// Validate endpoint format with regex
+	endpointRegex := `^https?://[^\s/$.?#].[^\s]*$`
+	if matched, _ := regexp.MatchString(endpointRegex, lokiEndpoint); !matched {
+		t.Fatalf("Invalid LOKI_ENDPOINT format: %s (expected format: http://host:port/path)", lokiEndpoint)
+	}
+
+	fmt.Printf("Using Loki endpoint: %s\n", lokiEndpoint)
+
+	clusterName := "llama-test-cluster"
+
+	// Try to load existing cluster first
+	cluster, err := GetCluster(httpClient, apiToken, clusterName)
 	if err != nil {
-		t.Fatalf("Failed to launch cluster: %v", err)
+		fmt.Printf("GetCluster error: %v\n", err)
+	}
+	if err == nil && len(cluster.Instances) > 0 {
+		fmt.Printf("Found existing cluster '%s' with %d running instances\n", clusterName, len(cluster.Instances))
+		for _, inst := range cluster.Instances {
+			fmt.Printf("  - %s (%s) @ %s\n", inst.Name, inst.ID[:16], inst.IP)
+		}
+	} else {
+		// No existing cluster or no instances - launch new one
+		if err != nil {
+			fmt.Printf("No existing cluster '%s' found (error: %v), launching new cluster...\n", clusterName, err)
+		} else {
+			fmt.Printf("Cluster '%s' found but has %d instances, launching new cluster...\n", clusterName, len(cluster.Instances))
+		}
+
+		// Define cluster specification for GPU instances across regions
+		clusterSpec := &ClusterSpec{
+			Name: clusterName,
+			Replicas: []ClusterReplicaSpec{
+				{
+					InstanceType: "gpu_8x_b200_sxm6",
+					Region:       "australia-east-1",
+					Quantity:     1,
+					Name:         "llama-australia",
+				},
+				{
+					InstanceType: "gpu_1x_h100_pcie",
+					Region:       "us-west-3",
+					Quantity:     1,
+					Name:         "llama-west",
+				},
+				{
+					InstanceType: "gpu_1x_a100_sxm4",
+					Region:       "us-east-1",
+					Quantity:     1,
+					Name:         "llama-east",
+				},
+			},
+		}
+
+		cluster, err = LaunchClusterFromSpec(httpClient, apiToken, clusterSpec)
+		if err != nil {
+			t.Fatalf("Failed to launch cluster: %v", err)
+		}
+
+		if len(cluster.Instances) == 0 {
+			t.Fatal("No instances launched in cluster")
+		}
+		fmt.Printf("Cluster launched with %d instances\n", len(cluster.Instances))
 	}
 
-	if len(cluster.Instances) == 0 {
-		t.Fatal("No instances launched in cluster")
-	}
-	fmt.Printf("Cluster launched with %d instances\n", len(cluster.Instances))
-
-	// Wait for healthy instances
-	if err := waitForHealthyCluster(cluster, 3, 10*time.Minute); err != nil {
-		t.Fatalf("Failed to get healthy cluster: %v", err)
-	}
-
-	// 2. Connect to the cluster instances
+	// 2. Connect to the cluster instances FIRST (required for heartbeat to work)
 	fmt.Println("2. Connecting to cluster instances...")
 
 	if err := cluster.Connect(); err != nil {
@@ -70,60 +109,322 @@ func TestClusterLlamaCpp(t *testing.T) {
 	}
 	defer cluster.Disconnect()
 
+	// Wait for healthy instances (requires SSH connection)
+	if err := waitForHealthyCluster(cluster, 3, 10*time.Minute); err != nil {
+		t.Fatalf("Failed to get healthy cluster: %v", err)
+	}
+
 	fmt.Printf("Connected to %d instances in cluster\n", len(cluster.Instances))
 
-	// 3. Define llama.cpp server tasks for different configurations
-	fmt.Println("3. Defining llama.cpp server tasks...")
+	// 3. Setup: Check and install llama.cpp if needed
+	fmt.Println("\n3. Setting up llama.cpp on cluster instances...")
+	hfToken := os.Getenv("HF_TOKEN")
+	if hfToken == "" {
+		fmt.Println("Warning: HF_TOKEN not set, model download may fail")
+	}
 
-	// Task for a Llama 3.1 8B model with standard settings
+	setupLlamaCppDocker(cluster, hfToken)
+
+	// 4. Define llama.cpp server tasks for different configurations
+	fmt.Println("\n4. Defining llama.cpp server tasks...")
+
+	// Task for a Llama 3.1 8B model running in Docker container with conditional image pulling
 	llama8BTask := remote.Task{
-		Name:       "llama-3.1-8b-server",
-		Command:    "./llama-server -m llama-3.1-8b.gguf --port 8080 --ctx-size 4096 --host 0.0.0.0",
+		Name: "llama-3.1-8b-docker-server",
+		Command: `#!/bin/bash
+# Check if container is already running
+if sudo docker ps --filter name=llama-server --filter status=running | grep -q llama-server; then
+    echo "Container llama-server is already running"
+    exit 0
+fi
+
+# Check if Docker image exists, pull if not
+if ! sudo docker images voplica/llama-cpp | grep -q llama-cpp; then
+    echo "Pulling voplica/llama-cpp:latest image..."
+    sudo docker pull voplica/llama-cpp:latest
+fi
+
+# Remove any stopped containers with the same name
+sudo docker rm -f llama-server 2>/dev/null || true
+
+# Start the container
+sudo docker run --gpus all -v /home/ubuntu/models:/models -p 8080:8080 --name llama-server --restart unless-stopped -d voplica/llama-cpp:latest --server -m /models/llama-3.1-8b.gguf --port 8080 --ctx-size 4096 --host 0.0.0.0
+
+echo 'Container started successfully'
+`,
 		Background: true,
-		WorkingDir: "/home/ubuntu/models",
+		WorkingDir: "/home/ubuntu",
 		Env: map[string]string{
 			"CUDA_VISIBLE_DEVICES": "0",
 		},
 	}
 
-	// 4. Deploy tasks to different instances
-	fmt.Println("4. Deploying llama.cpp servers to cluster instances...")
+	// 5. Deploy tasks to different instances
+	fmt.Println("5. Deploying llama.cpp servers to cluster instances...")
 
-	// Deploy different models to different instances (if we have multiple instances)
-	tasks := []remote.Task{llama8BTask}
+	// Create Alloy task with dynamic endpoint
+	alloyTask := remote.Task{
+		Name: "grafana-alloy-docker-logs",
+		Command: fmt.Sprintf(`#!/bin/bash
+# Check if Alloy container is already running
+if sudo docker ps --filter name=alloy-docker-logs --filter status=running | grep -q alloy-docker-logs; then
+    echo "Alloy container alloy-docker-logs is already running"
+    exit 0
+fi
 
-	for i, task := range tasks {
-		if i >= len(cluster.Instances) {
-			fmt.Printf("Skipping task %s - not enough instances (%d available)\n", task.Name, len(cluster.Instances))
-			continue
-		}
+# Check if Docker image exists, pull if not
+if ! sudo docker images grafana/alloy | grep -q alloy; then
+    echo "Pulling grafana/alloy:latest image..."
+    sudo docker pull grafana/alloy:latest
+fi
 
-		fmt.Printf("Deploying %s to instance %s...\n", task.Name, cluster.Instances[i].ID)
+# Get Loki endpoint from environment variable or use default
+LOKI_ENDPOINT="${LOKI_ENDPOINT:-%s}"
+echo "Using Loki endpoint: $LOKI_ENDPOINT"
 
-		// Run task asynchronously
+# Get instance metadata for labeling
+INSTANCE_ID="${INSTANCE_ID:-unknown}"
+INSTANCE_IP="${INSTANCE_IP:-unknown}"
+INSTANCE_NAME="${INSTANCE_NAME:-unknown}"
+
+# Create loki directory and generate config with endpoint and instance metadata
+mkdir -p /home/ubuntu/loki
+cat > /home/ubuntu/loki/config.alloy << EOF
+logging {
+  level  = "info"
+  format = "logfmt"
+}
+
+// Discover Docker containers
+discovery.docker "docker_containers" {
+  host = "unix:///var/run/docker.sock"
+}
+
+// Extract logs from Docker containers with instance metadata
+loki.source.docker "docker_logs" {
+  host = "unix:///var/run/docker.sock"
+  targets = discovery.docker.docker_containers.targets
+  forward_to = [loki.process.add_instance_labels.receiver]
+}
+
+// Add instance metadata labels to all log entries
+loki.process "add_instance_labels" {
+  stage.match {
+    selector = "{container_name=~\".*\"}"
+    stage.label_drop {
+      values = ["container_id", "image_name", "image_id"]
+    }
+  }
+
+  stage.labels {
+    values = {
+      instance_id   = "$INSTANCE_ID",
+      instance_ip   = "$INSTANCE_IP",
+      instance_name = "$INSTANCE_NAME",
+      host          = "$INSTANCE_NAME",
+    }
+  }
+
+  forward_to = [loki.write.http.receiver]
+}
+
+// Write logs to Loki endpoint
+loki.write "http" {
+  endpoint {
+    url = "$LOKI_ENDPOINT"
+  }
+}
+EOF
+
+# Remove any stopped containers with the same name
+sudo docker rm -f alloy-docker-logs 2>/dev/null || true
+
+# Start the Alloy container with Docker socket access
+sudo docker run -d --name alloy-docker-logs \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v /home/ubuntu/loki/config.alloy:/etc/alloy/config.alloy \
+  -p 12345:12345 \
+  grafana/alloy:latest \
+  run --server.http.listen-addr=0.0.0.0:12345 \
+  --storage.path=/var/lib/alloy/data \
+  /etc/alloy/config.alloy
+
+echo "Alloy container started successfully with endpoint: $LOKI_ENDPOINT"
+`, lokiEndpoint),
+		Background: true,
+		WorkingDir: "/home/ubuntu",
+		Env: map[string]string{
+			"CUDA_VISIBLE_DEVICES": "0",
+		},
+	}
+
+	// Deploy tasks to all instances (both llama server and alloy)
+	for _, task := range []remote.Task{llama8BTask} {
+		fmt.Printf("Deploying %s to all instances...\n", task.Name)
+
+		// Run task asynchronously on all instances
 		resultChan := make(chan map[string]error, 1)
-		go func(task remote.Task, instanceIndex int) {
+		go func(task remote.Task) {
 			results := cluster.RunTaskOnCluster(task)
 			resultChan <- results
-		}(task, i)
+		}(task)
 
 		// Wait for completion with timeout
 		select {
 		case results := <-resultChan:
+			successCount := 0
 			for instanceID, err := range results {
 				if err != nil {
 					fmt.Printf("❌ Task %s failed on instance %s: %v\n", task.Name, instanceID, err)
 				} else {
 					fmt.Printf("✅ Task %s completed successfully on instance %s\n", task.Name, instanceID)
+					successCount++
 				}
 			}
+			fmt.Printf("Task %s deployed on %d/%d instances\n", task.Name, successCount, len(cluster.Instances))
 		case <-time.After(5 * time.Minute):
 			fmt.Printf("⏰ Task %s timed out after 5 minutes\n", task.Name)
 		}
+		fmt.Println()
 	}
 
+	// Deploy Alloy task to all instances with instance-specific metadata
+	fmt.Println("Deploying grafana-alloy-docker-logs to all instances...")
+
+	// Create a dynamic Alloy task that gets instance metadata from cluster context
+	alloyTask = remote.Task{
+		Name: "grafana-alloy-docker-logs",
+		Command: fmt.Sprintf(`#!/bin/bash
+		# Check if Alloy container is already running
+		if sudo docker ps --filter name=alloy-docker-logs --filter status=running | grep -q alloy-docker-logs; then
+			echo "Alloy container alloy-docker-logs is already running"
+			exit 0
+		fi
+
+		# Check if Docker image exists, pull if not
+		if ! sudo docker images grafana/alloy | grep -q alloy; then
+			echo "Pulling grafana/alloy:latest image..."
+			sudo docker pull grafana/alloy:latest
+		fi
+
+		# Get Loki endpoint from environment variable or use default
+		LOKI_ENDPOINT="${LOKI_ENDPOINT:-%s}"
+		echo "Using Loki endpoint: $LOKI_ENDPOINT"
+
+		# Try to detect instance metadata (this is a simplified approach)
+		# In a production system, this would be passed via environment variables
+		INSTANCE_ID="${INSTANCE_ID:-unknown}"
+		INSTANCE_IP="${INSTANCE_IP:-unknown}"
+		INSTANCE_NAME="${INSTANCE_NAME:-unknown}"
+
+		# Try to get instance info from hostname or other sources
+		if [ "$INSTANCE_ID" = "unknown" ]; then
+			# Try to get instance ID from hostname or metadata
+			INSTANCE_ID=$(hostname | cut -d'-' -f1)
+			INSTANCE_IP=$(hostname -I | awk '{print $1}')
+			INSTANCE_NAME=$(hostname)
+		fi
+
+		echo "Detected instance metadata - ID: $INSTANCE_ID, IP: $INSTANCE_IP, Name: $INSTANCE_NAME"
+
+		# Create loki directory and generate config with endpoint and instance metadata
+		mkdir -p /home/ubuntu/loki
+		cat > /home/ubuntu/loki/config.alloy << EOF
+		logging {
+		level  = "info"
+		format = "logfmt"
+		}
+
+		// Discover Docker containers
+		discovery.docker "docker_containers" {
+		host = "unix:///var/run/docker.sock"
+		}
+
+		// Extract logs from Docker containers with instance metadata
+		loki.source.docker "docker_logs" {
+		host = "unix:///var/run/docker.sock"
+		targets = discovery.docker.docker_containers.targets
+		forward_to = [loki.process.add_instance_labels.receiver]
+		}
+
+		// Add instance metadata labels to all log entries
+		loki.process "add_instance_labels" {
+		stage.match {
+			selector = "{container_name=~\".*\"}"
+			stage.label_drop {
+			values = ["container_id", "image_name", "image_id"]
+			}
+		}
+
+		stage.labels {
+			values = {
+			instance_id   = "$INSTANCE_ID",
+			instance_ip   = "$INSTANCE_IP",
+			instance_name = "$INSTANCE_NAME",
+			host          = "$INSTANCE_NAME",
+			}
+		}
+
+		forward_to = [loki.write.http.receiver]
+		}
+
+		// Write logs to Loki endpoint
+		loki.write "http" {
+		endpoint {
+			url = "$LOKI_ENDPOINT"
+		}
+		}
+		EOF
+
+		# Remove any stopped containers with the same name
+		sudo docker rm -f alloy-docker-logs 2>/dev/null || true
+
+		# Start the Alloy container with Docker socket access
+		sudo docker run -d --name alloy-docker-logs \
+		-v /var/run/docker.sock:/var/run/docker.sock \
+		-v /home/ubuntu/loki/config.alloy:/etc/alloy/config.alloy \
+		-p 12345:12345 \
+		grafana/alloy:latest \
+		run --server.http.listen-addr=0.0.0.0:12345 \
+		--storage.path=/var/lib/alloy/data \
+		/etc/alloy/config.alloy
+
+		echo "Alloy container started successfully with endpoint: $LOKI_ENDPOINT"
+		`, lokiEndpoint),
+		Background: true,
+		WorkingDir: "/home/ubuntu",
+		Env: map[string]string{
+			"CUDA_VISIBLE_DEVICES": "0",
+		},
+	}
+
+	// Run Alloy task on all instances
+	resultChan := make(chan map[string]error, 1)
+	go func() {
+		results := cluster.RunTaskOnCluster(alloyTask)
+		resultChan <- results
+	}()
+
+	// Wait for completion with timeout
+	select {
+	case results := <-resultChan:
+		successCount := 0
+		for instanceID, err := range results {
+			if err != nil {
+				fmt.Printf("❌ Task grafana-alloy-docker-logs failed on instance %s: %v\n", instanceID, err)
+			} else {
+				fmt.Printf("✅ Task grafana-alloy-docker-logs completed successfully on instance %s\n", instanceID)
+				successCount++
+			}
+		}
+		fmt.Printf("Alloy deployed on %d/%d instances\n", successCount, len(cluster.Instances))
+	case <-time.After(3 * time.Minute):
+		fmt.Printf("⏰ Task grafana-alloy-docker-logs timed out after 3 minutes\n")
+	}
+	fmt.Println()
+
 	// 5. Check task health (background processes)
-	fmt.Println("5. Checking task health...")
+	fmt.Println("6. Checking task health...")
 	time.Sleep(10 * time.Second) // Give tasks time to start
 
 	taskHealth := cluster.CheckTaskHealth()
@@ -148,19 +449,28 @@ func TestClusterLlamaCpp(t *testing.T) {
 		fmt.Println()
 	}
 
-	// Check specific task
-	if cluster.IsTaskRunning("llama-3.1-8b-server") {
-		fmt.Println("🎉 llama-3.1-8b-server is running!")
+	// Check specific tasks
+	llamaRunning := cluster.IsTaskRunning("llama-3.1-8b-docker-server")
+	alloyRunning := cluster.IsTaskRunning("grafana-alloy-docker-logs")
+
+	if llamaRunning {
+		fmt.Println("🎉 llama-3.1-8b-docker-server is running!")
 	} else {
-		fmt.Println("⚠️  llama-3.1-8b-server is not running")
+		fmt.Println("⚠️  llama-3.1-8b-docker-server is not running")
+	}
+
+	if alloyRunning {
+		fmt.Println("🎉 grafana-alloy-docker-logs is running!")
+	} else {
+		fmt.Println("⚠️  grafana-alloy-docker-logs is not running")
 	}
 
 	// 6. Test cluster heartbeat
-	fmt.Println("6. Test cluster heartbeat...")
+	fmt.Println("7. Test cluster heartbeat...")
 	testClusterHeartbeat(t, cluster)
 
 	// 7. Test API endpoints (if services are accessible)
-	fmt.Println("7. Testing llama.cpp API endpoints...")
+	fmt.Println("8. Testing llama.cpp API endpoints...")
 	testAPIEndpoints(cluster, cluster.Instances)
 
 	fmt.Println("=== Cluster Llama.cpp Test Complete ===")
@@ -170,14 +480,10 @@ func TestClusterLlamaCpp(t *testing.T) {
 func testAPIEndpoints(cluster *Cluster, instances []remote.RunningInstance) {
 	testClient := &http.Client{Timeout: 10 * time.Second}
 
-	ports := []int{8080, 8081, 8082} // Corresponding to our server ports
+	// All servers run on port 8080
+	port := 8080
 
-	for i, instance := range instances {
-		if i >= len(ports) {
-			break
-		}
-
-		port := ports[i]
+	for _, instance := range instances {
 		url := fmt.Sprintf("http://%s:%d/health", instance.IP, port)
 
 		resp, err := testClient.Get(url)
@@ -444,41 +750,186 @@ func exampleClusterSpecs() {
 	}
 }
 
-// benchmarkClusterLoad demonstrates cluster load benchmarking
-func benchmarkClusterLoad(cluster *Cluster, instances []remote.RunningInstance) {
-	fmt.Println("=== Benchmarking Cluster Load ===")
+// setupLlamaCppDocker sets up Docker-based llama.cpp deployment (parallel)
+func setupLlamaCppDocker(cluster *Cluster, hfToken string) {
+	fmt.Println("Checking llama.cpp installation on all instances...")
 
-	// First check cluster health
-	if !cluster.IsHealthy() {
-		fmt.Println("⚠️  Cluster is not fully healthy, benchmark may be incomplete")
+	// Check if llama.cpp is installed
+	checkCmd := "test -f /home/ubuntu/llama.cpp/llama-server && echo 'installed' || echo 'not_installed'"
+	results := cluster.ExecuteOnCluster(checkCmd)
+
+	// Collect instances that need installation
+	var needsInstall []string
+	for instanceID, result := range results {
+		if result.Error != nil {
+			fmt.Printf("❌ Failed to check llama.cpp on %s: %v\n", instanceID[:16], result.Error)
+			continue
+		}
+
+		output := strings.TrimSpace(result.Output)
+		if output == "installed" {
+			fmt.Printf("✅ llama.cpp already installed on %s\n", instanceID[:16])
+		} else {
+			needsInstall = append(needsInstall, instanceID)
+		}
 	}
 
-	// Test concurrent requests to all llama.cpp servers
-	testClient := &http.Client{Timeout: 30 * time.Second}
-
-	for _, instance := range instances {
-		go func(ip string) {
-			// Simple benchmark: test token generation speed
-			url := fmt.Sprintf("http://%s:8080/completion", ip)
-			payload := `{"prompt": "Hello, how are you?", "n_predict": 50}`
-
-			start := time.Now()
-			resp, err := testClient.Post(url, "application/json", strings.NewReader(payload))
-			elapsed := time.Since(start)
-
-			if err != nil {
-				fmt.Printf("❌ Benchmark failed for %s: %v\n", ip, err)
-				return
-			}
-			defer resp.Body.Close()
-
-			if resp.StatusCode == 200 {
-				fmt.Printf("✅ %s responded in %v\n", ip, elapsed)
-			} else {
-				fmt.Printf("⚠️  %s returned status %d\n", ip, resp.StatusCode)
-			}
-		}(instance.IP)
+	// Install llama.cpp in parallel on all instances that need it
+	if len(needsInstall) > 0 {
+		fmt.Printf("\n📦 Installing llama.cpp on %d instances in parallel...\n", len(needsInstall))
+		var wg sync.WaitGroup
+		for _, instanceID := range needsInstall {
+			wg.Add(1)
+			go func(id string) {
+				defer wg.Done()
+				fmt.Printf("  → Starting install on %s...\n", id[:16])
+				installLlamaCpp(cluster, id)
+			}(instanceID)
+		}
+		wg.Wait()
+		fmt.Println("✅ All llama.cpp installations complete!")
 	}
 
-	time.Sleep(5 * time.Second) // Wait for benchmarks to complete
+	// Check if model exists
+	fmt.Println("\nChecking model file on all instances...")
+	modelCheckCmd := "test -f /home/ubuntu/models/llama-3.1-8b.gguf && echo 'exists' || echo 'not_found'"
+	modelResults := cluster.ExecuteOnCluster(modelCheckCmd)
+
+	// Collect instances that need model download
+	var needsModel []string
+	for instanceID, result := range modelResults {
+		if result.Error != nil {
+			fmt.Printf("❌ Failed to check model on %s: %v\n", instanceID[:16], result.Error)
+			continue
+		}
+
+		output := strings.TrimSpace(result.Output)
+		if output == "exists" {
+			fmt.Printf("✅ Model already exists on %s\n", instanceID[:16])
+		} else {
+			needsModel = append(needsModel, instanceID)
+		}
+	}
+
+	// Download model in parallel on all instances that need it
+	if len(needsModel) > 0 {
+		fmt.Printf("\n📥 Downloading model on %d instances in parallel...\n", len(needsModel))
+		var wg sync.WaitGroup
+		for _, instanceID := range needsModel {
+			wg.Add(1)
+			go func(id string) {
+				defer wg.Done()
+				fmt.Printf("  → Starting download on %s...\n", id[:16])
+				downloadModel(cluster, id, hfToken)
+			}(instanceID)
+		}
+		wg.Wait()
+		fmt.Println("✅ All model downloads complete!")
+	}
+}
+
+// installLlamaCpp installs llama.cpp on a specific instance
+func installLlamaCpp(cluster *Cluster, instanceID string) {
+	// Find the instance IP
+	var instanceIP string
+	for _, inst := range cluster.Instances {
+		if inst.ID == instanceID {
+			instanceIP = inst.IP
+			break
+		}
+	}
+	if instanceIP == "" {
+		fmt.Printf("❌ Instance %s not found\n", instanceID[:16])
+		return
+	}
+
+	// Install dependencies and build llama.cpp
+	installScript := `
+set -e
+echo "Installing build dependencies..."
+sudo apt-get update -qq
+sudo apt-get install -y -qq build-essential cmake git libcurl4-openssl-dev
+
+echo "Cloning llama.cpp..."
+cd /home/ubuntu
+if [ ! -d "llama.cpp" ]; then
+    git clone https://github.com/ggerganov/llama.cpp.git
+fi
+cd llama.cpp
+
+echo "Building llama.cpp with CUDA support..."
+cmake -B build -DGGML_CUDA=ON
+cmake --build build --config Release -j$(nproc)
+
+echo "Creating symlinks..."
+ln -sf build/bin/llama-server llama-server
+ln -sf build/bin/llama-cli llama-cli
+
+echo "Creating models directory..."
+mkdir -p /home/ubuntu/models
+
+echo "llama.cpp installation complete!"
+`
+	output, err := cluster.sshMgr.ExecuteCommandWithTimeout(instanceIP, installScript, 15*time.Minute)
+	if err != nil {
+		fmt.Printf("❌ Failed to install llama.cpp on %s: %v\n", instanceID[:16], err)
+		fmt.Printf("Output: %s\n", output)
+		return
+	}
+	fmt.Printf("✅ llama.cpp installed on %s\n", instanceID[:16])
+}
+
+// downloadModel downloads the model from HuggingFace
+func downloadModel(cluster *Cluster, instanceID string, hfToken string) {
+	// Find the instance IP
+	var instanceIP string
+	for _, inst := range cluster.Instances {
+		if inst.ID == instanceID {
+			instanceIP = inst.IP
+			break
+		}
+	}
+	if instanceIP == "" {
+		fmt.Printf("❌ Instance %s not found\n", instanceID[:16])
+		return
+	}
+
+	// Download from HuggingFace using huggingface-cli or wget
+	// Using bartowski's quantized GGUF which is publicly available
+	downloadScript := fmt.Sprintf(`
+set -e
+cd /home/ubuntu/models
+
+echo "Installing huggingface_hub..."
+pip install -q huggingface_hub
+
+echo "Downloading Llama 3.1 8B GGUF model..."
+export HF_TOKEN="%s"
+python3 -c "
+from huggingface_hub import hf_hub_download
+import os
+token = os.environ.get('HF_TOKEN')
+# Using bartowski's quantized version which is publicly available
+hf_hub_download(
+    repo_id='bartowski/Meta-Llama-3.1-8B-Instruct-GGUF',
+    filename='Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf',
+    local_dir='/home/ubuntu/models',
+    token=token
+)
+"
+
+# Rename to expected filename
+mv -f Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf llama-3.1-8b.gguf 2>/dev/null || true
+
+echo "Model download complete!"
+ls -la /home/ubuntu/models/
+`, hfToken)
+
+	output, err := cluster.sshMgr.ExecuteCommandWithTimeout(instanceIP, downloadScript, 30*time.Minute)
+	if err != nil {
+		fmt.Printf("❌ Failed to download model on %s: %v\n", instanceID[:16], err)
+		fmt.Printf("Output: %s\n", output)
+		return
+	}
+	fmt.Printf("✅ Model downloaded on %s\n", instanceID[:16])
 }

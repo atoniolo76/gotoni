@@ -226,14 +226,15 @@ func validateClusterSpec(spec *ClusterSpec, availableInstances []remote.Instance
 	return nil
 }
 
-// waitForInstances polls for running instances until they are ready or timeout
+// waitForInstances polls for running instances until they are active or timeout
 func waitForInstances(httpClient *http.Client, apiToken string, launchedInstances []remote.LaunchedInstance, timeout time.Duration) ([]remote.RunningInstance, error) {
 	provider, _ := remote.GetCloudProvider()
 	startTime := time.Now()
 
 	for {
-		allRunning := true
-		var runningInstances []remote.RunningInstance
+		allActive := true
+		var activeInstances []remote.RunningInstance
+		var pendingCount int
 
 		// Get current list of running instances
 		instances, err := provider.ListRunningInstances(httpClient, apiToken)
@@ -241,32 +242,39 @@ func waitForInstances(httpClient *http.Client, apiToken string, launchedInstance
 			return nil, fmt.Errorf("failed to list instances: %w", err)
 		}
 
-		// Check if all launched instances are running
+		// Check if all launched instances are active (not just present in the list)
 		for _, launched := range launchedInstances {
 			found := false
 			for _, instance := range instances {
 				if instance.ID == launched.ID {
 					found = true
-					runningInstances = append(runningInstances, instance)
+					// Only consider it ready if status is "active"
+					if instance.Status == "active" {
+						activeInstances = append(activeInstances, instance)
+					} else {
+						allActive = false
+						pendingCount++
+					}
 					break
 				}
 			}
 			if !found {
-				allRunning = false
-				break
+				allActive = false
+				pendingCount++
 			}
 		}
 
-		if allRunning {
-			return runningInstances, nil
+		if allActive && len(activeInstances) == len(launchedInstances) {
+			log.Printf("All %d instances are now active!", len(activeInstances))
+			return activeInstances, nil
 		}
 
 		if time.Since(startTime) > timeout {
-			return runningInstances, fmt.Errorf("timeout waiting for instances to be ready")
+			return activeInstances, fmt.Errorf("timeout waiting for instances to be ready (%d/%d active)", len(activeInstances), len(launchedInstances))
 		}
 
-		log.Printf("Waiting for %d instances to be ready...", len(launchedInstances)-len(runningInstances))
-		time.Sleep(15 * time.Second)
+		log.Printf("Waiting for instances... (%d/%d active)", len(activeInstances), len(launchedInstances))
+		time.Sleep(30 * time.Second)
 	}
 }
 
