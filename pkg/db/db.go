@@ -413,7 +413,7 @@ func (d *DB) SaveCluster(cluster *Cluster) (int64, error) {
 
 // GetCluster retrieves a cluster by name
 func (d *DB) GetCluster(name string) (*Cluster, error) {
-	query := `SELECT id, name, ssh_key_name, filesystem_name, status, created_at FROM clusters WHERE name = ?`
+	query := `SELECT id, name, COALESCE(ssh_key_name, ''), COALESCE(filesystem_name, ''), COALESCE(status, ''), created_at FROM clusters WHERE name = ?`
 	row := d.QueryRow(query, name)
 
 	var cluster Cluster
@@ -426,7 +426,7 @@ func (d *DB) GetCluster(name string) (*Cluster, error) {
 
 // GetClusterByID retrieves a cluster by ID
 func (d *DB) GetClusterByID(id int64) (*Cluster, error) {
-	query := `SELECT id, name, ssh_key_name, filesystem_name, status, created_at FROM clusters WHERE id = ?`
+	query := `SELECT id, name, COALESCE(ssh_key_name, ''), COALESCE(filesystem_name, ''), COALESCE(status, ''), created_at FROM clusters WHERE id = ?`
 	row := d.QueryRow(query, id)
 
 	var cluster Cluster
@@ -439,7 +439,7 @@ func (d *DB) GetClusterByID(id int64) (*Cluster, error) {
 
 // ListClusters retrieves all clusters
 func (d *DB) ListClusters() ([]Cluster, error) {
-	query := `SELECT id, name, ssh_key_name, filesystem_name, status, created_at FROM clusters`
+	query := `SELECT id, name, COALESCE(ssh_key_name, ''), COALESCE(filesystem_name, ''), COALESCE(status, ''), created_at FROM clusters`
 	rows, err := d.Query(query)
 	if err != nil {
 		return nil, err
