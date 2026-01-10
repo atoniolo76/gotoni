@@ -877,3 +877,13 @@ func (p *LambdaProvider) EnsurePortOpen(httpClient *http.Client, apiToken string
 
 	return nil
 }
+
+// ExecuteBashCommand - Lambda uses SSH for command execution, not direct API calls
+func (p *LambdaProvider) ExecuteBashCommand(instanceID string, command string) (string, error) {
+	return "", fmt.Errorf("direct command execution not supported for Lambda provider - use SSH instead")
+}
+
+// ExecutePythonCode - Lambda uses SSH for command execution, not direct API calls
+func (p *LambdaProvider) ExecutePythonCode(instanceID string, code string, timeout int) (string, error) {
+	return "", fmt.Errorf("direct Python code execution not supported for Lambda provider - use SSH instead")
+}

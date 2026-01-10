@@ -2,8 +2,10 @@ package serve
 
 import (
 	"fmt"
+	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"regexp"
 	"strings"
 	"sync"
@@ -29,12 +31,26 @@ func TestClusterLlamaCpp(t *testing.T) {
 		t.Skip("LAMBDA_API_KEY not set, skipping integration test")
 	}
 
-	// Get Loki endpoint from environment variable (defaults to example IP)
-	// Set LOKI_ENDPOINT environment variable to customize, e.g.:
-	// export LOKI_ENDPOINT="http://your-loki-server:3100/loki/api/v1/push"
-	lokiEndpoint := os.Getenv("LOKI_ENDPOINT")
-	if lokiEndpoint == "" {
-		lokiEndpoint = "http://192.168.1.100:3100/loki/api/v1/push" // Default example endpoint
+	// Get current public IP address using ipify and construct Loki endpoint
+	var publicIP string
+	if resp, err := httpClient.Get("https://api.ipify.org"); err == nil {
+		defer resp.Body.Close()
+		if body, err := io.ReadAll(resp.Body); err == nil {
+			publicIP = strings.TrimSpace(string(body))
+			fmt.Printf("Current public IP: %s\n", publicIP)
+		}
+	}
+
+	// Construct Loki endpoint using public IP
+	var lokiEndpoint string
+	if publicIP != "" {
+		lokiEndpoint = fmt.Sprintf("http://%s:3100/loki/api/v1/push", publicIP)
+	} else {
+		// Fallback to environment variable if ipify fails
+		lokiEndpoint = os.Getenv("LOKI_ENDPOINT")
+		if lokiEndpoint == "" {
+			lokiEndpoint = "http://192.168.1.100:3100/loki/api/v1/push" // Default example endpoint
+		}
 	}
 
 	// Validate endpoint format with regex
@@ -44,6 +60,10 @@ func TestClusterLlamaCpp(t *testing.T) {
 	}
 
 	fmt.Printf("Using Loki endpoint: %s\n", lokiEndpoint)
+
+	// Install Loki on local instance
+	fmt.Println("\nInstalling Loki on local instance...")
+	installLokiLocally()
 
 	clusterName := "llama-test-cluster"
 
@@ -115,6 +135,11 @@ func TestClusterLlamaCpp(t *testing.T) {
 	}
 
 	fmt.Printf("Connected to %d instances in cluster\n", len(cluster.Instances))
+
+	// Clean up any running alloy containers on existing instances before proceeding
+	if cluster.Name == clusterName { // Only cleanup if using existing cluster
+		cleanupAlloyContainers(cluster)
+	}
 
 	// 3. Setup: Check and install llama.cpp if needed
 	fmt.Println("\n3. Setting up llama.cpp on cluster instances...")
@@ -879,6 +904,148 @@ echo "llama.cpp installation complete!"
 	fmt.Printf("✅ llama.cpp installed on %s\n", instanceID[:16])
 }
 
+// installLokiLocally installs Loki on the local test machine
+func installLokiLocally() {
+	fmt.Println("Detecting package manager and installing Loki...")
+
+	// Check if apt-get is available (Debian/Ubuntu)
+	aptCheck := exec.Command("which", "apt-get")
+	if err := aptCheck.Run(); err == nil {
+		fmt.Println("Detected apt-get, installing Loki using APT...")
+		installLokiWithApt()
+		return
+	}
+
+	// Check if dnf is available (RPM-based systems)
+	dnfCheck := exec.Command("which", "dnf")
+	if err := dnfCheck.Run(); err == nil {
+		fmt.Println("Detected dnf, installing Loki using DNF...")
+		installLokiWithDnf()
+		return
+	}
+
+	// Check if yum is available (older RPM-based systems)
+	yumCheck := exec.Command("which", "yum")
+	if err := yumCheck.Run(); err == nil {
+		fmt.Println("Detected yum, installing Loki using YUM...")
+		installLokiWithYum()
+		return
+	}
+
+	fmt.Println("Warning: No supported package manager found (apt-get, dnf, or yum). Skipping Loki installation.")
+}
+
+// installLokiWithApt installs Loki using apt-get
+func installLokiWithApt() {
+	installScript := `#!/bin/bash
+set -e
+
+echo "Adding Grafana APT repository..."
+
+# Install prerequisites
+apt-get update
+apt-get install -y wget gnupg2 software-properties-common
+
+# Add Grafana GPG key
+wget -q -O /usr/share/keyrings/grafana.key https://apt.grafana.com/gpg.key
+
+# Add repository
+echo "deb [signed-by=/usr/share/keyrings/grafana.key] https://apt.grafana.com stable main" | tee /etc/apt/sources.list.d/grafana.list
+
+# Update package list
+apt-get update
+
+# Install Loki (without Promtail as requested)
+apt-get install -y loki
+
+echo "Loki installed successfully!"
+systemctl status loki --no-pager || echo "Loki service status check"
+`
+
+	cmd := exec.Command("bash", "-c", installScript)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		fmt.Printf("Failed to install Loki with apt-get: %v\n", err)
+		fmt.Printf("Output: %s\n", string(output))
+		return
+	}
+	fmt.Printf("Loki installation output: %s\n", string(output))
+}
+
+// installLokiWithDnf installs Loki using dnf
+func installLokiWithDnf() {
+	installScript := `#!/bin/bash
+set -e
+
+echo "Adding Grafana RPM repository..."
+
+# Create repository file
+cat > /etc/yum.repos.d/grafana.repo << EOF
+[grafana]
+name=grafana
+baseurl=https://rpm.grafana.com
+repo_gpgcheck=1
+enabled=1
+gpgcheck=1
+gpgkey=https://rpm.grafana.com/gpg.key
+sslverify=1
+sslcacert=/etc/pki/tls/certs/ca-bundle.crt
+EOF
+
+# Install Loki (without Promtail as requested)
+dnf install -y loki
+
+echo "Loki installed successfully!"
+systemctl status loki --no-pager || echo "Loki service status check"
+`
+
+	cmd := exec.Command("bash", "-c", installScript)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		fmt.Printf("Failed to install Loki with dnf: %v\n", err)
+		fmt.Printf("Output: %s\n", string(output))
+		return
+	}
+	fmt.Printf("Loki installation output: %s\n", string(output))
+}
+
+// installLokiWithYum installs Loki using yum (for older RPM systems)
+func installLokiWithYum() {
+	installScript := `#!/bin/bash
+set -e
+
+echo "Adding Grafana RPM repository..."
+
+# Create repository file
+cat > /etc/yum.repos.d/grafana.repo << EOF
+[grafana]
+name=grafana
+baseurl=https://rpm.grafana.com
+repo_gpgcheck=1
+enabled=1
+gpgcheck=1
+gpgkey=https://rpm.grafana.com/gpg.key
+sslverify=1
+sslcacert=/etc/pki/tls/certs/ca-bundle.crt
+EOF
+
+# Install Loki (without Promtail as requested)
+yum install -y loki
+
+echo "Loki installed successfully!"
+systemctl status loki --no-pager || echo "Loki service status check"
+`
+
+	cmd := exec.Command("bash", "-c", installScript)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		fmt.Printf("Failed to install Loki with yum: %v\n", err)
+		fmt.Printf("Output: %s\n", string(output))
+		return
+	}
+	fmt.Printf("Loki installation output: %s\n", string(output))
+}
+
 // downloadModel downloads the model from HuggingFace
 func downloadModel(cluster *Cluster, instanceID string, hfToken string) {
 	// Find the instance IP
@@ -932,4 +1099,46 @@ ls -la /home/ubuntu/models/
 		return
 	}
 	fmt.Printf("✅ Model downloaded on %s\n", instanceID[:16])
+}
+
+// cleanupAlloyContainers stops any running alloy-docker-logs containers on all instances in the cluster
+func cleanupAlloyContainers(cluster *Cluster) {
+	fmt.Println("🧹 Cleaning up any running alloy-docker-logs containers on existing instances...")
+
+	for _, inst := range cluster.Instances {
+		fmt.Printf("Checking instance %s (%s)...\n", inst.Name, inst.ID[:16])
+
+		// Check if alloy container is running
+		checkCommand := "sudo docker ps --filter name=alloy-docker-logs --filter status=running --format '{{.Names}}' 2>/dev/null || true"
+
+		output, err := cluster.sshMgr.ExecuteCommand(inst.IP, checkCommand)
+		if err != nil {
+			fmt.Printf("⚠️  Failed to check alloy containers on %s: %v\n", inst.Name, err)
+			continue
+		}
+
+		if strings.TrimSpace(output) != "" {
+			fmt.Printf("Found running alloy container on %s, stopping it...\n", inst.Name)
+
+			// Stop the alloy container
+			stopCommand := "sudo docker stop alloy-docker-logs 2>/dev/null || true"
+			_, stopErr := cluster.sshMgr.ExecuteCommand(inst.IP, stopCommand)
+			if stopErr != nil {
+				fmt.Printf("⚠️  Failed to stop alloy container on %s: %v\n", inst.Name, stopErr)
+			} else {
+				fmt.Printf("✅ Stopped alloy container on %s\n", inst.Name)
+			}
+
+			// Remove the stopped container
+			rmCommand := "sudo docker rm -f alloy-docker-logs 2>/dev/null || true"
+			_, rmErr := cluster.sshMgr.ExecuteCommand(inst.IP, rmCommand)
+			if rmErr != nil {
+				fmt.Printf("⚠️  Failed to remove alloy container on %s: %v\n", inst.Name, rmErr)
+			}
+		} else {
+			fmt.Printf("No running alloy containers found on %s\n", inst.Name)
+		}
+	}
+
+	fmt.Println("✅ Alloy container cleanup completed")
 }

@@ -5,6 +5,9 @@
 *.so
 *.dylib
 
+# Loki
+.data/
+
 # Test binary, build output
 *.test
 *.out

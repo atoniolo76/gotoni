@@ -35,6 +35,10 @@ type CloudProvider interface {
 	GetGlobalFirewallRules(httpClient *http.Client, apiToken string) (*GlobalFirewallRuleset, error)
 	UpdateGlobalFirewallRules(httpClient *http.Client, apiToken string, rules []FirewallRule) (*GlobalFirewallRuleset, error)
 	EnsurePortOpen(httpClient *http.Client, apiToken string, port int, protocol string, description string) error
+
+	// Remote Command Execution (for providers that support it)
+	ExecuteBashCommand(instanceID string, command string) (string, error)
+	ExecutePythonCode(instanceID string, code string, timeout int) (string, error)
 }
 
 // CloudProviderType represents the type of cloud provider
@@ -42,6 +46,7 @@ type CloudProviderType string
 
 const (
 	CloudProviderLambda CloudProviderType = "lambda"
+	CloudProviderOrgo   CloudProviderType = "orgo"
 )
 
 // GetCloudProvider returns the appropriate cloud provider based on the GOTONI_CLOUD environment variable
@@ -50,6 +55,8 @@ func GetCloudProvider() (CloudProvider, CloudProviderType) {
 	switch cloudType {
 	case CloudProviderLambda:
 		return NewLambdaProvider(), CloudProviderLambda
+	case CloudProviderOrgo:
+		return NewOrgoProvider(), CloudProviderOrgo
 	default:
 		return NewLambdaProvider(), CloudProviderLambda
 	}
@@ -75,6 +82,8 @@ func GetAPITokenForProvider(providerType CloudProviderType) string {
 	switch providerType {
 	case CloudProviderLambda:
 		return os.Getenv("LAMBDA_API_KEY")
+	case CloudProviderOrgo:
+		return os.Getenv("ORGO_API_KEY")
 	default:
 		return os.Getenv("LAMBDA_API_KEY")
 	}

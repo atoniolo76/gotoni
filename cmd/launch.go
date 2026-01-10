@@ -18,15 +18,19 @@ import (
 var launchCmd = &cobra.Command{
 	Use:   "launch [instance-name]",
 	Short: "Launch a new instance and optionally run automation tasks",
-	Long: `Launch a new instance on your cloud provider with the specified name. 
+	Long: `Launch a new instance on your cloud provider with the specified name.
 Use --wait to automatically wait for the instance type to become available.
-Use --tasks to specify automation tasks to run after the instance is ready.
+Use --tasks to specify automation tasks to run after the instance is ready (Lambda only).
+Use --provider to specify the cloud provider (lambda or orgo).
 
 Examples:
-  # Launch and wait for instance
+  # Launch Lambda GPU instance
   gotoni launch my-instance -t gpu_1x_a100 -r us-west-1 --wait
-  
-  # Launch with tasks
+
+  # Launch Orgo computer
+  gotoni launch my-computer --provider orgo -t 4gb -r my-project --wait
+
+  # Launch with tasks (Lambda only)
   gotoni launch my-instance -t gpu_1x_a100 -r us-west-1 --wait --tasks "Install Docker,Setup Environment"`,
 	Args: cobra.MaximumNArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
@@ -46,6 +50,11 @@ Examples:
 		region, err := cmd.Flags().GetString("region")
 		if err != nil {
 			log.Fatalf("Error getting region: %v", err)
+		}
+
+		provider, err := cmd.Flags().GetString("provider")
+		if err != nil {
+			log.Fatalf("Error getting provider: %v", err)
 		}
 
 		apiToken, err := cmd.Flags().GetString("api-token")
@@ -88,11 +97,19 @@ Examples:
 			log.Fatal("Region is required when not using --wait flag. Use --region to specify a region or --wait to auto-select.")
 		}
 
-		// If API token not provided via flag, get from environment
+		// If API token not provided via flag, get from environment based on provider
 		if apiToken == "" {
-			apiToken = remote.GetAPIToken()
+			if provider == "orgo" {
+				apiToken = remote.GetAPITokenForProvider(remote.CloudProviderOrgo)
+			} else {
+				apiToken = remote.GetAPITokenForProvider(remote.CloudProviderLambda)
+			}
 			if apiToken == "" {
-				log.Fatal("API token not provided via --api-token flag or LAMBDA_API_KEY environment variable")
+				if provider == "orgo" {
+					log.Fatal("API token not provided via --api-token flag or ORGO_API_KEY environment variable")
+				} else {
+					log.Fatal("API token not provided via --api-token flag or LAMBDA_API_KEY environment variable")
+				}
 			}
 		}
 
@@ -175,8 +192,8 @@ Examples:
 		}
 
 	launchInstance:
-		// Create or retrieve filesystem if flag is provided
-		if filesystemName != "" {
+		// Create or retrieve filesystem if flag is provided (only for Lambda)
+		if filesystemName != "" && provider != "orgo" {
 			// Check if filesystem already exists
 			existingFilesystems, err := remote.ListFilesystems(httpClient, apiToken)
 			if err != nil {
@@ -213,20 +230,38 @@ Examples:
 				}
 				fmt.Printf("Filesystem '%s' created successfully (ID: %s)\n", fs.Name, fs.ID)
 			}
+		} else if filesystemName != "" && provider == "orgo" {
+			fmt.Println("Warning: Orgo provider does not support filesystems. Ignoring --filesystem flag.")
 		}
 
 		fmt.Printf("\nLaunching instance...\n")
-		if wait {
-			// Launch and wait for instances to be ready
-			launchedInstances, launchErr = remote.LaunchAndWait(httpClient, apiToken, instanceType, actualRegion, 1, instanceName, "", waitTimeout, filesystemName)
-		} else {
-			// Launch the instance (this creates SSH key and saves to config)
+		if provider == "orgo" {
+			// Orgo provider - use project-based launch
 			launchedInstances, launchErr = remote.LaunchInstance(httpClient, apiToken, instanceType, actualRegion, 1, instanceName, "", filesystemName)
-			fmt.Println("Note: SSH config not updated because IP is not yet available. Use --wait flag to update SSH config automatically.")
+			if launchErr == nil && wait {
+				// For Orgo, wait for the computer to be ready
+				if len(launchedInstances) > 0 {
+					fmt.Printf("Waiting for Orgo computer to be ready...\n")
+					launchErr = remote.WaitForInstanceReady(httpClient, apiToken, launchedInstances[0].ID, waitTimeout)
+					if launchErr == nil {
+						fmt.Printf("Orgo computer is ready!\n")
+					}
+				}
+			}
+		} else {
+			// Lambda provider - use region-based launch
+			if wait {
+				// Launch and wait for instances to be ready
+				launchedInstances, launchErr = remote.LaunchAndWait(httpClient, apiToken, instanceType, actualRegion, 1, instanceName, "", waitTimeout, filesystemName)
+			} else {
+				// Launch the instance (this creates SSH key and saves to config)
+				launchedInstances, launchErr = remote.LaunchInstance(httpClient, apiToken, instanceType, actualRegion, 1, instanceName, "", filesystemName)
+				fmt.Println("Note: SSH config not updated because IP is not yet available. Use --wait flag to update SSH config automatically.")
+			}
 		}
 
-		// If successful and we waited, update SSH config
-		if launchErr == nil && wait {
+		// If successful and we waited, update SSH config (only for Lambda)
+		if launchErr == nil && wait && provider != "orgo" {
 			for _, instance := range launchedInstances {
 				// Get instance details to get IP
 				details, err := remote.GetInstance(httpClient, apiToken, instance.ID)
@@ -260,8 +295,8 @@ Examples:
 			fmt.Println()
 		}
 
-		// Execute tasks if specified
-		if len(taskNames) > 0 && wait {
+		// Execute tasks if specified (only for Lambda provider)
+		if len(taskNames) > 0 && wait && provider != "orgo" {
 			if len(launchedInstances) == 0 {
 				log.Fatal("No instances launched, cannot execute tasks")
 			}
@@ -317,9 +352,13 @@ Examples:
 			}
 
 			fmt.Printf("\n✓ All tasks completed successfully!\n")
-		} else if len(taskNames) > 0 && !wait {
-			fmt.Println("\nWarning: Tasks specified but --wait flag not set. Tasks will not be executed.")
-			fmt.Println("Use --wait flag to execute tasks after instance is ready.")
+		} else if len(taskNames) > 0 && (!wait || provider == "orgo") {
+			if !wait {
+				fmt.Println("\nWarning: Tasks specified but --wait flag not set. Tasks will not be executed.")
+				fmt.Println("Use --wait flag to execute tasks after instance is ready.")
+			} else if provider == "orgo" {
+				fmt.Println("\nWarning: Task execution not supported for Orgo provider. Tasks will be skipped.")
+			}
 		}
 	},
 }
@@ -342,12 +381,15 @@ func init() {
 	}
 
 	// Extract region keys from the map
-	launchCmd.Flags().StringP("api-token", "a", "", "API token for cloud provider (can also be set via LAMBDA_API_KEY env var)")
+	launchCmd.Flags().StringP("provider", "p", "lambda", "Cloud provider to use (lambda or orgo)")
 
-	launchCmd.Flags().StringP("region", "r", "", "Region to launch the instance in (e.g., us-east-1, us-west-2)")
+	launchCmd.Flags().StringP("api-token", "a", "", "API token for cloud provider (can also be set via LAMBDA_API_KEY or ORGO_API_KEY env var)")
 
-	launchCmd.Flags().StringP("instance-type", "t", "", `choose the instance type to launch. Options:
-`+strings.Join(instanceOptions, "\n")+`
+	launchCmd.Flags().StringP("region", "r", "", "Region (Lambda) or Project (Orgo) to launch the instance in")
+
+	launchCmd.Flags().StringP("instance-type", "t", "", `choose the instance type to launch.
+For Lambda: `+strings.Join(instanceOptions, ", ")+`
+For Orgo: 2gb, 4gb, 8gb (RAM-based instance types)
 	`)
 
 	launchCmd.Flags().BoolP("wait", "w", false, "Wait for instance type to become available before launching, then wait for instance to be ready")

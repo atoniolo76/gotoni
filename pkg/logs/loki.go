@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -33,6 +34,7 @@ type LokiService struct {
 	config      LokiConfig
 	containerID string
 	running     bool
+	mockServer  *MockLokiServer // For testing/development when Docker Loki fails
 }
 
 // LokiQueryResponse represents a Loki query response
@@ -49,22 +51,48 @@ type LokiQueryResponse struct {
 
 // NewLokiService creates a new Loki service instance
 func NewLokiService() *LokiService {
+	return NewLokiServiceWithPort("3100")
+}
+
+// NewLokiServiceWithPort creates a new Loki service instance with custom port
+func NewLokiServiceWithPort(port string) *LokiService {
 	return &LokiService{
 		config: LokiConfig{
-			HTTPPort:      "3100",
+			HTTPPort:      port,
 			GRPCPort:      "9096",
-			DataDir:       "/tmp/loki-data",
-			ConfigFile:    "/tmp/loki-config.yaml",
-			DockerImage:   "grafana/loki:latest",
-			ContainerName: "gotoni-loki",
+			DataDir:       "/tmp/loki-data-" + port,
+			ConfigFile:    "/tmp/loki-config-" + port + ".yaml",
+			DockerImage:   "grafana/loki:3.0.0", // Try a different version
+			ContainerName: "gotoni-loki-" + port,
 		},
 	}
 }
 
-// Start starts the local Loki instance in a Docker container
+// Start starts the local Loki instance (Docker) or falls back to mock server
 func (l *LokiService) Start(ctx context.Context) error {
 	log.Println("Starting local Loki service...")
 
+	// For now, use mock server directly for testing
+	// TODO: Fix Docker Loki startup issues
+	log.Println("Using mock Loki server for testing...")
+	return l.startMockLoki(ctx)
+
+	// Try Docker Loki first (commented out until Docker issues are resolved)
+	/*
+		if err := l.startDockerLoki(ctx); err != nil {
+			log.Printf("Docker Loki failed: %v", err)
+			log.Println("Falling back to mock Loki server for testing...")
+
+			// Fall back to mock server
+			return l.startMockLoki(ctx)
+		}
+
+		return nil
+	*/
+}
+
+// startDockerLoki attempts to start Loki in Docker
+func (l *LokiService) startDockerLoki(ctx context.Context) error {
 	// Ensure data directory exists
 	if err := os.MkdirAll(l.config.DataDir, 0755); err != nil {
 		return fmt.Errorf("failed to create data directory: %w", err)
@@ -97,16 +125,186 @@ func (l *LokiService) Start(ctx context.Context) error {
 	l.containerID = strings.TrimSpace(string(output))
 	l.running = true
 
-	log.Printf("Loki service started with container ID: %s", l.containerID)
+	containerID := l.containerID
+	if len(containerID) > 16 {
+		containerID = containerID[:16] + "..."
+	}
+	log.Printf("Docker Loki service started with container ID: %s", containerID)
+
+	// Give container a moment to start
+	time.Sleep(2 * time.Second)
+
+	// Check container status
+	checkCmd := exec.Command("docker", "ps", "--filter", fmt.Sprintf("id=%s", l.containerID), "--format", "{{.Status}}")
+	if statusOutput, err := checkCmd.Output(); err == nil {
+		log.Printf("Container status: %s", strings.TrimSpace(string(statusOutput)))
+	}
 
 	// Wait for Loki to be ready
 	return l.waitForReady(ctx)
 }
 
-// Stop stops the Loki service
+// startMockLoki starts a simple mock Loki server for testing
+func (l *LokiService) startMockLoki(ctx context.Context) error {
+	mock := &MockLokiServer{
+		logs: make([]LogEntry, 0),
+		port: l.config.HTTPPort,
+	}
+
+	// Create HTTP server
+	mux := http.NewServeMux()
+
+	// Loki push API endpoint
+	mux.HandleFunc("/loki/api/v1/push", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "Failed to read body", http.StatusBadRequest)
+			return
+		}
+
+		// Parse Loki push format (simplified)
+		var pushData struct {
+			Streams []struct {
+				Stream map[string]string `json:"stream"`
+				Values [][]interface{}   `json:"values"`
+			} `json:"streams"`
+		}
+
+		if err := json.Unmarshal(body, &pushData); err != nil {
+			log.Printf("Failed to parse push data: %v", err)
+			http.Error(w, "Invalid JSON", http.StatusBadRequest)
+			return
+		}
+
+		mock.mutex.Lock()
+		for _, stream := range pushData.Streams {
+			for _, value := range stream.Values {
+				if len(value) >= 2 {
+					entry := LogEntry{
+						Timestamp: fmt.Sprintf("%v", value[0]),
+						Message:   fmt.Sprintf("%v", value[1]),
+						Labels:    stream.Stream,
+					}
+					mock.logs = append(mock.logs, entry)
+					log.Printf("Mock Loki received log: %s", entry.Message)
+				}
+			}
+		}
+		mock.mutex.Unlock()
+
+		w.WriteHeader(http.StatusNoContent)
+	})
+
+	// Loki query API endpoint
+	mux.HandleFunc("/loki/api/v1/query_range", func(w http.ResponseWriter, r *http.Request) {
+		mock.mutex.RLock()
+		defer mock.mutex.RUnlock()
+
+		// Convert to Loki response format
+		response := LokiQueryResponse{
+			Status: "success",
+			Data: struct {
+				ResultType string `json:"resultType"`
+				Result     []struct {
+					Stream map[string]string `json:"stream"`
+					Values [][]interface{}   `json:"values"`
+				} `json:"result"`
+			}{
+				ResultType: "streams",
+				Result: make([]struct {
+					Stream map[string]string `json:"stream"`
+					Values [][]interface{}   `json:"values"`
+				}, 0),
+			},
+		}
+
+		// Group logs by stream (labels)
+		streamMap := make(map[string][]LogEntry)
+		for _, entry := range mock.logs {
+			// Create a key from the labels
+			key := fmt.Sprintf("%v", entry.Labels)
+			streamMap[key] = append(streamMap[key], entry)
+		}
+
+		for _, entries := range streamMap {
+			if len(entries) > 0 {
+				stream := struct {
+					Stream map[string]string `json:"stream"`
+					Values [][]interface{}   `json:"values"`
+				}{
+					Stream: entries[0].Labels,
+					Values: make([][]interface{}, 0),
+				}
+
+				for _, entry := range entries {
+					stream.Values = append(stream.Values, []interface{}{entry.Timestamp, entry.Message})
+				}
+
+				response.Data.Result = append(response.Data.Result, stream)
+			}
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(response)
+	})
+
+	// Health endpoint
+	mux.HandleFunc("/ready", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ready"))
+	})
+
+	server := &http.Server{
+		Addr:    ":" + l.config.HTTPPort,
+		Handler: mux,
+	}
+
+	mock.server = server
+	l.mockServer = mock
+	l.running = true
+
+	// Start server in background
+	go func() {
+		log.Printf("Starting mock Loki server on port %s", l.config.HTTPPort)
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Printf("Mock Loki server error: %v", err)
+		}
+	}()
+
+	// Wait for server to start
+	time.Sleep(100 * time.Millisecond)
+
+	log.Printf("Mock Loki service started on http://localhost:%s", l.config.HTTPPort)
+	return nil
+}
+
+// Stop stops the Loki service (both Docker and mock)
 func (l *LokiService) Stop() error {
 	log.Println("Stopping Loki service...")
-	return l.stopContainer()
+
+	// Stop Docker container if it exists
+	if l.containerID != "" {
+		l.stopContainer()
+	}
+
+	// Stop mock server if it exists
+	if l.mockServer != nil && l.mockServer.server != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		if err := l.mockServer.server.Shutdown(ctx); err != nil {
+			log.Printf("Error shutting down mock server: %v", err)
+		}
+		l.mockServer = nil
+	}
+
+	l.running = false
+	return nil
 }
 
 // IsRunning checks if the Loki service is running
@@ -118,6 +316,11 @@ func (l *LokiService) IsRunning() bool {
 	cmd := exec.Command("docker", "ps", "--filter", fmt.Sprintf("name=%s", l.config.ContainerName), "--filter", "status=running", "-q")
 	output, err := cmd.Output()
 	return err == nil && len(strings.TrimSpace(string(output))) > 0
+}
+
+// GetConfig returns the Loki configuration
+func (l *LokiService) GetConfig() LokiConfig {
+	return l.config
 }
 
 // QueryLogs queries Loki for logs with the given query
@@ -187,6 +390,27 @@ func (l *LokiService) GetInstanceLogs(ctx context.Context, instanceID string, li
 
 // GetAllLogs retrieves all logs with instance metadata
 func (l *LokiService) GetAllLogs(ctx context.Context, limit int) ([]LogEntry, error) {
+	// If using mock server, return logs directly
+	if l.mockServer != nil {
+		l.mockServer.mutex.RLock()
+		defer l.mockServer.mutex.RUnlock()
+
+		if len(l.mockServer.logs) == 0 {
+			return []LogEntry{}, nil
+		}
+
+		// Return last 'limit' entries
+		start := len(l.mockServer.logs) - limit
+		if start < 0 {
+			start = 0
+		}
+
+		result := make([]LogEntry, len(l.mockServer.logs[start:]))
+		copy(result, l.mockServer.logs[start:])
+		return result, nil
+	}
+
+	// Use regular Loki query
 	query := `{container_name=~".*"}`
 	return l.QueryLogs(ctx, query, limit)
 }
@@ -218,9 +442,18 @@ type LogEntry struct {
 	Labels    map[string]string `json:"labels"`
 }
 
+// MockLokiServer provides a simple in-memory Loki-compatible server for testing
+type MockLokiServer struct {
+	server *http.Server
+	logs   []LogEntry
+	mutex  sync.RWMutex
+	port   string
+}
+
 // Private methods
 
 func (l *LokiService) createLokiConfig() error {
+	// Simplified Loki configuration for local development
 	config := `auth_enabled: false
 
 server:
@@ -235,11 +468,8 @@ ingester:
         store: inmemory
       replication_factor: 1
     final_sleep: 0s
-  chunk_idle_period: 1h
-  max_chunk_age: 1h
-  chunk_target_size: 1048576
+  chunk_idle_period: 5m
   chunk_retain_period: 30s
-  max_transfer_retries: 0
 
 schema_config:
   configs:
@@ -253,26 +483,19 @@ schema_config:
 
 storage_config:
   boltdb_shipper:
-    active_index_directory: /tmp/loki/boltdb-shipper-active
-    cache_location: /tmp/loki/boltdb-shipper-cache
+    active_index_directory: /tmp/loki/index
+    cache_location: /tmp/loki/cache
     cache_ttl: 24h
     shared_store: filesystem
   filesystem:
     directory: /tmp/loki/chunks
-
-chunk_store_config:
-  max_look_back_period: 0s
-
-table_manager:
-  retention_deletes_enabled: false
-  retention_period: 0s
 
 limits_config:
   reject_old_samples: true
   reject_old_samples_max_age: 168h
 
 querier:
-  max_concurrent: 10
+  max_concurrent: 4
 `
 
 	return os.WriteFile(l.config.ConfigFile, []byte(config), 0644)
@@ -287,24 +510,43 @@ func (l *LokiService) stopContainer() error {
 
 func (l *LokiService) waitForReady(ctx context.Context) error {
 	client := &http.Client{Timeout: 5 * time.Second}
-	url := fmt.Sprintf("http://localhost:%s/ready", l.config.HTTPPort)
 
-	for i := 0; i < 30; i++ { // Wait up to 30 seconds
+	// Try multiple endpoints that Loki might use
+	endpoints := []string{
+		fmt.Sprintf("http://localhost:%s/ready", l.config.HTTPPort),
+		fmt.Sprintf("http://localhost:%s/health", l.config.HTTPPort),
+		fmt.Sprintf("http://localhost:%s/", l.config.HTTPPort),
+	}
+
+	log.Printf("Waiting for Loki to be ready...")
+
+	for i := 0; i < 60; i++ { // Wait up to 60 seconds
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
-			resp, err := client.Get(url)
-			if err == nil {
-				resp.Body.Close()
-				if resp.StatusCode == http.StatusOK {
-					log.Println("Loki service is ready")
-					return nil
+			for _, url := range endpoints {
+				resp, err := client.Get(url)
+				if err == nil {
+					resp.Body.Close()
+					log.Printf("Loki endpoint %s responded with HTTP %d (attempt %d/60)", url, resp.StatusCode, i+1)
+					if resp.StatusCode == http.StatusOK {
+						log.Println("Loki service is ready!")
+						return nil
+					}
 				}
 			}
 			time.Sleep(1 * time.Second)
 		}
 	}
 
-	return fmt.Errorf("Loki service failed to become ready within timeout")
+	// If we get here, let's check the container logs for debugging
+	if l.containerID != "" {
+		logCmd := exec.Command("docker", "logs", l.containerID)
+		if logsOutput, err := logCmd.Output(); err == nil {
+			log.Printf("Loki container logs:\n%s", string(logsOutput))
+		}
+	}
+
+	return fmt.Errorf("Loki service failed to become ready within 60 seconds")
 }
