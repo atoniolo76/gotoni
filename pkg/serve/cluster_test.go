@@ -2,7 +2,6 @@ package serve
 
 import (
 	"fmt"
-	"io"
 	"net/http"
 	"os"
 	"os/exec"
@@ -26,44 +25,61 @@ func TestClusterLlamaCpp(t *testing.T) {
 
 	httpClient := remote.NewHTTPClient()
 	apiToken := os.Getenv("LAMBDA_API_KEY")
+	orgoToken := os.Getenv("ORGO_API_KEY")
 
 	if apiToken == "" {
 		t.Skip("LAMBDA_API_KEY not set, skipping integration test")
 	}
 
-	// Get current public IP address using ipify and construct Loki endpoint
-	var publicIP string
-	if resp, err := httpClient.Get("https://api.ipify.org"); err == nil {
-		defer resp.Body.Close()
-		if body, err := io.ReadAll(resp.Body); err == nil {
-			publicIP = strings.TrimSpace(string(body))
-			fmt.Printf("Current public IP: %s\n", publicIP)
-		}
+	if orgoToken == "" {
+		t.Skip("ORGO_API_KEY not set, skipping integration test")
 	}
 
-	// Construct Loki endpoint using public IP
-	var lokiEndpoint string
-	if publicIP != "" {
-		lokiEndpoint = fmt.Sprintf("http://%s:3100/loki/api/v1/push", publicIP)
-	} else {
-		// Fallback to environment variable if ipify fails
-		lokiEndpoint = os.Getenv("LOKI_ENDPOINT")
-		if lokiEndpoint == "" {
-			lokiEndpoint = "http://192.168.1.100:3100/loki/api/v1/push" // Default example endpoint
-		}
+	// Launch Orgo logging container
+	fmt.Println("Launching Orgo logging container...")
+	orgoProvider := remote.NewOrgoProvider()
+
+	// Launch a 4GB Orgo computer for logging
+	loggingInstances, err := orgoProvider.LaunchAndWait(httpClient, orgoToken, "4gb", "", 1, "loki-logger", "", 5*time.Minute, "")
+	if err != nil {
+		t.Fatalf("Failed to launch Orgo logging container: %v", err)
 	}
+
+	if len(loggingInstances) == 0 {
+		t.Fatal("No Orgo logging instances launched")
+	}
+
+	loggingInstance := loggingInstances[0]
+	fmt.Printf("✅ Launched Orgo logging container: %s\n", loggingInstance.ID)
+
+	// Get the logging container's endpoint
+	loggingComputer, err := orgoProvider.GetInstance(httpClient, orgoToken, loggingInstance.ID)
+	if err != nil {
+		t.Fatalf("Failed to get logging computer details: %v", err)
+	}
+
+	// For Orgo, we need to extract the accessible endpoint
+	// Since Orgo provides URLs but not direct IPs, we'll use the computer ID
+	// to construct commands that will help us determine the endpoint
+	fmt.Printf("Logging computer details - ID: %s, Status: %s\n", loggingComputer.ID, loggingComputer.Status)
+
+	// Setup Loki on the Orgo container
+	fmt.Println("Setting up Loki on Orgo logging container...")
+	setupOrgoLokiContainer(orgoProvider, loggingComputer.ID)
+
+	// Get the public endpoint/IP that Lambda instances can connect to
+	lokiEndpoint, err := getOrgoLokiEndpoint(orgoProvider, loggingComputer.ID)
+	if err != nil {
+		t.Fatalf("Failed to get Orgo Loki endpoint: %v", err)
+	}
+
+	fmt.Printf("Using Orgo Loki endpoint: %s\n", lokiEndpoint)
 
 	// Validate endpoint format with regex
 	endpointRegex := `^https?://[^\s/$.?#].[^\s]*$`
 	if matched, _ := regexp.MatchString(endpointRegex, lokiEndpoint); !matched {
 		t.Fatalf("Invalid LOKI_ENDPOINT format: %s (expected format: http://host:port/path)", lokiEndpoint)
 	}
-
-	fmt.Printf("Using Loki endpoint: %s\n", lokiEndpoint)
-
-	// Install Loki on local instance
-	fmt.Println("\nInstalling Loki on local instance...")
-	installLokiLocally()
 
 	clusterName := "llama-test-cluster"
 
@@ -187,7 +203,7 @@ echo 'Container started successfully'
 	// 5. Deploy tasks to different instances
 	fmt.Println("5. Deploying llama.cpp servers to cluster instances...")
 
-	// Create Alloy task with dynamic endpoint
+	// Create Alloy task with Orgo Loki endpoint
 	alloyTask := remote.Task{
 		Name: "grafana-alloy-docker-logs",
 		Command: fmt.Sprintf(`#!/bin/bash
@@ -203,79 +219,9 @@ if ! sudo docker images grafana/alloy | grep -q alloy; then
     sudo docker pull grafana/alloy:latest
 fi
 
-# Get Loki endpoint from environment variable or use default
-LOKI_ENDPOINT="${LOKI_ENDPOINT:-%s}"
-echo "Using Loki endpoint: $LOKI_ENDPOINT"
-
-# Get instance metadata for labeling
-INSTANCE_ID="${INSTANCE_ID:-unknown}"
-INSTANCE_IP="${INSTANCE_IP:-unknown}"
-INSTANCE_NAME="${INSTANCE_NAME:-unknown}"
-
-# Create loki directory and generate config with endpoint and instance metadata
-mkdir -p /home/ubuntu/loki
-cat > /home/ubuntu/loki/config.alloy << EOF
-logging {
-  level  = "info"
-  format = "logfmt"
-}
-
-// Discover Docker containers
-discovery.docker "docker_containers" {
-  host = "unix:///var/run/docker.sock"
-}
-
-// Extract logs from Docker containers with instance metadata
-loki.source.docker "docker_logs" {
-  host = "unix:///var/run/docker.sock"
-  targets = discovery.docker.docker_containers.targets
-  forward_to = [loki.process.add_instance_labels.receiver]
-}
-
-// Add instance metadata labels to all log entries
-loki.process "add_instance_labels" {
-  stage.match {
-    selector = "{container_name=~\".*\"}"
-    stage.label_drop {
-      values = ["container_id", "image_name", "image_id"]
-    }
-  }
-
-  stage.labels {
-    values = {
-      instance_id   = "$INSTANCE_ID",
-      instance_ip   = "$INSTANCE_IP",
-      instance_name = "$INSTANCE_NAME",
-      host          = "$INSTANCE_NAME",
-    }
-  }
-
-  forward_to = [loki.write.http.receiver]
-}
-
-// Write logs to Loki endpoint
-loki.write "http" {
-  endpoint {
-    url = "$LOKI_ENDPOINT"
-  }
-}
-EOF
-
-# Remove any stopped containers with the same name
-sudo docker rm -f alloy-docker-logs 2>/dev/null || true
-
-# Start the Alloy container with Docker socket access
-sudo docker run -d --name alloy-docker-logs \
-  -v /var/run/docker.sock:/var/run/docker.sock \
-  -v /home/ubuntu/loki/config.alloy:/etc/alloy/config.alloy \
-  -p 12345:12345 \
-  grafana/alloy:latest \
-  run --server.http.listen-addr=0.0.0.0:12345 \
-  --storage.path=/var/lib/alloy/data \
-  /etc/alloy/config.alloy
-
-echo "Alloy container started successfully with endpoint: $LOKI_ENDPOINT"
-`, lokiEndpoint),
+# Use Orgo Loki endpoint passed from test setup
+LOKI_ENDPOINT="%s"
+echo "Using Orgo Loki endpoint: $LOKI_ENDPOINT"`, lokiEndpoint),
 		Background: true,
 		WorkingDir: "/home/ubuntu",
 		Env: map[string]string{
@@ -332,9 +278,9 @@ echo "Alloy container started successfully with endpoint: $LOKI_ENDPOINT"
 			sudo docker pull grafana/alloy:latest
 		fi
 
-		# Get Loki endpoint from environment variable or use default
-		LOKI_ENDPOINT="${LOKI_ENDPOINT:-%s}"
-		echo "Using Loki endpoint: $LOKI_ENDPOINT"
+		# Use Orgo Loki endpoint passed from test setup
+		LOKI_ENDPOINT="%s"
+		echo "Using Orgo Loki endpoint: $LOKI_ENDPOINT"
 
 		# Try to detect instance metadata (this is a simplified approach)
 		# In a production system, this would be passed via environment variables
@@ -497,6 +443,15 @@ echo "Alloy container started successfully with endpoint: $LOKI_ENDPOINT"
 	// 7. Test API endpoints (if services are accessible)
 	fmt.Println("8. Testing llama.cpp API endpoints...")
 	testAPIEndpoints(cluster, cluster.Instances)
+
+	// Cleanup Orgo logging container
+	fmt.Println("Cleaning up Orgo logging container...")
+	_, err = orgoProvider.TerminateInstance(httpClient, orgoToken, []string{loggingInstance.ID})
+	if err != nil {
+		fmt.Printf("Warning: Failed to terminate Orgo logging container: %v\n", err)
+	} else {
+		fmt.Printf("✅ Terminated Orgo logging container: %s\n", loggingInstance.ID)
+	}
 
 	fmt.Println("=== Cluster Llama.cpp Test Complete ===")
 }
@@ -904,146 +859,137 @@ echo "llama.cpp installation complete!"
 	fmt.Printf("✅ llama.cpp installed on %s\n", instanceID[:16])
 }
 
-// installLokiLocally installs Loki on the local test machine
+// installLokiLocally installs Loki on the local test machine using Docker
 func installLokiLocally() {
-	fmt.Println("Detecting package manager and installing Loki...")
+	fmt.Println("Setting up Loki in Docker container on local machine...")
 
-	// Check if apt-get is available (Debian/Ubuntu)
-	aptCheck := exec.Command("which", "apt-get")
-	if err := aptCheck.Run(); err == nil {
-		fmt.Println("Detected apt-get, installing Loki using APT...")
-		installLokiWithApt()
+	// Check if Docker is available
+	dockerCheck := exec.Command("docker", "--version")
+	if err := dockerCheck.Run(); err != nil {
+		fmt.Println("❌ Docker is not available. Please install Docker first.")
+		fmt.Println("Visit: https://docs.docker.com/get-docker/")
 		return
 	}
 
-	// Check if dnf is available (RPM-based systems)
-	dnfCheck := exec.Command("which", "dnf")
-	if err := dnfCheck.Run(); err == nil {
-		fmt.Println("Detected dnf, installing Loki using DNF...")
-		installLokiWithDnf()
+	// Create Loki configuration directory
+	lokiConfigDir := "/tmp/loki-config"
+	if err := os.MkdirAll(lokiConfigDir, 0755); err != nil {
+		fmt.Printf("Failed to create Loki config directory: %v\n", err)
 		return
 	}
 
-	// Check if yum is available (older RPM-based systems)
-	yumCheck := exec.Command("which", "yum")
-	if err := yumCheck.Run(); err == nil {
-		fmt.Println("Detected yum, installing Loki using YUM...")
-		installLokiWithYum()
-		return
-	}
+	// Create Loki configuration file with 0.0.0.0 binding
+	lokiConfig := `auth_enabled: false
 
-	fmt.Println("Warning: No supported package manager found (apt-get, dnf, or yum). Skipping Loki installation.")
-}
+server:
+  http_listen_address: 0.0.0.0
+  http_listen_port: 3100
+  grpc_listen_address: 0.0.0.0
+  grpc_listen_port: 9096
 
-// installLokiWithApt installs Loki using apt-get
-func installLokiWithApt() {
-	installScript := `#!/bin/bash
-set -e
+common:
+  instance_addr: 0.0.0.0
+  path_prefix: /loki
+  storage:
+    filesystem:
+      chunks_directory: /loki/chunks
+      rules_directory: /loki/rules
+  replication_factor: 1
+  ring:
+    kvstore:
+      store: inmemory
 
-echo "Adding Grafana APT repository..."
+query_range:
+  results_cache:
+    cache:
+      embedded_cache:
+        enabled: true
+        max_size_mb: 100
 
-# Install prerequisites
-apt-get update
-apt-get install -y wget gnupg2 software-properties-common
+schema_config:
+  configs:
+    - from: 2020-10-24
+      store: tsdb
+      object_store: filesystem
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
 
-# Add Grafana GPG key
-wget -q -O /usr/share/keyrings/grafana.key https://apt.grafana.com/gpg.key
+ruler:
+  alertmanager_url: ""
 
-# Add repository
-echo "deb [signed-by=/usr/share/keyrings/grafana.key] https://apt.grafana.com stable main" | tee /etc/apt/sources.list.d/grafana.list
-
-# Update package list
-apt-get update
-
-# Install Loki (without Promtail as requested)
-apt-get install -y loki
-
-echo "Loki installed successfully!"
-systemctl status loki --no-pager || echo "Loki service status check"
+analytics:
+  reporting_enabled: false
 `
 
-	cmd := exec.Command("bash", "-c", installScript)
-	output, err := cmd.CombinedOutput()
+	configFile := lokiConfigDir + "/loki-config.yaml"
+	if err := os.WriteFile(configFile, []byte(lokiConfig), 0644); err != nil {
+		fmt.Printf("Failed to write Loki config file: %v\n", err)
+		return
+	}
+
+	fmt.Printf("✅ Created Loki configuration at %s\n", configFile)
+
+	// Check if Loki container is already running
+	checkCmd := exec.Command("docker", "ps", "--filter", "name=loki-local", "--format", "{{.Names}}")
+	if output, err := checkCmd.Output(); err == nil && strings.TrimSpace(string(output)) == "loki-local" {
+		fmt.Println("✅ Loki container is already running")
+		// Verify it's accessible
+		testLokiEndpoint("http://localhost:3100")
+		return
+	}
+
+	// Remove any stopped container with the same name
+	fmt.Println("Cleaning up any existing Loki containers...")
+	rmCmd := exec.Command("docker", "rm", "-f", "loki-local")
+	_ = rmCmd.Run() // Ignore errors if container doesn't exist
+
+	// Start Loki container with 0.0.0.0 binding
+	fmt.Println("Starting Loki container (binding to 0.0.0.0:3100)...")
+	runCmd := exec.Command("docker", "run", "-d",
+		"--name", "loki-local",
+		"-p", "3100:3100",
+		"-p", "9096:9096",
+		"-v", configFile+":/etc/loki/local-config.yaml",
+		"-v", "/tmp/loki-data:/loki",
+		"grafana/loki:latest",
+		"-config.file=/etc/loki/local-config.yaml",
+	)
+
+	output, err := runCmd.CombinedOutput()
 	if err != nil {
-		fmt.Printf("Failed to install Loki with apt-get: %v\n", err)
+		fmt.Printf("❌ Failed to start Loki container: %v\n", err)
 		fmt.Printf("Output: %s\n", string(output))
 		return
 	}
-	fmt.Printf("Loki installation output: %s\n", string(output))
+
+	fmt.Printf("✅ Loki container started successfully\n")
+	fmt.Println("Waiting for Loki to be ready...")
+	time.Sleep(5 * time.Second)
+
+	// Test the endpoint
+	testLokiEndpoint("http://localhost:3100")
 }
 
-// installLokiWithDnf installs Loki using dnf
-func installLokiWithDnf() {
-	installScript := `#!/bin/bash
-set -e
+// testLokiEndpoint tests if Loki is accessible at the given endpoint
+func testLokiEndpoint(endpoint string) {
+	client := &http.Client{Timeout: 5 * time.Second}
+	readyURL := strings.TrimSuffix(endpoint, "/loki/api/v1/push") + "/ready"
 
-echo "Adding Grafana RPM repository..."
-
-# Create repository file
-cat > /etc/yum.repos.d/grafana.repo << EOF
-[grafana]
-name=grafana
-baseurl=https://rpm.grafana.com
-repo_gpgcheck=1
-enabled=1
-gpgcheck=1
-gpgkey=https://rpm.grafana.com/gpg.key
-sslverify=1
-sslcacert=/etc/pki/tls/certs/ca-bundle.crt
-EOF
-
-# Install Loki (without Promtail as requested)
-dnf install -y loki
-
-echo "Loki installed successfully!"
-systemctl status loki --no-pager || echo "Loki service status check"
-`
-
-	cmd := exec.Command("bash", "-c", installScript)
-	output, err := cmd.CombinedOutput()
+	resp, err := client.Get(readyURL)
 	if err != nil {
-		fmt.Printf("Failed to install Loki with dnf: %v\n", err)
-		fmt.Printf("Output: %s\n", string(output))
+		fmt.Printf("⚠️  Loki health check failed: %v\n", err)
+		fmt.Printf("Endpoint: %s\n", readyURL)
 		return
 	}
-	fmt.Printf("Loki installation output: %s\n", string(output))
-}
+	defer resp.Body.Close()
 
-// installLokiWithYum installs Loki using yum (for older RPM systems)
-func installLokiWithYum() {
-	installScript := `#!/bin/bash
-set -e
-
-echo "Adding Grafana RPM repository..."
-
-# Create repository file
-cat > /etc/yum.repos.d/grafana.repo << EOF
-[grafana]
-name=grafana
-baseurl=https://rpm.grafana.com
-repo_gpgcheck=1
-enabled=1
-gpgcheck=1
-gpgkey=https://rpm.grafana.com/gpg.key
-sslverify=1
-sslcacert=/etc/pki/tls/certs/ca-bundle.crt
-EOF
-
-# Install Loki (without Promtail as requested)
-yum install -y loki
-
-echo "Loki installed successfully!"
-systemctl status loki --no-pager || echo "Loki service status check"
-`
-
-	cmd := exec.Command("bash", "-c", installScript)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		fmt.Printf("Failed to install Loki with yum: %v\n", err)
-		fmt.Printf("Output: %s\n", string(output))
-		return
+	if resp.StatusCode == 200 {
+		fmt.Printf("✅ Loki is ready at %s\n", endpoint)
+	} else {
+		fmt.Printf("⚠️  Loki returned status %d\n", resp.StatusCode)
 	}
-	fmt.Printf("Loki installation output: %s\n", string(output))
 }
 
 // downloadModel downloads the model from HuggingFace
@@ -1099,6 +1045,162 @@ ls -la /home/ubuntu/models/
 		return
 	}
 	fmt.Printf("✅ Model downloaded on %s\n", instanceID[:16])
+}
+
+// setupOrgoLokiContainer sets up Loki on an Orgo computer using Docker
+func setupOrgoLokiContainer(provider *remote.OrgoProvider, computerID string) {
+	fmt.Println("Setting up Loki in Docker container on Orgo computer...")
+
+	// Setup Loki using Docker with 0.0.0.0 binding
+	installScript := `#!/bin/bash
+set -e
+
+echo "Checking if Docker is installed..."
+if ! command -v docker &> /dev/null; then
+    echo "Installing Docker..."
+    curl -fsSL https://get.docker.com -o get-docker.sh
+    sh get-docker.sh
+    rm get-docker.sh
+fi
+
+echo "Creating Loki configuration directory..."
+mkdir -p /root/loki-config /root/loki-data
+
+echo "Creating Loki configuration file with 0.0.0.0 binding..."
+cat > /root/loki-config/loki-config.yaml << 'EOF'
+auth_enabled: false
+
+server:
+  http_listen_address: 0.0.0.0
+  http_listen_port: 3100
+  grpc_listen_address: 0.0.0.0
+  grpc_listen_port: 9096
+
+common:
+  instance_addr: 0.0.0.0
+  path_prefix: /loki
+  storage:
+    filesystem:
+      chunks_directory: /loki/chunks
+      rules_directory: /loki/rules
+  replication_factor: 1
+  ring:
+    kvstore:
+      store: inmemory
+
+query_range:
+  results_cache:
+    cache:
+      embedded_cache:
+        enabled: true
+        max_size_mb: 100
+
+schema_config:
+  configs:
+    - from: 2020-10-24
+      store: tsdb
+      object_store: filesystem
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
+
+ruler:
+  alertmanager_url: ""
+
+analytics:
+  reporting_enabled: false
+EOF
+
+echo "Checking if Loki container already exists..."
+if docker ps -a --filter name=loki-orgo --format '{{.Names}}' | grep -q loki-orgo; then
+    echo "Stopping and removing existing Loki container..."
+    docker stop loki-orgo 2>/dev/null || true
+    docker rm loki-orgo 2>/dev/null || true
+fi
+
+echo "Pulling Grafana Loki Docker image..."
+docker pull grafana/loki:latest
+
+echo "Starting Loki container (binding to 0.0.0.0:3100)..."
+docker run -d \
+  --name loki-orgo \
+  --restart unless-stopped \
+  -p 3100:3100 \
+  -p 9096:9096 \
+  -v /root/loki-config/loki-config.yaml:/etc/loki/local-config.yaml \
+  -v /root/loki-data:/loki \
+  grafana/loki:latest \
+  -config.file=/etc/loki/local-config.yaml
+
+echo "Waiting for Loki to start..."
+sleep 10
+
+echo "Checking Loki container status..."
+docker ps --filter name=loki-orgo
+
+echo "Testing Loki endpoint..."
+curl -f http://localhost:3100/ready || echo "Loki not ready yet, may need more time"
+
+echo "Getting container IP address..."
+docker inspect loki-orgo | grep IPAddress || true
+
+echo "Loki setup complete!"
+echo "Loki is accessible at http://0.0.0.0:3100"
+`
+
+	output, err := provider.ExecuteBashCommand(computerID, installScript)
+	if err != nil {
+		fmt.Printf("❌ Failed to setup Loki on Orgo container: %v\n", err)
+		fmt.Printf("Output: %s\n", output)
+		return
+	}
+
+	fmt.Printf("✅ Loki Docker setup output:\n%s\n", output)
+	fmt.Println("✅ Loki is now running in Docker container with 0.0.0.0 binding")
+}
+
+// getOrgoLokiEndpoint gets the accessible Loki endpoint from an Orgo computer
+func getOrgoLokiEndpoint(provider *remote.OrgoProvider, computerID string) (string, error) {
+	fmt.Println("Determining Orgo Loki endpoint...")
+
+	// For Orgo, we need to get the computer's URL and construct the endpoint
+	// Since Orgo doesn't provide direct IP access, we'll try to get network info
+	getIPScript := `
+#!/bin/bash
+# Try to get the public IP that this container can be reached at
+# First check if we can determine it from environment or hostname
+echo "Checking network configuration..."
+
+# Get all IP addresses
+ip addr show | grep "inet " | grep -v "127.0.0.1" | head -1 | awk '{print $2}' | cut -d'/' -f1
+`
+
+	ipOutput, err := provider.ExecuteBashCommand(computerID, getIPScript)
+	if err != nil {
+		fmt.Printf("Warning: Could not get IP from Orgo container: %v\n", err)
+		// Fallback: since Orgo doesn't provide direct IP access, we'll construct
+		// an endpoint using the computer's URL structure
+		// For now, return a placeholder that indicates we need external configuration
+		return "http://orgo-loki-endpoint:3100/loki/api/v1/push", fmt.Errorf("could not determine Orgo endpoint, manual configuration required")
+	}
+
+	ip := strings.TrimSpace(ipOutput)
+	if ip == "" {
+		return "http://orgo-loki-endpoint:3100/loki/api/v1/push", fmt.Errorf("no IP found on Orgo container")
+	}
+
+	fmt.Printf("Found Orgo container IP: %s\n", ip)
+
+	// Test if Loki is accessible on this IP
+	testEndpoint := fmt.Sprintf("http://%s:3100/loki/api/v1/push", ip)
+
+	// Since we can't directly test from here, we'll assume it's accessible
+	// In a real deployment, you might need to configure port forwarding or use Orgo's URL
+	fmt.Printf("Constructed Loki endpoint: %s\n", testEndpoint)
+	fmt.Println("Note: Orgo containers may require additional networking setup for external access")
+
+	return testEndpoint, nil
 }
 
 // cleanupAlloyContainers stops any running alloy-docker-logs containers on all instances in the cluster

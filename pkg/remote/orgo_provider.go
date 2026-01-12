@@ -104,15 +104,10 @@ func (p *OrgoProvider) LaunchInstance(httpClient *http.Client, apiToken string, 
 		return nil, fmt.Errorf("failed to parse instance type: %w", err)
 	}
 
-	// For Orgo, we'll use a default project name if region is empty
-	projectName := region
-	if projectName == "" {
-		projectName = "default"
-	}
-
-	// Create or ensure project exists
-	if err := p.ensureProjectExists(httpClient, apiToken, projectName); err != nil {
-		return nil, fmt.Errorf("failed to ensure project exists: %w", err)
+	// Get the default project for this API key
+	projectName, err := p.getDefaultProject(httpClient, apiToken)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get default project: %w", err)
 	}
 
 	var instances []LaunchedInstance
@@ -482,6 +477,9 @@ func (p *OrgoProvider) createComputer(httpClient *http.Client, apiToken string, 
 	}
 
 	url := fmt.Sprintf("https://www.orgo.ai/api/projects/%s/computers", projectName)
+	fmt.Printf("DEBUG: Creating computer at URL: %s\n", url)
+	fmt.Printf("DEBUG: Request body: %s\n", string(jsonBody))
+
 	req, err := http.NewRequest("POST", url, strings.NewReader(string(jsonBody)))
 	if err != nil {
 		return "", fmt.Errorf("failed to create request: %w", err)
@@ -495,8 +493,10 @@ func (p *OrgoProvider) createComputer(httpClient *http.Client, apiToken string, 
 	}
 	defer resp.Body.Close()
 
+	body, _ := io.ReadAll(resp.Body)
+	fmt.Printf("DEBUG: Create computer response status: %d, body: %s\n", resp.StatusCode, string(body))
+
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
 		return "", fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
 	}
 
@@ -530,14 +530,11 @@ func (p *OrgoProvider) listProjects(httpClient *http.Client, apiToken string) ([
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
-	}
+	body, _ := io.ReadAll(resp.Body)
+	fmt.Printf("DEBUG: List projects response status: %d, body: %s\n", resp.StatusCode, string(body))
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read response body: %w", err)
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
 	}
 
 	var apiResponse struct {
@@ -550,6 +547,26 @@ func (p *OrgoProvider) listProjects(httpClient *http.Client, apiToken string) ([
 	}
 
 	return apiResponse.Data, nil
+}
+
+// getDefaultProject returns the first available project for the API key
+// Since Orgo API keys are tied to projects, this gets the project automatically
+func (p *OrgoProvider) getDefaultProject(httpClient *http.Client, apiToken string) (string, error) {
+	projects, err := p.listProjects(httpClient, apiToken)
+	if err != nil {
+		return "", fmt.Errorf("failed to list projects: %w", err)
+	}
+
+	if len(projects) == 0 {
+		// If no projects found, try to use a default project name
+		// This can happen when API key is project-scoped
+		defaultProjectName := "default"
+		fmt.Printf("No projects found for API key, trying default project '%s'\n", defaultProjectName)
+		return defaultProjectName, nil
+	}
+
+	// Return the first project (API key is tied to projects)
+	return projects[0].Name, nil
 }
 
 // Stub implementations for methods not applicable to Orgo
