@@ -25,60 +25,9 @@ func TestClusterLlamaCpp(t *testing.T) {
 
 	httpClient := remote.NewHTTPClient()
 	apiToken := os.Getenv("LAMBDA_API_KEY")
-	orgoToken := os.Getenv("ORGO_API_KEY")
 
 	if apiToken == "" {
 		t.Skip("LAMBDA_API_KEY not set, skipping integration test")
-	}
-
-	if orgoToken == "" {
-		t.Skip("ORGO_API_KEY not set, skipping integration test")
-	}
-
-	// Launch Orgo logging container
-	fmt.Println("Launching Orgo logging container...")
-	orgoProvider := remote.NewOrgoProvider()
-
-	// Launch a 4GB Orgo computer for logging
-	loggingInstances, err := orgoProvider.LaunchAndWait(httpClient, orgoToken, "4gb", "", 1, "loki-logger", "", 5*time.Minute, "")
-	if err != nil {
-		t.Fatalf("Failed to launch Orgo logging container: %v", err)
-	}
-
-	if len(loggingInstances) == 0 {
-		t.Fatal("No Orgo logging instances launched")
-	}
-
-	loggingInstance := loggingInstances[0]
-	fmt.Printf("✅ Launched Orgo logging container: %s\n", loggingInstance.ID)
-
-	// Get the logging container's endpoint
-	loggingComputer, err := orgoProvider.GetInstance(httpClient, orgoToken, loggingInstance.ID)
-	if err != nil {
-		t.Fatalf("Failed to get logging computer details: %v", err)
-	}
-
-	// For Orgo, we need to extract the accessible endpoint
-	// Since Orgo provides URLs but not direct IPs, we'll use the computer ID
-	// to construct commands that will help us determine the endpoint
-	fmt.Printf("Logging computer details - ID: %s, Status: %s\n", loggingComputer.ID, loggingComputer.Status)
-
-	// Setup Loki on the Orgo container
-	fmt.Println("Setting up Loki on Orgo logging container...")
-	setupOrgoLokiContainer(orgoProvider, loggingComputer.ID)
-
-	// Get the public endpoint/IP that Lambda instances can connect to
-	lokiEndpoint, err := getOrgoLokiEndpoint(orgoProvider, loggingComputer.ID)
-	if err != nil {
-		t.Fatalf("Failed to get Orgo Loki endpoint: %v", err)
-	}
-
-	fmt.Printf("Using Orgo Loki endpoint: %s\n", lokiEndpoint)
-
-	// Validate endpoint format with regex
-	endpointRegex := `^https?://[^\s/$.?#].[^\s]*$`
-	if matched, _ := regexp.MatchString(endpointRegex, lokiEndpoint); !matched {
-		t.Fatalf("Invalid LOKI_ENDPOINT format: %s (expected format: http://host:port/path)", lokiEndpoint)
 	}
 
 	clusterName := "llama-test-cluster"
@@ -102,6 +51,7 @@ func TestClusterLlamaCpp(t *testing.T) {
 		}
 
 		// Define cluster specification for GPU instances across regions
+		// Name instances gpu-0, gpu-1, gpu-2, etc.
 		clusterSpec := &ClusterSpec{
 			Name: clusterName,
 			Replicas: []ClusterReplicaSpec{
@@ -109,19 +59,19 @@ func TestClusterLlamaCpp(t *testing.T) {
 					InstanceType: "gpu_8x_b200_sxm6",
 					Region:       "australia-east-1",
 					Quantity:     1,
-					Name:         "llama-australia",
+					Name:         "gpu-0",
 				},
 				{
 					InstanceType: "gpu_1x_h100_pcie",
 					Region:       "us-west-3",
 					Quantity:     1,
-					Name:         "llama-west",
+					Name:         "gpu-1",
 				},
 				{
 					InstanceType: "gpu_1x_a100_sxm4",
 					Region:       "us-east-1",
 					Quantity:     1,
-					Name:         "llama-east",
+					Name:         "gpu-2",
 				},
 			},
 		}
@@ -157,8 +107,36 @@ func TestClusterLlamaCpp(t *testing.T) {
 		cleanupAlloyContainers(cluster)
 	}
 
-	// 3. Setup: Check and install llama.cpp if needed
-	fmt.Println("\n3. Setting up llama.cpp on cluster instances...")
+	// 3. Ensure firewall allows Loki port (3100)
+	fmt.Println("\n3. Configuring firewall to allow Loki traffic on port 3100...")
+	if err := ensureLokiFirewallRule(httpClient, apiToken); err != nil {
+		t.Fatalf("Failed to configure firewall for Loki: %v", err)
+	}
+
+	// 4. Setup Loki on the first instance (gpu-0) for centralized logging
+	fmt.Println("\n4. Setting up Loki logging on gpu-0...")
+	loggingInstance := cluster.Instances[0]
+	fmt.Printf("Using instance %s (%s) for Loki logging\n", loggingInstance.Name, loggingInstance.ID[:16])
+
+	// Setup Loki on the logging instance
+	setupLokiOnInstance(cluster, loggingInstance.IP)
+
+	// Get the public IP using ipify
+	lokiEndpoint, err := getLokiEndpointViaIpify(cluster, loggingInstance.IP)
+	if err != nil {
+		t.Fatalf("Failed to get Loki endpoint via ipify: %v", err)
+	}
+
+	fmt.Printf("Using Loki endpoint: %s\n", lokiEndpoint)
+
+	// Validate endpoint format with regex
+	endpointRegex := `^https?://[^\s/$.?#].[^\s]*$`
+	if matched, _ := regexp.MatchString(endpointRegex, lokiEndpoint); !matched {
+		t.Fatalf("Invalid LOKI_ENDPOINT format: %s (expected format: http://host:port/path)", lokiEndpoint)
+	}
+
+	// 5. Setup: Check and install llama.cpp if needed
+	fmt.Println("\n5. Setting up llama.cpp on cluster instances...")
 	hfToken := os.Getenv("HF_TOKEN")
 	if hfToken == "" {
 		fmt.Println("Warning: HF_TOKEN not set, model download may fail")
@@ -166,8 +144,8 @@ func TestClusterLlamaCpp(t *testing.T) {
 
 	setupLlamaCppDocker(cluster, hfToken)
 
-	// 4. Define llama.cpp server tasks for different configurations
-	fmt.Println("\n4. Defining llama.cpp server tasks...")
+	// 6. Define llama.cpp server tasks for different configurations
+	fmt.Println("\n6. Defining llama.cpp server tasks...")
 
 	// Task for a Llama 3.1 8B model running in Docker container with conditional image pulling
 	llama8BTask := remote.Task{
@@ -200,8 +178,8 @@ echo 'Container started successfully'
 		},
 	}
 
-	// 5. Deploy tasks to different instances
-	fmt.Println("5. Deploying llama.cpp servers to cluster instances...")
+	// 7. Deploy tasks to different instances
+	fmt.Println("7. Deploying llama.cpp servers to cluster instances...")
 
 	// Create Alloy task with Orgo Loki endpoint
 	alloyTask := remote.Task{
@@ -394,8 +372,8 @@ echo "Using Orgo Loki endpoint: $LOKI_ENDPOINT"`, lokiEndpoint),
 	}
 	fmt.Println()
 
-	// 5. Check task health (background processes)
-	fmt.Println("6. Checking task health...")
+	// 8. Check task health (background processes)
+	fmt.Println("8. Checking task health...")
 	time.Sleep(10 * time.Second) // Give tasks time to start
 
 	taskHealth := cluster.CheckTaskHealth()
@@ -436,22 +414,13 @@ echo "Using Orgo Loki endpoint: $LOKI_ENDPOINT"`, lokiEndpoint),
 		fmt.Println("⚠️  grafana-alloy-docker-logs is not running")
 	}
 
-	// 6. Test cluster heartbeat
-	fmt.Println("7. Test cluster heartbeat...")
+	// 9. Test cluster heartbeat
+	fmt.Println("9. Test cluster heartbeat...")
 	testClusterHeartbeat(t, cluster)
 
-	// 7. Test API endpoints (if services are accessible)
-	fmt.Println("8. Testing llama.cpp API endpoints...")
+	// 10. Test API endpoints (if services are accessible)
+	fmt.Println("10. Testing llama.cpp API endpoints...")
 	testAPIEndpoints(cluster, cluster.Instances)
-
-	// Cleanup Orgo logging container
-	fmt.Println("Cleaning up Orgo logging container...")
-	_, err = orgoProvider.TerminateInstance(httpClient, orgoToken, []string{loggingInstance.ID})
-	if err != nil {
-		fmt.Printf("Warning: Failed to terminate Orgo logging container: %v\n", err)
-	} else {
-		fmt.Printf("✅ Terminated Orgo logging container: %s\n", loggingInstance.ID)
-	}
 
 	fmt.Println("=== Cluster Llama.cpp Test Complete ===")
 }
@@ -1047,27 +1016,72 @@ ls -la /home/ubuntu/models/
 	fmt.Printf("✅ Model downloaded on %s\n", instanceID[:16])
 }
 
-// setupOrgoLokiContainer sets up Loki on an Orgo computer using Docker
-func setupOrgoLokiContainer(provider *remote.OrgoProvider, computerID string) {
-	fmt.Println("Setting up Loki in Docker container on Orgo computer...")
+// cleanupAlloyContainers stops any running alloy-docker-logs containers on all instances in the cluster
+func cleanupAlloyContainers(cluster *Cluster) {
+	fmt.Println("🧹 Cleaning up any running alloy-docker-logs containers on existing instances...")
+
+	for _, inst := range cluster.Instances {
+		fmt.Printf("Checking instance %s (%s)...\n", inst.Name, inst.ID[:16])
+
+		// Check if alloy container is running
+		checkCommand := "sudo docker ps --filter name=alloy-docker-logs --filter status=running --format '{{.Names}}' 2>/dev/null || true"
+
+		output, err := cluster.sshMgr.ExecuteCommand(inst.IP, checkCommand)
+		if err != nil {
+			fmt.Printf("⚠️  Failed to check alloy containers on %s: %v\n", inst.Name, err)
+			continue
+		}
+
+		if strings.TrimSpace(output) != "" {
+			fmt.Printf("Found running alloy container on %s, stopping it...\n", inst.Name)
+
+			// Stop the alloy container
+			stopCommand := "sudo docker stop alloy-docker-logs 2>/dev/null || true"
+			_, stopErr := cluster.sshMgr.ExecuteCommand(inst.IP, stopCommand)
+			if stopErr != nil {
+				fmt.Printf("⚠️  Failed to stop alloy container on %s: %v\n", inst.Name, stopErr)
+			} else {
+				fmt.Printf("✅ Stopped alloy container on %s\n", inst.Name)
+			}
+
+			// Remove the stopped container
+			rmCommand := "sudo docker rm -f alloy-docker-logs 2>/dev/null || true"
+			_, rmErr := cluster.sshMgr.ExecuteCommand(inst.IP, rmCommand)
+			if rmErr != nil {
+				fmt.Printf("⚠️  Failed to remove alloy container on %s: %v\n", inst.Name, rmErr)
+			}
+		} else {
+			fmt.Printf("No running alloy containers found on %s\n", inst.Name)
+		}
+	}
+
+	fmt.Println("✅ Alloy container cleanup completed")
+}
+
+// setupLokiOnInstance sets up Loki Docker container on a specific cluster instance
+func setupLokiOnInstance(cluster *Cluster, instanceIP string) {
+	fmt.Printf("Setting up Loki in Docker container on instance %s...\n", instanceIP)
 
 	// Setup Loki using Docker with 0.0.0.0 binding
 	installScript := `#!/bin/bash
 set -e
 
-echo "Checking if Docker is installed..."
+echo "Checking if Docker is available..."
 if ! command -v docker &> /dev/null; then
-    echo "Installing Docker..."
+    echo "Docker not found, installing..."
     curl -fsSL https://get.docker.com -o get-docker.sh
-    sh get-docker.sh
+    sudo sh get-docker.sh
     rm get-docker.sh
 fi
 
-echo "Creating Loki configuration directory..."
-mkdir -p /root/loki-config /root/loki-data
+echo "Creating Loki configuration and data directories..."
+sudo mkdir -p /home/ubuntu/loki-config /home/ubuntu/loki-data
+# Loki runs as user 10001 in the container, ensure it can write to data directory
+sudo chown -R 10001:10001 /home/ubuntu/loki-data
+sudo chmod -R 755 /home/ubuntu/loki-data
 
 echo "Creating Loki configuration file with 0.0.0.0 binding..."
-cat > /root/loki-config/loki-config.yaml << 'EOF'
+sudo tee /home/ubuntu/loki-config/loki-config.yaml > /dev/null << 'EOF'
 auth_enabled: false
 
 server:
@@ -1113,45 +1127,52 @@ analytics:
 EOF
 
 echo "Checking if Loki container already exists..."
-if docker ps -a --filter name=loki-orgo --format '{{.Names}}' | grep -q loki-orgo; then
+if sudo docker ps -a --filter name=loki-cluster --format '{{.Names}}' | grep -q loki-cluster; then
     echo "Stopping and removing existing Loki container..."
-    docker stop loki-orgo 2>/dev/null || true
-    docker rm loki-orgo 2>/dev/null || true
+    sudo docker stop loki-cluster 2>/dev/null || true
+    sudo docker rm loki-cluster 2>/dev/null || true
 fi
 
 echo "Pulling Grafana Loki Docker image..."
-docker pull grafana/loki:latest
+sudo docker pull grafana/loki:latest
 
 echo "Starting Loki container (binding to 0.0.0.0:3100)..."
-docker run -d \
-  --name loki-orgo \
+sudo docker run -d \
+  --name loki-cluster \
   --restart unless-stopped \
+  --user 10001:10001 \
   -p 3100:3100 \
   -p 9096:9096 \
-  -v /root/loki-config/loki-config.yaml:/etc/loki/local-config.yaml \
-  -v /root/loki-data:/loki \
+  -v /home/ubuntu/loki-config/loki-config.yaml:/etc/loki/local-config.yaml:ro \
+  -v /home/ubuntu/loki-data:/loki \
   grafana/loki:latest \
   -config.file=/etc/loki/local-config.yaml
 
-echo "Waiting for Loki to start..."
-sleep 10
+echo "Waiting for Loki to start (15 seconds)..."
+sleep 15
 
 echo "Checking Loki container status..."
-docker ps --filter name=loki-orgo
+sudo docker ps --filter name=loki-cluster
+
+echo "Checking container logs..."
+sudo docker logs loki-cluster 2>&1 | tail -20
 
 echo "Testing Loki endpoint..."
-curl -f http://localhost:3100/ready || echo "Loki not ready yet, may need more time"
-
-echo "Getting container IP address..."
-docker inspect loki-orgo | grep IPAddress || true
+for i in 1 2 3 4 5; do
+    if curl -sf http://localhost:3100/ready; then
+        echo "Loki is ready!"
+        break
+    fi
+    echo "Loki not ready yet, attempt $i/5..."
+    sleep 5
+done
 
 echo "Loki setup complete!"
-echo "Loki is accessible at http://0.0.0.0:3100"
 `
 
-	output, err := provider.ExecuteBashCommand(computerID, installScript)
+	output, err := cluster.sshMgr.ExecuteCommandWithTimeout(instanceIP, installScript, 10*time.Minute)
 	if err != nil {
-		fmt.Printf("❌ Failed to setup Loki on Orgo container: %v\n", err)
+		fmt.Printf("❌ Failed to setup Loki on instance: %v\n", err)
 		fmt.Printf("Output: %s\n", output)
 		return
 	}
@@ -1160,87 +1181,80 @@ echo "Loki is accessible at http://0.0.0.0:3100"
 	fmt.Println("✅ Loki is now running in Docker container with 0.0.0.0 binding")
 }
 
-// getOrgoLokiEndpoint gets the accessible Loki endpoint from an Orgo computer
-func getOrgoLokiEndpoint(provider *remote.OrgoProvider, computerID string) (string, error) {
-	fmt.Println("Determining Orgo Loki endpoint...")
+// getLokiEndpointViaIpify gets the public IP of an instance using ipify service
+func getLokiEndpointViaIpify(cluster *Cluster, instanceIP string) (string, error) {
+	fmt.Println("Getting public IP via ipify service...")
 
-	// For Orgo, we need to get the computer's URL and construct the endpoint
-	// Since Orgo doesn't provide direct IP access, we'll try to get network info
-	getIPScript := `
-#!/bin/bash
-# Try to get the public IP that this container can be reached at
-# First check if we can determine it from environment or hostname
-echo "Checking network configuration..."
+	// Use ipify to get the public IP
+	ipifyScript := `curl -s https://api.ipify.org`
 
-# Get all IP addresses
-ip addr show | grep "inet " | grep -v "127.0.0.1" | head -1 | awk '{print $2}' | cut -d'/' -f1
-`
-
-	ipOutput, err := provider.ExecuteBashCommand(computerID, getIPScript)
+	output, err := cluster.sshMgr.ExecuteCommand(instanceIP, ipifyScript)
 	if err != nil {
-		fmt.Printf("Warning: Could not get IP from Orgo container: %v\n", err)
-		// Fallback: since Orgo doesn't provide direct IP access, we'll construct
-		// an endpoint using the computer's URL structure
-		// For now, return a placeholder that indicates we need external configuration
-		return "http://orgo-loki-endpoint:3100/loki/api/v1/push", fmt.Errorf("could not determine Orgo endpoint, manual configuration required")
+		return "", fmt.Errorf("failed to get public IP via ipify: %w", err)
 	}
 
-	ip := strings.TrimSpace(ipOutput)
-	if ip == "" {
-		return "http://orgo-loki-endpoint:3100/loki/api/v1/push", fmt.Errorf("no IP found on Orgo container")
+	publicIP := strings.TrimSpace(output)
+	if publicIP == "" {
+		return "", fmt.Errorf("ipify returned empty IP")
 	}
 
-	fmt.Printf("Found Orgo container IP: %s\n", ip)
+	fmt.Printf("Got public IP from ipify: %s\n", publicIP)
 
-	// Test if Loki is accessible on this IP
-	testEndpoint := fmt.Sprintf("http://%s:3100/loki/api/v1/push", ip)
+	// Construct the Loki endpoint
+	lokiEndpoint := fmt.Sprintf("http://%s:3100/loki/api/v1/push", publicIP)
 
-	// Since we can't directly test from here, we'll assume it's accessible
-	// In a real deployment, you might need to configure port forwarding or use Orgo's URL
-	fmt.Printf("Constructed Loki endpoint: %s\n", testEndpoint)
-	fmt.Println("Note: Orgo containers may require additional networking setup for external access")
+	// Verify Loki is accessible on the public IP
+	verifyScript := fmt.Sprintf(`curl -s -o /dev/null -w "%%{http_code}" http://%s:3100/ready || echo "000"`, publicIP)
+	statusOutput, _ := cluster.sshMgr.ExecuteCommand(instanceIP, verifyScript)
+	statusCode := strings.TrimSpace(statusOutput)
 
-	return testEndpoint, nil
+	if statusCode == "200" {
+		fmt.Printf("✅ Loki is accessible at %s\n", lokiEndpoint)
+	} else {
+		fmt.Printf("⚠️  Loki returned status %s (may need firewall adjustment)\n", statusCode)
+	}
+
+	return lokiEndpoint, nil
 }
 
-// cleanupAlloyContainers stops any running alloy-docker-logs containers on all instances in the cluster
-func cleanupAlloyContainers(cluster *Cluster) {
-	fmt.Println("🧹 Cleaning up any running alloy-docker-logs containers on existing instances...")
+// ensureLokiFirewallRule ensures that port 3100 is open in the firewall for Loki
+func ensureLokiFirewallRule(httpClient *http.Client, apiToken string) error {
+	fmt.Println("Checking current firewall rules...")
 
-	for _, inst := range cluster.Instances {
-		fmt.Printf("Checking instance %s (%s)...\n", inst.Name, inst.ID[:16])
+	// Get current firewall rules
+	ruleset, err := remote.GetGlobalFirewallRules(httpClient, apiToken)
+	if err != nil {
+		return fmt.Errorf("failed to get firewall rules: %w", err)
+	}
 
-		// Check if alloy container is running
-		checkCommand := "sudo docker ps --filter name=alloy-docker-logs --filter status=running --format '{{.Names}}' 2>/dev/null || true"
-
-		output, err := cluster.sshMgr.ExecuteCommand(inst.IP, checkCommand)
-		if err != nil {
-			fmt.Printf("⚠️  Failed to check alloy containers on %s: %v\n", inst.Name, err)
-			continue
-		}
-
-		if strings.TrimSpace(output) != "" {
-			fmt.Printf("Found running alloy container on %s, stopping it...\n", inst.Name)
-
-			// Stop the alloy container
-			stopCommand := "sudo docker stop alloy-docker-logs 2>/dev/null || true"
-			_, stopErr := cluster.sshMgr.ExecuteCommand(inst.IP, stopCommand)
-			if stopErr != nil {
-				fmt.Printf("⚠️  Failed to stop alloy container on %s: %v\n", inst.Name, stopErr)
-			} else {
-				fmt.Printf("✅ Stopped alloy container on %s\n", inst.Name)
+	// Check if port 3100 is already open
+	lokiPort := 3100
+	for _, rule := range ruleset.Rules {
+		if rule.Protocol == "tcp" && len(rule.PortRange) == 2 {
+			if rule.PortRange[0] <= lokiPort && rule.PortRange[1] >= lokiPort {
+				fmt.Printf("✅ Port %d already open in firewall (rule: %s)\n", lokiPort, rule.Description)
+				return nil
 			}
-
-			// Remove the stopped container
-			rmCommand := "sudo docker rm -f alloy-docker-logs 2>/dev/null || true"
-			_, rmErr := cluster.sshMgr.ExecuteCommand(inst.IP, rmCommand)
-			if rmErr != nil {
-				fmt.Printf("⚠️  Failed to remove alloy container on %s: %v\n", inst.Name, rmErr)
-			}
-		} else {
-			fmt.Printf("No running alloy containers found on %s\n", inst.Name)
 		}
 	}
 
-	fmt.Println("✅ Alloy container cleanup completed")
+	// Port 3100 not open, add it
+	fmt.Printf("Adding firewall rule for Loki port %d...\n", lokiPort)
+
+	// Create new rules list with existing rules plus Loki rule
+	newRules := append(ruleset.Rules, remote.FirewallRule{
+		Protocol:      "tcp",
+		PortRange:     []int{lokiPort, lokiPort},
+		SourceNetwork: "0.0.0.0/0",
+		Description:   "Allow Loki logging (port 3100)",
+	})
+
+	// Update firewall rules
+	_, err = remote.UpdateGlobalFirewallRules(httpClient, apiToken, newRules)
+	if err != nil {
+		return fmt.Errorf("failed to update firewall rules: %w", err)
+	}
+
+	fmt.Printf("✅ Firewall rule added for port %d\n", lokiPort)
+	return nil
 }
