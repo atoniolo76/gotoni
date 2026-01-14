@@ -56,8 +56,8 @@ func TestClusterLlamaCpp(t *testing.T) {
 			Name: clusterName,
 			Replicas: []ClusterReplicaSpec{
 				{
-					InstanceType: "gpu_8x_b200_sxm6",
-					Region:       "australia-east-1",
+					InstanceType: "gpu_1x_h100_sxm5",
+					Region:       "us-south-2",
 					Quantity:     1,
 					Name:         "gpu-0",
 				},
