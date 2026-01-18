@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -476,11 +477,10 @@ func (p *OrgoProvider) createComputer(httpClient *http.Client, apiToken string, 
 		return "", fmt.Errorf("failed to marshal request body: %w", err)
 	}
 
-	url := fmt.Sprintf("https://www.orgo.ai/api/projects/%s/computers", projectName)
-	fmt.Printf("DEBUG: Creating computer at URL: %s\n", url)
-	fmt.Printf("DEBUG: Request body: %s\n", string(jsonBody))
+	// Use project name with /computers endpoint per API docs (URL-encode for spaces/special chars)
+	apiURL := fmt.Sprintf("https://www.orgo.ai/api/projects/%s/computers", url.PathEscape(projectName))
 
-	req, err := http.NewRequest("POST", url, strings.NewReader(string(jsonBody)))
+	req, err := http.NewRequest("POST", apiURL, strings.NewReader(string(jsonBody)))
 	if err != nil {
 		return "", fmt.Errorf("failed to create request: %w", err)
 	}
@@ -493,10 +493,8 @@ func (p *OrgoProvider) createComputer(httpClient *http.Client, apiToken string, 
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
-	fmt.Printf("DEBUG: Create computer response status: %d, body: %s\n", resp.StatusCode, string(body))
-
 	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
 		return "", fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
 	}
 
@@ -530,15 +528,18 @@ func (p *OrgoProvider) listProjects(httpClient *http.Client, apiToken string) ([
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
-	fmt.Printf("DEBUG: List projects response status: %d, body: %s\n", resp.StatusCode, string(body))
-
 	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
 		return nil, fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
 	}
 
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %w", err)
+	}
+
 	var apiResponse struct {
-		Data []OrgoProjectResponse `json:"data"`
+		Projects []OrgoProjectResponse `json:"projects"`
 	}
 
 	err = json.Unmarshal(body, &apiResponse)
@@ -546,7 +547,7 @@ func (p *OrgoProvider) listProjects(httpClient *http.Client, apiToken string) ([
 		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
 	}
 
-	return apiResponse.Data, nil
+	return apiResponse.Projects, nil
 }
 
 // getDefaultProject returns the first available project for the API key
@@ -565,7 +566,8 @@ func (p *OrgoProvider) getDefaultProject(httpClient *http.Client, apiToken strin
 		return defaultProjectName, nil
 	}
 
-	// Return the first project (API key is tied to projects)
+	// Use project name for API calls (API uses project name, not ID)
+	fmt.Printf("Found project '%s' with ID '%s', using name for API calls\n", projects[0].Name, projects[0].ID)
 	return projects[0].Name, nil
 }
 
