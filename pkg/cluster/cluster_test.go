@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/atoniolo76/gotoni/pkg/db"
 	"github.com/atoniolo76/gotoni/pkg/remote"
 	"github.com/joho/godotenv"
 )
@@ -30,62 +31,69 @@ func TestClusterLlamaCpp(t *testing.T) {
 		t.Skip("LAMBDA_API_KEY not set, skipping integration test")
 	}
 
-	clusterName := "llama-test-cluster"
+	// Get ALL running instances from the provider
+	fmt.Println("1. Discovering all running instances...")
+	provider, _ := remote.GetCloudProvider()
+	allInstances, err := provider.ListRunningInstances(httpClient, apiToken)
+	if err != nil {
+		t.Fatalf("Failed to list running instances: %v", err)
+	}
 
-	// Try to load existing cluster first
+	if len(allInstances) == 0 {
+		t.Fatal("No running instances found. Please launch some instances first.")
+	}
+
+	fmt.Printf("Found %d running instance(s):\n", len(allInstances))
+	for _, inst := range allInstances {
+		fmt.Printf("  - %s (%s) @ %s [%s]\n", inst.Name, inst.ID[:16], inst.IP, inst.Region.Name)
+	}
+
+	// Create or load cluster with all running instances
+	clusterName := "llama-auto-cluster"
 	cluster, err := GetCluster(httpClient, apiToken, clusterName)
 	if err != nil {
-		fmt.Printf("GetCluster error: %v\n", err)
-	}
-	if err == nil && len(cluster.Instances) > 0 {
-		fmt.Printf("Found existing cluster '%s' with %d running instances\n", clusterName, len(cluster.Instances))
-		for _, inst := range cluster.Instances {
-			fmt.Printf("  - %s (%s) @ %s\n", inst.Name, inst.ID[:16], inst.IP)
+		// Cluster doesn't exist, create a new one
+		fmt.Printf("\nCreating new cluster '%s' with all %d instances...\n", clusterName, len(allInstances))
+
+		// Initialize database for SSH key lookups
+		database, dbErr := db.InitDB()
+		if dbErr != nil {
+			t.Fatalf("Failed to initialize database: %v", dbErr)
+		}
+
+		cluster = &Cluster{
+			Name:      clusterName,
+			Instances: allInstances,
+			sshMgr:    remote.NewSSHClientManager(),
+			database:  database,
 		}
 	} else {
-		// No existing cluster or no instances - launch new one
-		if err != nil {
-			fmt.Printf("No existing cluster '%s' found (error: %v), launching new cluster...\n", clusterName, err)
-		} else {
-			fmt.Printf("Cluster '%s' found but has %d instances, launching new cluster...\n", clusterName, len(cluster.Instances))
+		// Cluster exists, sync it with all running instances
+		fmt.Printf("\nSyncing cluster '%s' with all running instances...\n", clusterName)
+
+		// Build set of existing instance IDs
+		existingIDs := make(map[string]bool)
+		for _, inst := range cluster.Instances {
+			existingIDs[inst.ID] = true
 		}
 
-		// Define cluster specification for GPU instances across regions
-		// Name instances gpu-0, gpu-1, gpu-2, etc.
-		clusterSpec := &ClusterSpec{
-			Name: clusterName,
-			Replicas: []ClusterReplicaSpec{
-				{
-					InstanceType: "gpu_1x_h100_sxm5",
-					Region:       "us-south-2",
-					Quantity:     1,
-					Name:         "gpu-0",
-				},
-				{
-					InstanceType: "gpu_1x_h100_pcie",
-					Region:       "us-west-3",
-					Quantity:     1,
-					Name:         "gpu-1",
-				},
-				{
-					InstanceType: "gpu_1x_a100_sxm4",
-					Region:       "us-east-1",
-					Quantity:     1,
-					Name:         "gpu-2",
-				},
-			},
+		// Add any new instances not already in cluster
+		for _, inst := range allInstances {
+			if !existingIDs[inst.ID] {
+				fmt.Printf("  → Adding instance: %s (%s) @ %s\n", inst.Name, inst.ID[:16], inst.IP)
+				if addErr := cluster.AddInstance(inst); addErr != nil {
+					fmt.Printf("    ⚠️  Failed to add: %v\n", addErr)
+				} else {
+					fmt.Printf("    ✅ Added!\n")
+				}
+			}
 		}
 
-		cluster, err = LaunchClusterFromSpec(httpClient, apiToken, clusterSpec)
-		if err != nil {
-			t.Fatalf("Failed to launch cluster: %v", err)
-		}
-
-		if len(cluster.Instances) == 0 {
-			t.Fatal("No instances launched in cluster")
-		}
-		fmt.Printf("Cluster launched with %d instances\n", len(cluster.Instances))
+		// Update cluster instances to match all running instances
+		cluster.Instances = allInstances
 	}
+
+	fmt.Printf("Cluster '%s' has %d instances\n", clusterName, len(cluster.Instances))
 
 	// 2. Connect to the cluster instances FIRST (required for heartbeat to work)
 	fmt.Println("2. Connecting to cluster instances...")
@@ -95,17 +103,15 @@ func TestClusterLlamaCpp(t *testing.T) {
 	}
 	defer cluster.Disconnect()
 
-	// Wait for healthy instances (requires SSH connection)
-	if err := waitForHealthyCluster(cluster, 3, 10*time.Minute); err != nil {
+	// Wait for all instances to be healthy (requires SSH connection)
+	if err := waitForHealthyCluster(cluster, len(cluster.Instances), 10*time.Minute); err != nil {
 		t.Fatalf("Failed to get healthy cluster: %v", err)
 	}
 
 	fmt.Printf("Connected to %d instances in cluster\n", len(cluster.Instances))
 
 	// Clean up any running alloy containers on existing instances before proceeding
-	if cluster.Name == clusterName { // Only cleanup if using existing cluster
-		cleanupAlloyContainers(cluster)
-	}
+	cleanupAlloyContainers(cluster)
 
 	// 3. Ensure firewall allows Loki port (3100)
 	fmt.Println("\n3. Configuring firewall to allow Loki traffic on port 3100...")
