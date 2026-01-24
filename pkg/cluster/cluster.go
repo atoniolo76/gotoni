@@ -886,6 +886,32 @@ func (c *Cluster) Close() {
 	}
 }
 
+// ExecuteCommand executes a command on a specific instance by IP
+// Returns the command output and any error
+func (c *Cluster) ExecuteCommand(instanceIP string, command string) (string, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if !c.connected {
+		return "", fmt.Errorf("cluster not connected")
+	}
+
+	return c.sshMgr.ExecuteCommand(instanceIP, command)
+}
+
+// ExecuteCommandWithTimeout executes a command on a specific instance with a timeout
+// Returns the command output and any error
+func (c *Cluster) ExecuteCommandWithTimeout(instanceIP string, command string, timeout time.Duration) (string, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if !c.connected {
+		return "", fmt.Errorf("cluster not connected")
+	}
+
+	return c.sshMgr.ExecuteCommandWithTimeout(instanceIP, command, timeout)
+}
+
 // Helper functions for creating common task types
 
 // NewTask creates a new task with the specified parameters
