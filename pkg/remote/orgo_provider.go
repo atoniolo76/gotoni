@@ -48,15 +48,18 @@ type OrgoComputerCreateRequest struct {
 }
 
 type OrgoComputerResponse struct {
-	ID          string `json:"id"`
-	Name        string `json:"name"`
-	ProjectName string `json:"project_name"`
-	OS          string `json:"os"`
-	RAM         int    `json:"ram"`
-	CPU         int    `json:"cpu"`
-	Status      string `json:"status"`
-	URL         string `json:"url"`
-	CreatedAt   string `json:"created_at"`
+	ID           string `json:"id"`
+	Name         string `json:"name"`
+	ProjectName  string `json:"project_name"`
+	OS           string `json:"os"`
+	RAM          int    `json:"ram"`
+	CPU          int    `json:"cpu"`
+	Status       string `json:"status"`
+	URL          string `json:"url"`
+	CreatedAt    string `json:"created_at"`
+	Region       string `json:"region"`
+	InstanceType string `json:"instance_type"`
+	Hostname     string `json:"hostname"`
 }
 
 type OrgoProjectResponse struct {
@@ -239,25 +242,17 @@ func (p *OrgoProvider) WaitForInstanceReady(httpClient *http.Client, apiToken st
 // GetInstance retrieves details for a specific computer
 func (p *OrgoProvider) GetInstance(httpClient *http.Client, apiToken string, instanceID string) (*RunningInstance, error) {
 	url := fmt.Sprintf("https://www.orgo.ai/api/computers/%s", instanceID)
-
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", apiToken))
-
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to execute request: %w", err)
 	}
 	defer resp.Body.Close()
-	var body []byte
-	if resp.StatusCode != http.StatusOK {
-		body, _ = io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
-	}
-
-	body, err = io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read response body: %w", err)
 	}
@@ -265,26 +260,24 @@ func (p *OrgoProvider) GetInstance(httpClient *http.Client, apiToken string, ins
 	var apiResponse struct {
 		Data OrgoComputerResponse `json:"data"`
 	}
-
 	err = json.Unmarshal(body, &apiResponse)
 	if err != nil {
 		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
 	}
-
-	// Convert Orgo response to RunningInstance format
 	runningInstance := &RunningInstance{
 		ID:     apiResponse.Data.ID,
 		Name:   apiResponse.Data.Name,
 		Status: apiResponse.Data.Status,
-		IP:     "", // Orgo doesn't provide direct IP access
-		InstanceType: InstanceType{
-			Name: fmt.Sprintf("%dgb", apiResponse.Data.RAM),
-		},
 		Region: Region{
-			Name: apiResponse.Data.ProjectName,
+			Name:        apiResponse.Data.Region,
+			Description: "",
 		},
+		InstanceType: InstanceType{
+			Name:        apiResponse.Data.InstanceType,
+			Description: "",
+		},
+		Hostname: apiResponse.Data.Hostname,
 	}
-
 	return runningInstance, nil
 }
 
@@ -293,9 +286,11 @@ func (p *OrgoProvider) ListRunningInstances(httpClient *http.Client, apiToken st
 	// First get all projects
 	projects, err := p.listProjects(httpClient, apiToken)
 	if err != nil {
+
 		return nil, fmt.Errorf("failed to list projects: %w", err)
 	}
 
+	var body []byte
 	var allInstances []RunningInstance
 
 	// For each project, list computers
@@ -405,16 +400,13 @@ func (p *OrgoProvider) TerminateInstance(httpClient *http.Client, apiToken strin
 
 // Helper methods
 
-func (p *OrgoProvider) ensureProjectExists(httpClient *http.Client, apiToken string, projectName string) error {
-	// Try to get the project first
-	url := fmt.Sprintf("https://www.orgo.ai/api/projects/by-name/%s", projectName)
-
+func (p *OrgoProvider) checkProjectExists(httpClient *http.Client, apiToken string, projectName string) error {
+	url := fmt.Sprintf("https://www.orgo.ai/api/projects/%s", url.PathEscape(projectName))
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return fmt.Errorf("failed to create request: %w", err)
 	}
 	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", apiToken))
-
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("failed to execute request: %w", err)
@@ -422,7 +414,6 @@ func (p *OrgoProvider) ensureProjectExists(httpClient *http.Client, apiToken str
 	defer resp.Body.Close()
 	var body []byte
 	if resp.StatusCode == http.StatusOK {
-		// Project exists
 		return nil
 	}
 
@@ -431,31 +422,23 @@ func (p *OrgoProvider) ensureProjectExists(httpClient *http.Client, apiToken str
 		return fmt.Errorf("unexpected response when checking project: %s", string(body))
 	}
 
-	// Project doesn't exist, create it
-	return p.createProject(httpClient, apiToken, projectName)
-}
-
-func (p *OrgoProvider) createProject(httpClient *http.Client, apiToken string, projectName string) error {
 	requestBody := OrgoProjectCreateRequest{Name: projectName}
-
 	jsonBody, err := json.Marshal(requestBody)
 	if err != nil {
 		return fmt.Errorf("failed to marshal request body: %w", err)
 	}
-
-	req, err := http.NewRequest("POST", "https://www.orgo.ai/api/projects", strings.NewReader(string(jsonBody)))
+	req, err = http.NewRequest("POST", "https://www.orgo.ai/api/projects", strings.NewReader(string(jsonBody)))
 	if err != nil {
 		return fmt.Errorf("failed to create request: %w", err)
 	}
 	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", apiToken))
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := httpClient.Do(req)
+	resp, err = httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("failed to execute request: %w", err)
 	}
 	defer resp.Body.Close()
-	var body []byte
 	if resp.StatusCode != http.StatusOK {
 		body, _ = io.ReadAll(resp.Body)
 		return fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
@@ -474,7 +457,7 @@ func (p *OrgoProvider) createComputer(httpClient *http.Client, apiToken string, 
 
 	jsonBody, err := json.Marshal(requestBody)
 	if err != nil {
-		return "", fmt.Errorf("failed to marshal request body: %w", err)
+		return "", fmt.Errorf("faied to marshal request body: %w", err)
 	}
 
 	// Use project name with /computers endpoint per API docs (URL-encode for spaces/special chars)
@@ -492,9 +475,8 @@ func (p *OrgoProvider) createComputer(httpClient *http.Client, apiToken string, 
 		return "", fmt.Errorf("failed to execute request: %w", err)
 	}
 	defer resp.Body.Close()
-
-
 	var body []byte
+
 	if resp.StatusCode != http.StatusOK {
 		body, _ = io.ReadAll(resp.Body)
 		return "", fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
