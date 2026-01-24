@@ -77,7 +77,6 @@ config.yaml
 !docs/*.json
 
 # Python files (if any remain)
-*.py
 *.pyc
 __pycache__/
 
