@@ -13,7 +13,6 @@ import (
 
 	"github.com/atoniolo76/gotoni/pkg/db"
 	"github.com/atoniolo76/gotoni/pkg/remote"
-	"github.com/atoniolo76/gotoni/pkg/remote/client"
 	"github.com/joho/godotenv"
 )
 
@@ -809,30 +808,31 @@ func setupGotoniBinaryOnInstance(cluster *Cluster) {
 		// get the current architecture of the system
 		sshMgr := cluster.sshMgr
 
-		arch, err := client.ExecuteTask(sshMgr, inst.IP, remote.Task{
-			Name:       "get current arch",
-			Command:    "python -c 'import platform; print(platform.machine())'",
-			Background: false,
-		}, make(map[string]bool))
+		archOutput, err := sshMgr.ExecuteCommand(inst.IP, "python3 -c 'import platform; print(platform.machine())'")
 		if err != nil {
 			fmt.Printf("❌ Failed to get architecture on %s: %v\n", inst.ID[:16], err)
-			arch = ""
+			archOutput = ""
 		}
 
-		if arch == "x86_64" {
-			arch = "amd64"
-		} else if arch == "arm64" {
-			arch = "arm64"
-		} else if arch == "arch64" || arch == "aarch64" {
-			arch = "arm64"
+		// Clean up the output and map to Go architecture
+		archOutput = strings.TrimSpace(archOutput)
+		var goos, goarch string
+		if archOutput == "x86_64" {
+			goos, goarch = "linux", "amd64"
+		} else if archOutput == "aarch64" || archOutput == "arm64" {
+			goos, goarch = "linux", "arm64"
 		} else {
-			fmt.Printf("❌ Unsupported architecture on %s: %s\n", inst.ID[:16], arch)
-			arch = ""
+			fmt.Printf("❌ Unsupported architecture on %s: %s\n", inst.ID[:16], archOutput)
+			continue
 		}
 
-		buildProcess, err := os.StartProcess("go", []string{"build", "-o", "gotoni-" + arch, "."}, &os.ProcAttr{
-			Dir:   ".",
-			Env:   append(os.Environ(), "GOOS="+arch),
+		fmt.Printf("Building for %s/%s on instance %s\n", goos, goarch, inst.ID[:16])
+
+		buildProcess, err := os.StartProcess("go", []string{"build", "-o", "gotoni-" + goarch, "."}, &os.ProcAttr{
+			Dir: ".",
+			Env: append(os.Environ(),
+				"GOOS="+goos,
+				"GOARCH="+goarch),
 			Files: []*os.File{os.Stdin, os.Stdout, os.Stderr},
 		})
 		if err != nil {
@@ -840,24 +840,36 @@ func setupGotoniBinaryOnInstance(cluster *Cluster) {
 			continue
 		}
 
-		if arch != "" {
-			// copy the binary to the instance
-			copyProcess, err := os.StartProcess("scp", []string{"gotoni-" + arch, "ubuntu@" + inst.IP + ":/home/ubuntu/gotoni-" + arch}, &os.ProcAttr{
-				Dir:   ".",
-				Env:   os.Environ(),
-				Files: []*os.File{os.Stdin, os.Stdout, os.Stderr},
-			})
-			if err != nil {
-				fmt.Printf("❌ Failed to copy gotoni binary to %s: %v\n", inst.ID[:16], err)
-			}
-			_, err = copyProcess.Wait()
-			if err != nil {
-				fmt.Printf("❌ Failed to wait for gotoni binary copy: %v\n", err)
-			}
-			fmt.Printf("✅ gotoni binary copied to %s\n", inst.ID[:16])
-		} else {
-			fmt.Printf("❌ Unsupported architecture on %s: %s\n", inst.ID[:16], arch)
+		// Wait for build to complete
+		_, err = buildProcess.Wait()
+		if err != nil {
+			fmt.Printf("❌ Build process failed on %s: %v\n", inst.ID[:16], err)
+			continue
 		}
+
+		fmt.Printf("✅ Binary built for %s/%s\n", goos, goarch)
+
+		// Copy the binary to the instance
+		binaryName := "gotoni-" + goarch
+		scpArgs := []string{"-o", "StrictHostKeyChecking=no", binaryName, "ubuntu@" + inst.IP + ":/home/ubuntu/" + binaryName}
+
+		copyProcess, err := os.StartProcess("scp", scpArgs, &os.ProcAttr{
+			Dir:   ".",
+			Env:   os.Environ(),
+			Files: []*os.File{os.Stdin, os.Stdout, os.Stderr},
+		})
+		if err != nil {
+			fmt.Printf("❌ Failed to start SCP to %s: %v\n", inst.ID[:16], err)
+			continue
+		}
+
+		_, err = copyProcess.Wait()
+		if err != nil {
+			fmt.Printf("❌ Failed to copy gotoni binary to %s: %v\n", inst.ID[:16], err)
+			continue
+		}
+
+		fmt.Printf("✅ Gotoni binary copied to %s (%s)\n", inst.ID[:16], binaryName)
 	}
 	fmt.Println("✅ gotoni binary installed on all instances")
 }
