@@ -13,6 +13,7 @@ import (
 
 	"github.com/atoniolo76/gotoni/pkg/db"
 	"github.com/atoniolo76/gotoni/pkg/remote"
+	"github.com/atoniolo76/gotoni/pkg/remote/client"
 	"github.com/joho/godotenv"
 )
 
@@ -781,6 +782,84 @@ func setupLlamaCppDocker(cluster *Cluster, hfToken string) {
 		wg.Wait()
 		fmt.Println("✅ All model downloads complete!")
 	}
+}
+
+func setupGotoniBinaryOnInstance(cluster *Cluster) {
+	fmt.Println("setting up gotoni binary on all instances...")
+
+	// first, build gotoni for current binary
+	process, err := os.StartProcess("go", []string{"build", "-o", "gotoni", "."}, &os.ProcAttr{
+		Dir:   ".",
+		Env:   os.Environ(),
+		Files: []*os.File{os.Stdin, os.Stdout, os.Stderr},
+	})
+
+	_, err = process.Wait()
+	if err != nil {
+		fmt.Printf("❌ Failed to wait for gotoni binary build: %v\n", err)
+		return
+	}
+
+	fmt.Println("✅ gotoni binary built successfully")
+
+	// next, build the process for linux amd64 or whatever the instance details
+	for _, inst := range cluster.Instances {
+		fmt.Println("installing gotoni binary on instance %s...", inst.ID)
+
+		// get the current architecture of the system
+		sshMgr := cluster.sshMgr
+
+		arch, err := client.ExecuteTask(sshMgr, inst.IP, remote.Task{
+			Name:       "get current arch",
+			Command:    "python -c 'import platform; print(platform.machine())'",
+			Background: false,
+		}, make(map[string]bool))
+		if err != nil {
+			fmt.Printf("❌ Failed to get architecture on %s: %v\n", inst.ID[:16], err)
+			arch = ""
+		}
+
+		if arch == "x86_64" {
+			arch = "amd64"
+		} else if arch == "arm64" {
+			arch = "arm64"
+		} else if arch == "arch64" || arch == "aarch64" {
+			arch = "arm64"
+		} else {
+			fmt.Printf("❌ Unsupported architecture on %s: %s\n", inst.ID[:16], arch)
+			arch = ""
+		}
+
+		buildProcess, err := os.StartProcess("go", []string{"build", "-o", "gotoni-" + arch, "."}, &os.ProcAttr{
+			Dir:   ".",
+			Env:   append(os.Environ(), "GOOS="+arch),
+			Files: []*os.File{os.Stdin, os.Stdout, os.Stderr},
+		})
+		if err != nil {
+			fmt.Printf("❌ Failed to build gotoni binary on %s: %v\n", inst.ID[:16], err)
+			continue
+		}
+
+		if arch != "" {
+			// copy the binary to the instance
+			copyProcess, err := os.StartProcess("scp", []string{"gotoni-" + arch, "ubuntu@" + inst.IP + ":/home/ubuntu/gotoni-" + arch}, &os.ProcAttr{
+				Dir:   ".",
+				Env:   os.Environ(),
+				Files: []*os.File{os.Stdin, os.Stdout, os.Stderr},
+			})
+			if err != nil {
+				fmt.Printf("❌ Failed to copy gotoni binary to %s: %v\n", inst.ID[:16], err)
+			}
+			_, err = copyProcess.Wait()
+			if err != nil {
+				fmt.Printf("❌ Failed to wait for gotoni binary copy: %v\n", err)
+			}
+			fmt.Printf("✅ gotoni binary copied to %s\n", inst.ID[:16])
+		} else {
+			fmt.Printf("❌ Unsupported architecture on %s: %s\n", inst.ID[:16], arch)
+		}
+	}
+	fmt.Println("✅ gotoni binary installed on all instances")
 }
 
 // installLlamaCpp installs llama.cpp on a specific instance
