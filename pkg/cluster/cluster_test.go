@@ -428,6 +428,44 @@ echo "Using Orgo Loki endpoint: $LOKI_ENDPOINT"`, lokiEndpoint),
 	fmt.Println("10. Testing llama.cpp API endpoints...")
 	testAPIEndpoints(cluster, cluster.Instances)
 
+	// start load balancing processes
+	tasks := setupGotoniBinaryOnInstance(cluster)
+	if tasks == nil {
+		fmt.Println("❌ Failed to setup gotoni binary on instances")
+		return
+	}
+
+	for i, task := range tasks {
+		err := remote.ExecuteTask(cluster.sshMgr, cluster.Instances[i].IP, task, make(map[string]bool))
+		if err != nil {
+			fmt.Printf("❌ Failed to start gotoni load balancer on %s: %v\n", cluster.Instances[i].IP, err)
+		} else {
+			fmt.Printf("✅ Gotoni load balancer started on %s\n", cluster.Instances[i].IP)
+		}
+	}
+
+	// Test load balancers on cluster using the gotoni binary we already have
+	fmt.Println("Testing remote load balancer status...")
+
+	// Build gotoni binary from project root (../../ from pkg/cluster/)
+	fmt.Println("🏗️  Building gotoni binary for test...")
+	buildCmd := exec.Command("go", "build", "-o", "../../gotoni", "../../.")
+	buildCmd.Stdout = os.Stdout
+	buildCmd.Stderr = os.Stderr
+	if err := buildCmd.Run(); err != nil {
+		fmt.Printf("❌ Failed to build gotoni binary: %v\n", err)
+		return
+	}
+
+	// Run lb-remote-status from the built binary
+	statusCmd := exec.Command("../../gotoni", "lb-remote-status", "--all")
+	statusCmd.Stdout = os.Stdout
+	statusCmd.Stderr = os.Stderr
+	if err := statusCmd.Run(); err != nil {
+		fmt.Printf("❌ Failed to test remote load balancers: %v\n", err)
+		return
+	}
+	fmt.Println("✅ Remote load balancers tested successfully")
 	fmt.Println("=== Cluster Llama.cpp Test Complete ===")
 }
 
@@ -783,27 +821,27 @@ func setupLlamaCppDocker(cluster *Cluster, hfToken string) {
 	}
 }
 
-func setupGotoniBinaryOnInstance(cluster *Cluster) {
+func setupGotoniBinaryOnInstance(cluster *Cluster) []remote.Task {
 	fmt.Println("setting up gotoni binary on all instances...")
 
-	// first, build gotoni for current binary
-	process, err := os.StartProcess("go", []string{"build", "-o", "gotoni", "."}, &os.ProcAttr{
-		Dir:   ".",
-		Env:   os.Environ(),
-		Files: []*os.File{os.Stdin, os.Stdout, os.Stderr},
-	})
-
-	_, err = process.Wait()
-	if err != nil {
-		fmt.Printf("❌ Failed to wait for gotoni binary build: %v\n", err)
-		return
+	// first, build gotoni for current platform
+	fmt.Println("Building gotoni for current platform...")
+	buildCmd := exec.Command("go", "build", "-o", "gotoni", ".")
+	buildCmd.Dir = "."
+	buildCmd.Stdout = os.Stdout
+	buildCmd.Stderr = os.Stderr
+	if err := buildCmd.Run(); err != nil {
+		fmt.Printf("❌ Failed to build gotoni binary: %v\n", err)
+		return nil
 	}
 
 	fmt.Println("✅ gotoni binary built successfully")
 
+	out := []remote.Task{}
+
 	// next, build the process for linux amd64 or whatever the instance details
 	for _, inst := range cluster.Instances {
-		fmt.Println("installing gotoni binary on instance %s...", inst.ID)
+		fmt.Printf("installing gotoni binary on instance %s...\n", inst.ID)
 
 		// get the current architecture of the system
 		sshMgr := cluster.sshMgr
@@ -817,61 +855,105 @@ func setupGotoniBinaryOnInstance(cluster *Cluster) {
 		// Clean up the output and map to Go architecture
 		archOutput = strings.TrimSpace(archOutput)
 		var goos, goarch string
-		if archOutput == "x86_64" {
+		switch archOutput {
+		case "x86_64":
 			goos, goarch = "linux", "amd64"
-		} else if archOutput == "aarch64" || archOutput == "arm64" {
+		case "aarch64", "arm64":
 			goos, goarch = "linux", "arm64"
-		} else {
+		default:
 			fmt.Printf("❌ Unsupported architecture on %s: %s\n", inst.ID[:16], archOutput)
 			continue
 		}
 
 		fmt.Printf("Building for %s/%s on instance %s\n", goos, goarch, inst.ID[:16])
 
-		buildProcess, err := os.StartProcess("go", []string{"build", "-o", "gotoni-" + goarch, "."}, &os.ProcAttr{
-			Dir: ".",
-			Env: append(os.Environ(),
-				"GOOS="+goos,
-				"GOARCH="+goarch),
-			Files: []*os.File{os.Stdin, os.Stdout, os.Stderr},
-		})
-		if err != nil {
-			fmt.Printf("❌ Failed to build gotoni binary on %s: %v\n", inst.ID[:16], err)
-			continue
-		}
-
-		// Wait for build to complete
-		_, err = buildProcess.Wait()
-		if err != nil {
-			fmt.Printf("❌ Build process failed on %s: %v\n", inst.ID[:16], err)
+		archName := "gotoni-" + goarch
+		crossBuildCmd := exec.Command("go", "build", "-o", archName, ".")
+		crossBuildCmd.Dir = "."
+		crossBuildCmd.Env = append(os.Environ(), "GOOS="+goos, "GOARCH="+goarch)
+		crossBuildCmd.Stdout = os.Stdout
+		crossBuildCmd.Stderr = os.Stderr
+		if err := crossBuildCmd.Run(); err != nil {
+			fmt.Printf("❌ Failed to build gotoni binary for %s/%s: %v\n", goos, goarch, err)
 			continue
 		}
 
 		fmt.Printf("✅ Binary built for %s/%s\n", goos, goarch)
 
-		// Copy the binary to the instance
-		binaryName := "gotoni-" + goarch
-		scpArgs := []string{"-o", "StrictHostKeyChecking=no", binaryName, "ubuntu@" + inst.IP + ":/home/ubuntu/" + binaryName}
+		// Get SSH key path for this instance
+		var sshKeyPath string
+		if len(inst.SSHKeyNames) > 0 {
+			sshKeyName := inst.SSHKeyNames[0]
+			sshKey, err := cluster.database.GetSSHKey(sshKeyName)
+			if err != nil {
+				fmt.Printf("❌ Failed to get SSH key %s for %s: %v\n", sshKeyName, inst.ID[:16], err)
+				continue
+			}
+			sshKeyPath = sshKey.PrivateKey
+			fmt.Printf("🔑 Using SSH key: %s\n", sshKeyPath)
+		} else {
+			fmt.Printf("❌ No SSH key found for instance %s\n", inst.ID[:16])
+			continue
+		}
 
-		copyProcess, err := os.StartProcess("scp", scpArgs, &os.ProcAttr{
-			Dir:   ".",
-			Env:   os.Environ(),
-			Files: []*os.File{os.Stdin, os.Stdout, os.Stderr},
+		// Copy the binary to the instance using SCP with the SSH key
+		remotePath := "/home/ubuntu/" + archName
+		fmt.Printf("📤 Copying %s to %s:%s via SCP...\n", archName, inst.IP, remotePath)
+
+		scpCmd := exec.Command("scp",
+			"-i", sshKeyPath,
+			"-o", "StrictHostKeyChecking=no",
+			"-o", "UserKnownHostsFile=/dev/null",
+			archName,
+			fmt.Sprintf("ubuntu@%s:%s", inst.IP, remotePath),
+		)
+		scpCmd.Stdout = os.Stdout
+		scpCmd.Stderr = os.Stderr
+		fmt.Printf("🔧 Running: scp -i %s -o StrictHostKeyChecking=no %s ubuntu@%s:%s\n",
+			sshKeyPath, archName, inst.IP, remotePath)
+
+		if err := scpCmd.Run(); err != nil {
+			fmt.Printf("❌ Failed to SCP binary to %s: %v\n", inst.ID[:16], err)
+			continue
+		}
+
+		// Make executable
+		chmodCmd := fmt.Sprintf("chmod +x %s", remotePath)
+		if _, err := sshMgr.ExecuteCommand(inst.IP, chmodCmd); err != nil {
+			fmt.Printf("❌ Failed to chmod +x on %s: %v\n", inst.ID[:16], err)
+			continue
+		}
+
+		// Verify the binary was copied correctly
+		verifyCmd := fmt.Sprintf("ls -la %s && file %s", remotePath, remotePath)
+		verifyOutput, err := sshMgr.ExecuteCommand(inst.IP, verifyCmd)
+		if err != nil {
+			fmt.Printf("❌ Failed to verify binary on %s: %v\n", inst.ID[:16], err)
+			continue
+		}
+		fmt.Printf("✅ Binary copied and verified on %s:\n%s\n", inst.ID[:16], verifyOutput)
+
+		out = append(out, remote.Task{
+			Name:       "start gotoni load balancer",
+			Command:    "/home/ubuntu/" + archName + " lb start --listen-port 8000 --local-port 8080",
+			Background: true,
+			WorkingDir: "/home/ubuntu",
 		})
-		if err != nil {
-			fmt.Printf("❌ Failed to start SCP to %s: %v\n", inst.ID[:16], err)
-			continue
-		}
-
-		_, err = copyProcess.Wait()
-		if err != nil {
-			fmt.Printf("❌ Failed to copy gotoni binary to %s: %v\n", inst.ID[:16], err)
-			continue
-		}
-
-		fmt.Printf("✅ Gotoni binary copied to %s (%s)\n", inst.ID[:16], binaryName)
 	}
+
+	// Open port 8000 for load balancer (global firewall, only need to do once)
+	fmt.Println("Opening port 8000 in firewall for load balancer...")
+	provider, _ := remote.GetCloudProvider()
+	httpClient := remote.NewHTTPClient()
+	apiToken := remote.GetAPIToken()
+	if err := provider.EnsurePortOpen(httpClient, apiToken, 8000, "tcp", "Allow Load Balancer (port 8000)"); err != nil {
+		fmt.Printf("⚠️  Failed to open port 8000: %v\n", err)
+	} else {
+		fmt.Println("✅ Port 8000 opened in firewall")
+	}
+
 	fmt.Println("✅ gotoni binary installed on all instances")
+	return out
 }
 
 // installLlamaCpp installs llama.cpp on a specific instance

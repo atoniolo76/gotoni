@@ -317,6 +317,11 @@ func runLBRemoteStatus(cmd *cobra.Command, args []string) {
 
 		if err != nil || strings.TrimSpace(output) == "" {
 			fmt.Printf("❌ %s (%s): Load balancer NOT running\n", inst.Name, inst.IP)
+
+			// Debug: check if process exists and port is listening
+			debugCmd := fmt.Sprintf("echo '--- Processes ---' && ps aux | grep -E 'gotoni|lb' | grep -v grep; echo '--- Port %d ---' && ss -tlnp | grep %d || echo 'Port %d not listening'; echo '--- Tmux sessions ---' && tmux list-sessions 2>/dev/null || echo 'No tmux sessions'", port, port, port)
+			debugOutput, _ := sshMgr.ExecuteCommand(inst.IP, debugCmd)
+			fmt.Printf("   Debug info:\n%s\n", debugOutput)
 			continue
 		}
 
