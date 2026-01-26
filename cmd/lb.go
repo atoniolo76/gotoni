@@ -9,7 +9,6 @@ package cmd
 import (
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"os"
@@ -41,11 +40,11 @@ Examples:
   # Start with config file
   gotoni lb start --config lb-config.json
 
-  # Check load balancer status
-  gotoni lb status
+	# Check if load balancer is responding
+	gotoni lb status
 
-  # Stop load balancer (sends SIGTERM)
-  gotoni lb stop`,
+	# Stop load balancer (sends SIGTERM)
+	gotoni lb stop`,
 }
 
 // lbStartCmd starts the load balancer
@@ -72,11 +71,11 @@ var lbStopCmd = &cobra.Command{
 	Run:   runLBStop,
 }
 
-// lbStatusCmd checks load balancer status
+// lbStatusCmd checks if load balancer is responding
 var lbStatusCmd = &cobra.Command{
 	Use:   "status",
-	Short: "Check load balancer status",
-	Long:  `Query the load balancer's /lb/status endpoint to check if it's running and healthy.`,
+	Short: "Check if load balancer is responding",
+	Long:  `Check if the load balancer is running and responding to requests.`,
 	Run:   runLBStatus,
 }
 
@@ -88,16 +87,11 @@ func init() {
 
 	// Flags for lb start
 	lbStartCmd.Flags().String("config", "", "Path to JSON config file")
-	lbStartCmd.Flags().String("node-id", "", "Unique node identifier (defaults to hostname)")
-	lbStartCmd.Flags().Int("local-port", 8080, "Port of the local backend service")
+	lbStartCmd.Flags().Int("local-port", 8080, "Port of the local SGLang backend service")
 	lbStartCmd.Flags().Int("listen-port", 8000, "Port for the load balancer to listen on")
-	lbStartCmd.Flags().Int("peer-port", 8000, "Port that peer load balancers listen on")
 	lbStartCmd.Flags().Int("max-concurrent", 10, "Max concurrent requests before forwarding to peers")
-	lbStartCmd.Flags().String("strategy", "least-loaded", "Load balancing strategy: least-loaded, round-robin, random")
 	lbStartCmd.Flags().Bool("queue-enabled", true, "Enable request queuing when all nodes at capacity")
-	lbStartCmd.Flags().Int("max-queue-size", 100, "Maximum queue size")
 	lbStartCmd.Flags().Duration("queue-timeout", 30*time.Second, "Queue timeout")
-	lbStartCmd.Flags().Duration("health-check-interval", 5*time.Second, "Health check interval")
 	lbStartCmd.Flags().Duration("request-timeout", 30*time.Second, "Request timeout for forwarded requests")
 	lbStartCmd.Flags().StringSlice("peers", []string{}, "Peer addresses in format ip:port (can specify multiple)")
 	lbStartCmd.Flags().String("pid-file", "/tmp/gotoni-lb.pid", "Path to PID file")
@@ -127,48 +121,23 @@ func runLBStart(cmd *cobra.Command, args []string) {
 	}
 
 	// Override with flags if provided
-	if cmd.Flags().Changed("node-id") {
-		config.NodeID, _ = cmd.Flags().GetString("node-id")
-	}
 	if cmd.Flags().Changed("local-port") {
-		config.LocalPort, _ = cmd.Flags().GetInt("local-port")
+		config.ApplicationPort, _ = cmd.Flags().GetInt("local-port")
 	}
 	if cmd.Flags().Changed("listen-port") {
-		config.ListenPort, _ = cmd.Flags().GetInt("listen-port")
-	}
-	if cmd.Flags().Changed("peer-port") {
-		config.PeerPort, _ = cmd.Flags().GetInt("peer-port")
+		config.LoadBalancerPort, _ = cmd.Flags().GetInt("listen-port")
 	}
 	if cmd.Flags().Changed("max-concurrent") {
 		config.MaxConcurrentRequests, _ = cmd.Flags().GetInt("max-concurrent")
 	}
-	if cmd.Flags().Changed("strategy") {
-		config.Strategy, _ = cmd.Flags().GetString("strategy")
-	}
 	if cmd.Flags().Changed("queue-enabled") {
 		config.QueueEnabled, _ = cmd.Flags().GetBool("queue-enabled")
-	}
-	if cmd.Flags().Changed("max-queue-size") {
-		config.MaxQueueSize, _ = cmd.Flags().GetInt("max-queue-size")
 	}
 	if cmd.Flags().Changed("queue-timeout") {
 		config.QueueTimeout, _ = cmd.Flags().GetDuration("queue-timeout")
 	}
-	if cmd.Flags().Changed("health-check-interval") {
-		config.HealthCheckInterval, _ = cmd.Flags().GetDuration("health-check-interval")
-	}
 	if cmd.Flags().Changed("request-timeout") {
 		config.RequestTimeout, _ = cmd.Flags().GetDuration("request-timeout")
-	}
-
-	// Default node ID to hostname if not set
-	if config.NodeID == "" {
-		hostname, err := os.Hostname()
-		if err != nil {
-			config.NodeID = fmt.Sprintf("node-%d", os.Getpid())
-		} else {
-			config.NodeID = hostname
-		}
 	}
 
 	// Write PID file
@@ -181,8 +150,8 @@ func runLBStart(cmd *cobra.Command, args []string) {
 		}
 	}
 
-	// Create load balancer
-	lb := serve.NewNodeLoadBalancer(config)
+	// Create load balancer (self=nil for standalone usage)
+	lb := serve.NewLoadBalancer(config, nil)
 
 	// Add peers if specified
 	peers, _ := cmd.Flags().GetStringSlice("peers")
@@ -205,12 +174,11 @@ func runLBStart(cmd *cobra.Command, args []string) {
 
 	// Print startup info
 	fmt.Printf("Starting load balancer:\n")
-	fmt.Printf("  Node ID:          %s\n", config.NodeID)
-	fmt.Printf("  Listen port:      %d\n", config.ListenPort)
-	fmt.Printf("  Local backend:    localhost:%d\n", config.LocalPort)
+	fmt.Printf("  Listen port:      %d\n", config.LoadBalancerPort)
+	fmt.Printf("  Local SGLang:     localhost:%d\n", config.ApplicationPort)
 	fmt.Printf("  Max concurrent:   %d\n", config.MaxConcurrentRequests)
-	fmt.Printf("  Strategy:         %s\n", config.Strategy)
 	fmt.Printf("  Queue enabled:    %v\n", config.QueueEnabled)
+	fmt.Printf("  Metrics polling:  %v\n", config.MetricsEnabled)
 	fmt.Printf("  PID file:         %s\n", pidFile)
 	fmt.Println()
 
@@ -252,87 +220,25 @@ func runLBStatus(cmd *cobra.Command, args []string) {
 	host, _ := cmd.Flags().GetString("host")
 	port, _ := cmd.Flags().GetInt("port")
 
-	statusURL := fmt.Sprintf("http://%s:%d/lb/status", host, port)
-	metricsURL := fmt.Sprintf("http://%s:%d/lb/metrics", host, port)
-	peersURL := fmt.Sprintf("http://%s:%d/lb/peers", host, port)
+	// Try to connect to the load balancer
+	testURL := fmt.Sprintf("http://%s:%d/", host, port)
+	client := &http.Client{Timeout: 5 * time.Second}
 
 	fmt.Printf("Checking load balancer at %s:%d...\n\n", host, port)
 
-	client := &http.Client{Timeout: 5 * time.Second}
-
-	// Check status
-	fmt.Println("=== Status ===")
-	resp, err := client.Get(statusURL)
+	// Basic connectivity check
+	resp, err := client.Get(testURL)
 	if err != nil {
 		fmt.Printf("❌ Load balancer is NOT running or unreachable: %v\n", err)
+		fmt.Printf("   Make sure the load balancer is started with 'gotoni lb start'\n")
 		os.Exit(1)
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
-	var status serve.PeerStatus
-	if err := json.Unmarshal(body, &status); err != nil {
-		fmt.Printf("Raw response: %s\n", string(body))
-	} else {
-		fmt.Printf("✅ Load balancer is running\n")
-		fmt.Printf("  Node ID:       %s\n", status.NodeID)
-		fmt.Printf("  Current Load:  %d / %d\n", status.CurrentLoad, status.MaxLoad)
-		fmt.Printf("  Queue Size:    %d\n", status.QueueSize)
-		fmt.Printf("  Healthy:       %v\n", status.Healthy)
-	}
+	fmt.Printf("✅ Load balancer is responding (HTTP %d)\n", resp.StatusCode)
 
-	// Check metrics
-	fmt.Println("\n=== Metrics ===")
-	resp, err = client.Get(metricsURL)
-	if err != nil {
-		fmt.Printf("Failed to get metrics: %v\n", err)
-	} else {
-		defer resp.Body.Close()
-		body, _ = io.ReadAll(resp.Body)
-		var metrics serve.LoadBalancerMetrics
-		if err := json.Unmarshal(body, &metrics); err != nil {
-			fmt.Printf("Raw response: %s\n", string(body))
-		} else {
-			fmt.Printf("  Total Requests:     %d\n", metrics.TotalRequests)
-			fmt.Printf("  Local Requests:     %d\n", metrics.LocalRequests)
-			fmt.Printf("  Forwarded Requests: %d\n", metrics.ForwardedRequests)
-			fmt.Printf("  Queued Requests:    %d\n", metrics.QueuedRequests)
-			fmt.Printf("  Dropped Requests:   %d\n", metrics.DroppedRequests)
-			fmt.Printf("  Failed Forwards:    %d\n", metrics.FailedForwards)
-			fmt.Printf("  Avg Response Time:  %.2f ms\n", metrics.AvgResponseTimeMs)
-			fmt.Printf("  Peak Concurrent:    %d\n", metrics.PeakConcurrent)
-		}
-	}
-
-	// Check peers
-	fmt.Println("\n=== Peers ===")
-	resp, err = client.Get(peersURL)
-	if err != nil {
-		fmt.Printf("Failed to get peers: %v\n", err)
-	} else {
-		defer resp.Body.Close()
-		body, _ = io.ReadAll(resp.Body)
-		var peers []*serve.PeerNode
-		if err := json.Unmarshal(body, &peers); err != nil {
-			fmt.Printf("Raw response: %s\n", string(body))
-		} else if len(peers) == 0 {
-			fmt.Printf("  No peers configured\n")
-		} else {
-			for _, peer := range peers {
-				healthStatus := "❌"
-				if peer.Healthy {
-					healthStatus = "✅"
-				}
-				fmt.Printf("  %s %s (%s:%d) - Load: %d/%d, Response: %dms\n",
-					healthStatus,
-					peer.Instance.ID[:16],
-					peer.Instance.IP,
-					peer.Port,
-					peer.CurrentLoad,
-					peer.MaxLoad,
-					peer.ResponseTimeMs,
-				)
-			}
-		}
-	}
+	// Since the new load balancer doesn't have status endpoints,
+	// we can only confirm it's responding to requests
+	fmt.Printf("\nNote: Detailed status/metrics not available in new SGLang-integrated version\n")
+	fmt.Printf("The load balancer is running and can handle requests.\n")
 }

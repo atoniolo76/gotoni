@@ -1,22 +1,24 @@
 /*
 Copyright © 2025 ALESSIO TONIOLO
 
-loadbalancer.go implements a distributed load balancer that runs on each node.
+load_balancer.go implements a distributed load balancer that runs on each node.
 When a node reaches its max concurrent requests threshold, it forwards
 requests to other healthy nodes in the cluster.
+
+Metrics polling is handled in sglang_metrics.go
 */
 package serve
 
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -24,107 +26,263 @@ import (
 	"github.com/atoniolo76/gotoni/pkg/remote"
 )
 
+// LoadBalancingStrategy defines the interface for load balancing algorithms
+type LoadBalancingStrategy interface {
+	Select(peers []*PeerNode, availabilityMap map[*PeerNode]AvailabilityStatus, requestPath string) *PeerNode
+}
+
 // LoadBalancerConfig configures the distributed load balancer
 type LoadBalancerConfig struct {
-	// MaxConcurrentRequests is the threshold before forwarding to peers
-	MaxConcurrentRequests int `json:"max_concurrent_requests"`
+	MaxConcurrentRequests int                   `json:"max_concurrent_requests"`
+	ApplicationPort       int                   `json:"application_port"`
+	LoadBalancerPort      int                   `json:"load_balancer_port"`
+	RequestTimeout        time.Duration         `json:"request_timeout"`
+	QueueEnabled          bool                  `json:"queue_enabled"`
+	QueueTimeout          time.Duration         `json:"queue_timeout"`
+	Strategy              LoadBalancingStrategy `json:"-"` // Not serializable
 
-	// LocalPort is the port the local backend service listens on
-	LocalPort int `json:"local_port"`
-
-	// ListenPort is the port the load balancer listens on
-	ListenPort int `json:"listen_port"`
-
-	// PeerPort is the port other nodes' load balancers listen on (usually same as ListenPort)
-	PeerPort int `json:"peer_port"`
-
-	// HealthCheckInterval is how often to check peer health
-	HealthCheckInterval time.Duration `json:"health_check_interval"`
-
-	// HealthCheckTimeout is the timeout for health check requests
-	HealthCheckTimeout time.Duration `json:"health_check_timeout"`
-
-	// RequestTimeout is the timeout for forwarded requests
-	RequestTimeout time.Duration `json:"request_timeout"`
-
-	// Strategy is the load balancing strategy: "round-robin", "least-loaded", "random"
-	Strategy string `json:"strategy"`
-
-	// QueueEnabled enables request queuing when all nodes are at capacity
-	QueueEnabled bool `json:"queue_enabled"`
-
-	// MaxQueueSize is the maximum number of requests to queue
-	MaxQueueSize int `json:"max_queue_size"`
-
-	// QueueTimeout is how long a request can wait in queue
-	QueueTimeout time.Duration `json:"queue_timeout"`
-
-	// NodeID is a unique identifier for this node
-	NodeID string `json:"node_id"`
-
-	// HealthEndpoint is the path to check for health (default: /health)
-	HealthEndpoint string `json:"health_endpoint"`
-
-	// MetricsEnabled enables metrics collection
-	MetricsEnabled bool `json:"metrics_enabled"`
+	// SGLang metrics polling (see sglang_metrics.go for polling logic)
+	MetricsEnabled      bool          `json:"metrics_enabled"`
+	MetricsPollInterval time.Duration `json:"metrics_poll_interval"`
+	MetricsEndpoint     string        `json:"metrics_endpoint"`
+	MetricsTimeout      time.Duration `json:"metrics_timeout"`
+	UnhealthyThreshold  int           `json:"unhealthy_threshold"`
+	GPUCacheThreshold   float64       `json:"gpu_cache_threshold"`
 }
 
 // DefaultLoadBalancerConfig returns sensible defaults
 func DefaultLoadBalancerConfig() *LoadBalancerConfig {
+	metricsConfig := DefaultMetricsConfig()
 	return &LoadBalancerConfig{
 		MaxConcurrentRequests: 10,
-		LocalPort:             8080,
-		ListenPort:            8000,
-		PeerPort:              8000,
-		HealthCheckInterval:   5 * time.Second,
-		HealthCheckTimeout:    2 * time.Second,
+		ApplicationPort:       8080,
+		LoadBalancerPort:      8000,
 		RequestTimeout:        30 * time.Second,
-		Strategy:              "least-loaded",
 		QueueEnabled:          true,
-		MaxQueueSize:          100,
 		QueueTimeout:          30 * time.Second,
-		NodeID:                "",
-		HealthEndpoint:        "/health",
-		MetricsEnabled:        true,
+		Strategy:              &LeastLoadedPolicy{},
+
+		// SGLang metrics config
+		MetricsEnabled:      metricsConfig.Enabled,
+		MetricsPollInterval: metricsConfig.PollInterval,
+		MetricsEndpoint:     metricsConfig.Endpoint,
+		MetricsTimeout:      metricsConfig.Timeout,
+		UnhealthyThreshold:  metricsConfig.UnhealthyThreshold,
+		GPUCacheThreshold:   metricsConfig.GPUCacheThreshold,
 	}
 }
 
-// LoadBalancerPolicy defines the interface for peer selection strategies
-type LoadBalancerPolicy interface {
-	// Select chooses a peer from the available peers
-	Select(peers []*PeerNode) *PeerNode
-	// Name returns the name of the policy
-	Name() string
-}
-
-// LeastLoadedPolicy selects the peer with the lowest current load
 type LeastLoadedPolicy struct{}
 
-func (p *LeastLoadedPolicy) Name() string {
-	return "least-loaded"
+type PrefixTreePolicy struct {
+	mu   sync.RWMutex
+	root *prefixNode
 }
 
-func (p *LeastLoadedPolicy) Select(peers []*PeerNode) *PeerNode {
+type prefixNode struct {
+	children map[byte]*prefixNode
+	peers    []*PeerNode
+	prefix   string // variable length
+}
+
+type AvailabilityStatus struct {
+	Available       bool
+	RunningRequests int     // Actual requests in GPU batch (from SGLang)
+	WaitingRequests int     // Actual queued requests (from SGLang)
+	TotalRequests   int     // Running + Waiting
+	GPUCacheUsage   float64 // KV cache utilization
+	Healthy         bool    // Whether the peer is responding
+}
+
+type MatchedPrefixNodes struct {
+	node      prefixNode
+	matchRate float64
+}
+
+func NewPrefixTreePolicy() *PrefixTreePolicy {
+	return &PrefixTreePolicy{
+		root: &prefixNode{
+			children: make(map[byte]*prefixNode),
+			peers:    []*PeerNode{},
+			prefix:   "",
+		},
+	}
+}
+
+func (p *PrefixTreePolicy) Select(peers []*PeerNode, availabilityMap map[*PeerNode]AvailabilityStatus, requestPath string) *PeerNode {
+	if p.root == nil {
+		// No existing prefix trie (first request), fall back to least-loaded
+		return (&LeastLoadedPolicy{}).Select(peers, availabilityMap, requestPath)
+	}
+
+	if len(requestPath) == 0 {
+		return nil
+	}
+
+	matches := []MatchedPrefixNodes{}
+	currentNode := p.root
+
+	i := 0
+	for i < len(requestPath) {
+		currentChar := requestPath[i]
+		remainingText := requestPath[i:]
+		lookup, ok := currentNode.children[currentChar]
+		if !ok {
+			break
+		}
+
+		currentNode = lookup
+		sharedLen := sharedPrefixLength(remainingText, lookup.prefix)
+		i += sharedLen
+
+		// Check if this node has available replicas
+		availablePeers := []*PeerNode{}
+		for _, peerNode := range lookup.peers {
+			if status, ok := availabilityMap[peerNode]; ok && status.Available && status.Healthy {
+				availablePeers = append(availablePeers, peerNode)
+			}
+		}
+
+		if len(availablePeers) > 0 {
+			matchRate := float64(i) / float64(len(requestPath))
+			node := prefixNode{
+				prefix: lookup.prefix,
+				peers:  availablePeers,
+			}
+			matches = append(matches, MatchedPrefixNodes{
+				node:      node,
+				matchRate: matchRate,
+			})
+		}
+
+		if sharedLen < len(lookup.prefix) {
+			// partial match, no need to search further
+			break
+		}
+	}
+	sort.Slice(matches, func(i2, j int) bool {
+		return matches[i2].matchRate > matches[j].matchRate
+	})
+
+	if len(matches) > 0 {
+		bestPeer := matches[0].node.peers[0]
+		bestPeer.CurrentLoad++
+		return bestPeer
+	}
+
+	return nil
+}
+
+func (p *PrefixTreePolicy) Insert(prefix string, peer *PeerNode) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if len(prefix) == 0 {
+		return
+	}
+
+	currentNode := p.root
+
+	i := 0
+
+	// TODO note this for loop never hits its own exit condition bc of :262
+	for i < len(prefix) {
+		currentChar := prefix[i]
+		remainingText := prefix[i:]
+		lookup, ok := currentNode.children[currentChar]
+
+		if !ok {
+			// No child exists — create new node with entire remaining string
+			newNode := &prefixNode{
+				children: make(map[byte]*prefixNode),
+				peers:    []*PeerNode{peer},
+				prefix:   remainingText,
+			}
+			currentNode.children[currentChar] = newNode
+			return
+		}
+
+		sharedLen := sharedPrefixLength(remainingText, lookup.prefix)
+
+		if sharedLen < len(lookup.prefix) {
+			matchingPart := lookup.prefix[:sharedLen]
+			oldRemainingPart := lookup.prefix[sharedLen:]
+
+			newNode := &prefixNode{
+				children: make(map[byte]*prefixNode),
+				peers:    []*PeerNode{peer},
+				prefix:   matchingPart,
+			}
+
+			lookup.prefix = oldRemainingPart
+			lookup.children[oldRemainingPart[0]] = lookup
+			currentNode.children[currentChar] = newNode
+
+			i += sharedLen
+
+			if len(remainingText[i:]) > 0 {
+				finalNode := &prefixNode{
+					children: make(map[byte]*prefixNode),
+					peers:    []*PeerNode{peer},
+					prefix:   remainingText[i:],
+				}
+				newNode.children[finalNode.prefix[0]] = finalNode
+			}
+			return
+		}
+
+		i += sharedLen
+		if i >= len(prefix) {
+			lookup.peers = append(lookup.peers, peer)
+			return
+		}
+		currentNode = lookup
+	}
+}
+
+func sharedPrefixLength(a, b string) int {
+	minLength := len(a)
+	if len(b) < minLength {
+		minLength = len(b)
+	}
+	for i := 0; i < minLength; i++ {
+		if a[i] != b[i] {
+			return i
+		}
+	}
+	return minLength
+}
+
+func (p *LeastLoadedPolicy) Select(peers []*PeerNode, availabilityMap map[*PeerNode]AvailabilityStatus, requestPath string) *PeerNode {
 	if len(peers) == 0 {
 		return nil
 	}
 
 	var best *PeerNode
-	var lowestLoad int64 = -1
+	lowestLoad := -1
 
 	for _, peer := range peers {
-		// Skip unhealthy peers
-		if !peer.Healthy {
+		status, exists := availabilityMap[peer]
+
+		// Skip unavailable/unhealthy peers
+		if !exists || !status.Available || !status.Healthy {
 			continue
 		}
 
-		// Skip peers at capacity
-		if peer.CurrentLoad >= int64(peer.MaxLoad) {
+		// Use real SGLang metrics: total requests = running + waiting
+		totalLoad := status.TotalRequests
+
+		// Skip peers at capacity (use MaxRunningReqs from SGLang if available)
+		maxLoad := peer.MaxLoad
+		if peer.Metrics.MaxRunningReqs > 0 {
+			maxLoad = peer.Metrics.MaxRunningReqs
+		}
+		if totalLoad >= maxLoad {
 			continue
 		}
 
-		if lowestLoad == -1 || peer.CurrentLoad < lowestLoad {
-			lowestLoad = peer.CurrentLoad
+		if lowestLoad == -1 || totalLoad < lowestLoad {
+			lowestLoad = totalLoad
 			best = peer
 		}
 	}
@@ -132,52 +290,15 @@ func (p *LeastLoadedPolicy) Select(peers []*PeerNode) *PeerNode {
 	return best
 }
 
-// NewLoadBalancerPolicy creates a new load balancer policy based on the strategy name
-func NewLoadBalancerPolicy(strategy string) LoadBalancerPolicy {
-	switch strategy {
-	case "least-loaded":
-		return &LeastLoadedPolicy{}
-	default:
-		// Default to least-loaded
-		return &LeastLoadedPolicy{}
-	}
-}
-
 // PeerNode represents a peer node in the cluster
 type PeerNode struct {
-	Instance         *remote.RunningInstance `json:"instance"`
-	Port             int                     `json:"port"`
-	Healthy          bool                    `json:"healthy"`
-	LastHealthCheck  time.Time               `json:"last_health_check"`
-	CurrentLoad      int64                   `json:"current_load"`
-	MaxLoad          int                     `json:"max_load"`
-	ResponseTimeMs   int64                   `json:"response_time_ms"`
-	ConsecutiveFails int                     `json:"consecutive_fails"`
-	TotalRequests    int64                   `json:"total_requests"`
-	FailedRequests   int64                   `json:"failed_requests"`
-}
+	Instance    *remote.RunningInstance `json:"instance"`
+	Port        int                     `json:"port"`
+	CurrentLoad int64                   `json:"current_load"` // Deprecated: use Metrics instead
+	MaxLoad     int                     `json:"max_load"`
 
-// PeerStatus is the status response from a peer's /lb/status endpoint
-type PeerStatus struct {
-	NodeID      string `json:"node_id"`
-	CurrentLoad int64  `json:"current_load"`
-	MaxLoad     int    `json:"max_load"`
-	QueueSize   int    `json:"queue_size"`
-	Healthy     bool   `json:"healthy"`
-}
-
-// LoadBalancerMetrics tracks load balancer performance
-type LoadBalancerMetrics struct {
-	TotalRequests     int64     `json:"total_requests"`
-	LocalRequests     int64     `json:"local_requests"`
-	ForwardedRequests int64     `json:"forwarded_requests"`
-	QueuedRequests    int64     `json:"queued_requests"`
-	DroppedRequests   int64     `json:"dropped_requests"`
-	FailedForwards    int64     `json:"failed_forwards"`
-	AvgResponseTimeMs float64   `json:"avg_response_time_ms"`
-	CurrentConcurrent int64     `json:"current_concurrent"`
-	PeakConcurrent    int64     `json:"peak_concurrent"`
-	LastUpdated       time.Time `json:"last_updated"`
+	// Real-time metrics from SGLang
+	Metrics SGLangMetrics `json:"metrics"`
 }
 
 // queuedRequest represents a request waiting in the queue
@@ -189,28 +310,27 @@ type queuedRequest struct {
 	enqueuedAt time.Time
 }
 
-// NodeLoadBalancer is a distributed load balancer instance for a single node
-type NodeLoadBalancer struct {
+// LoadBalancer is a distributed load balancer instance for a single node
+type LoadBalancer struct {
 	config *LoadBalancerConfig
 
-	// Peer management
-	peers   map[string]*PeerNode
+	// Self reference for peer exclusion
+	self *remote.RunningInstance
+
+	// Peer management - maps peer nodes to their availability status
+	peers   map[*PeerNode]AvailabilityStatus
 	peersMu sync.RWMutex
 
-	// Load balancing policy
-	policy LoadBalancerPolicy
+	// Load balancing strategy (used when forwarding to peers)
+	strategy LoadBalancingStrategy
 
-	// Request tracking
-	currentRequests atomic.Int64
-	peakRequests    atomic.Int64
+	// Local SGLang metrics (polled from local backend)
+	localMetrics   SGLangMetrics
+	localMetricsMu sync.RWMutex
 
-	// Metrics
-	metrics   LoadBalancerMetrics
-	metricsMu sync.RWMutex
-
-	// Request queue
-	queue     chan *queuedRequest
-	queueSize atomic.Int64
+	// Request queue (unbounded slice-based queue)
+	queue   []*queuedRequest
+	queueMu sync.Mutex
 
 	// HTTP clients
 	httpClient *http.Client
@@ -221,13 +341,10 @@ type NodeLoadBalancer struct {
 	cancel  context.CancelFunc
 	wg      sync.WaitGroup
 	running atomic.Bool
-
-	// Response time tracking (exponential moving average)
-	avgResponseTime atomic.Int64
 }
 
-// NewNodeLoadBalancer creates a new load balancer for this node
-func NewNodeLoadBalancer(config *LoadBalancerConfig) *NodeLoadBalancer {
+// NewLoadBalancer creates a new load balancer for this node
+func NewLoadBalancer(config *LoadBalancerConfig, self *remote.RunningInstance) *LoadBalancer {
 	if config == nil {
 		config = DefaultLoadBalancerConfig()
 	}
@@ -235,7 +352,7 @@ func NewNodeLoadBalancer(config *LoadBalancerConfig) *NodeLoadBalancer {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	// Create local backend proxy
-	localURL, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", config.LocalPort))
+	localURL, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", config.ApplicationPort))
 	localProxy := httputil.NewSingleHostReverseProxy(localURL)
 
 	// Customize proxy error handler
@@ -244,10 +361,16 @@ func NewNodeLoadBalancer(config *LoadBalancerConfig) *NodeLoadBalancer {
 		http.Error(w, "Backend unavailable", http.StatusBadGateway)
 	}
 
-	lb := &NodeLoadBalancer{
-		config: config,
-		peers:  make(map[string]*PeerNode),
-		policy: NewLoadBalancerPolicy(config.Strategy),
+	// Use default strategy if none provided
+	if config.Strategy == nil {
+		config.Strategy = &LeastLoadedPolicy{}
+	}
+
+	lb := &LoadBalancer{
+		config:   config,
+		self:     self,
+		peers:    make(map[*PeerNode]AvailabilityStatus),
+		strategy: config.Strategy,
 		httpClient: &http.Client{
 			Timeout: config.RequestTimeout,
 			Transport: &http.Transport{
@@ -261,59 +384,69 @@ func NewNodeLoadBalancer(config *LoadBalancerConfig) *NodeLoadBalancer {
 	}
 
 	if config.QueueEnabled {
-		lb.queue = make(chan *queuedRequest, config.MaxQueueSize)
+		lb.queue = make([]*queuedRequest, 0)
 	}
 
 	return lb
 }
 
 // AddPeer adds a peer node to the load balancer
-func (lb *NodeLoadBalancer) AddPeer(instance *remote.RunningInstance, port int) {
+func (lb *LoadBalancer) AddPeer(instance *remote.RunningInstance, port int) {
 	lb.peersMu.Lock()
 	defer lb.peersMu.Unlock()
 
-	lb.peers[instance.ID] = &PeerNode{
+	peerNode := &PeerNode{
 		Instance: instance,
 		Port:     port,
-		Healthy:  true, // Assume healthy until proven otherwise
 		MaxLoad:  lb.config.MaxConcurrentRequests,
+		Metrics: SGLangMetrics{
+			Healthy:     true, // Assume healthy initially until first poll
+			LastUpdated: time.Now(),
+		},
+	}
+
+	lb.peers[peerNode] = AvailabilityStatus{
+		Available: true, // Assume available initially until first metrics poll
+		Healthy:   true,
 	}
 
 	log.Printf("[LB] Added peer: %s (%s:%d)", instance.ID, instance.IP, port)
 }
 
 // RemovePeer removes a peer node from the load balancer
-func (lb *NodeLoadBalancer) RemovePeer(id string) {
+func (lb *LoadBalancer) RemovePeer(id string) {
 	lb.peersMu.Lock()
 	defer lb.peersMu.Unlock()
 
-	delete(lb.peers, id)
-	log.Printf("[LB] Removed peer: %s", id)
+	// Find and remove the peer with matching ID
+	for peerNode := range lb.peers {
+		if peerNode.Instance.ID == id {
+			delete(lb.peers, peerNode)
+			log.Printf("[LB] Removed peer: %s", id)
+			break
+		}
+	}
 }
 
 // AddPeersFromCluster adds all instances from a cluster as peers
-func (lb *NodeLoadBalancer) AddPeersFromCluster(cluster *Cluster) {
+func (lb *LoadBalancer) AddPeersFromCluster(cluster *Cluster) {
 	for i := range cluster.Instances {
 		inst := &cluster.Instances[i]
-		// Skip self
-		if inst.ID == lb.config.NodeID {
+		// Skip self by comparing pointers
+		if inst == lb.self {
 			continue
 		}
-		lb.AddPeer(inst, lb.config.PeerPort)
+		lb.AddPeer(inst, lb.config.LoadBalancerPort)
 	}
 }
 
 // Start starts the load balancer
-func (lb *NodeLoadBalancer) Start() error {
+func (lb *LoadBalancer) Start() error {
 	if lb.running.Load() {
 		return fmt.Errorf("load balancer already running")
 	}
 
 	lb.running.Store(true)
-
-	// Start health checker
-	lb.wg.Add(1)
-	go lb.healthCheckLoop()
 
 	// Start queue processor if enabled
 	if lb.config.QueueEnabled {
@@ -321,20 +454,20 @@ func (lb *NodeLoadBalancer) Start() error {
 		go lb.processQueue()
 	}
 
-	// Start metrics collector if enabled
+	// Start metrics poller if enabled
 	if lb.config.MetricsEnabled {
 		lb.wg.Add(1)
-		go lb.collectMetrics()
+		go lb.pollMetricsLoop()
 	}
 
-	log.Printf("[LB] Load balancer started (node: %s, max concurrent: %d, strategy: %s)",
-		lb.config.NodeID, lb.config.MaxConcurrentRequests, lb.config.Strategy)
+	log.Printf("[LB] Load balancer started (max concurrent: %d, metrics polling: %v)",
+		lb.config.MaxConcurrentRequests, lb.config.MetricsEnabled)
 
 	return nil
 }
 
 // Stop stops the load balancer
-func (lb *NodeLoadBalancer) Stop() {
+func (lb *LoadBalancer) Stop() {
 	if !lb.running.Load() {
 		return
 	}
@@ -347,76 +480,64 @@ func (lb *NodeLoadBalancer) Stop() {
 }
 
 // Handler returns an HTTP handler that implements the load balancing logic
-func (lb *NodeLoadBalancer) Handler(next http.Handler) http.Handler {
+func (lb *LoadBalancer) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Handle internal LB endpoints
-		if lb.handleInternalEndpoint(w, r) {
+		// Check if LOCAL SGLang has capacity using real metrics
+		if lb.localHasCapacity() {
+			// Process locally - user is routed here, KV cache is warm
+			lb.localProxy.ServeHTTP(w, r)
 			return
 		}
 
-		startTime := time.Now()
-		atomic.AddInt64(&lb.metrics.TotalRequests, 1)
+		// Local is at capacity - try to forward to a peer
+		lb.localMetricsMu.RLock()
+		localLoad := lb.localMetrics.NumTotalReqs
+		lb.localMetricsMu.RUnlock()
+		log.Printf("[LB] Local at capacity (running=%d, waiting=%d, total=%d), forwarding",
+			lb.localMetrics.NumRunningReqs, lb.localMetrics.NumWaitingReqs, localLoad)
 
-		// Try to handle locally first
-		currentLoad := lb.currentRequests.Load()
-
-		if currentLoad < int64(lb.config.MaxConcurrentRequests) {
-			// Handle locally
-			lb.handleLocal(w, r, next, startTime)
+		if lb.forwardToPeer(w, r) {
 			return
 		}
 
-		// Local capacity exceeded - try to forward to a peer
-		log.Printf("[LB] Local capacity exceeded (%d/%d), attempting forward",
-			currentLoad, lb.config.MaxConcurrentRequests)
-
-		if lb.forwardToPeer(w, r, startTime) {
-			return
-		}
-
-		// No healthy peers available - try queue or reject
-		if lb.config.QueueEnabled && lb.queueSize.Load() < int64(lb.config.MaxQueueSize) {
+		// No healthy peers available - try queue locally or reject
+		if lb.config.QueueEnabled {
 			lb.enqueueRequest(w, r)
 			return
 		}
 
 		// All options exhausted
-		atomic.AddInt64(&lb.metrics.DroppedRequests, 1)
 		http.Error(w, "Service at capacity", http.StatusServiceUnavailable)
 	})
 }
 
-// handleLocal processes the request locally
-func (lb *NodeLoadBalancer) handleLocal(w http.ResponseWriter, r *http.Request, next http.Handler, startTime time.Time) {
-	// Increment concurrent request counter
-	current := lb.currentRequests.Add(1)
-	defer lb.currentRequests.Add(-1)
+// localHasCapacity checks if the local SGLang backend has capacity
+// Returns true if we should process locally (queue depth < max)
+func (lb *LoadBalancer) localHasCapacity() bool {
+	lb.localMetricsMu.RLock()
+	defer lb.localMetricsMu.RUnlock()
 
-	// Track peak
-	for {
-		peak := lb.peakRequests.Load()
-		if current <= peak || lb.peakRequests.CompareAndSwap(peak, current) {
-			break
-		}
+	// If we haven't polled yet, assume we have capacity
+	if lb.localMetrics.LastUpdated.IsZero() {
+		return true
 	}
 
-	atomic.AddInt64(&lb.metrics.LocalRequests, 1)
-
-	// Process with the actual handler
-	if next != nil {
-		next.ServeHTTP(w, r)
-	} else {
-		lb.localProxy.ServeHTTP(w, r)
+	// Check if local SGLang queue is below threshold
+	// "Capacity" means: total requests (running + waiting) < max running
+	maxLoad := lb.config.MaxConcurrentRequests
+	if lb.localMetrics.MaxRunningReqs > 0 {
+		maxLoad = lb.localMetrics.MaxRunningReqs
 	}
 
-	// Update response time (EMA with alpha=0.1)
-	elapsed := time.Since(startTime).Milliseconds()
-	lb.updateResponseTime(elapsed)
+	hasCapacity := lb.localMetrics.NumTotalReqs < maxLoad &&
+		lb.localMetrics.GPUCacheUsage < lb.config.GPUCacheThreshold &&
+		lb.localMetrics.Healthy
+
+	return hasCapacity
 }
 
-// forwardToPeer attempts to forward the request to a healthy peer
-func (lb *NodeLoadBalancer) forwardToPeer(w http.ResponseWriter, r *http.Request, startTime time.Time) bool {
-	peer := lb.selectPeer()
+func (lb *LoadBalancer) forwardToPeer(w http.ResponseWriter, r *http.Request) bool {
+	peer := lb.selectPeer(r.URL.Path)
 	if peer == nil {
 		return false
 	}
@@ -441,7 +562,6 @@ func (lb *NodeLoadBalancer) forwardToPeer(w http.ResponseWriter, r *http.Request
 	forwardReq, err := http.NewRequestWithContext(ctx, r.Method, targetURL, bytes.NewReader(bodyBytes))
 	if err != nil {
 		log.Printf("[LB] Failed to create forward request: %v", err)
-		atomic.AddInt64(&lb.metrics.FailedForwards, 1)
 		return false
 	}
 
@@ -454,16 +574,12 @@ func (lb *NodeLoadBalancer) forwardToPeer(w http.ResponseWriter, r *http.Request
 
 	// Add forwarding headers
 	forwardReq.Header.Set("X-Forwarded-For", r.RemoteAddr)
-	forwardReq.Header.Set("X-Forwarded-By", lb.config.NodeID)
 	forwardReq.Header.Set("X-LB-Hop", "1")
 
 	// Execute forward
 	resp, err := lb.httpClient.Do(forwardReq)
 	if err != nil {
 		log.Printf("[LB] Forward to %s failed: %v", peer.Instance.ID, err)
-		atomic.AddInt64(&lb.metrics.FailedForwards, 1)
-		atomic.AddInt64(&peer.FailedRequests, 1)
-		peer.ConsecutiveFails++
 		return false
 	}
 	defer resp.Body.Close()
@@ -478,74 +594,26 @@ func (lb *NodeLoadBalancer) forwardToPeer(w http.ResponseWriter, r *http.Request
 	w.WriteHeader(resp.StatusCode)
 	io.Copy(w, resp.Body)
 
-	atomic.AddInt64(&lb.metrics.ForwardedRequests, 1)
-	atomic.AddInt64(&peer.TotalRequests, 1)
-	peer.ConsecutiveFails = 0
-
-	// Update peer response time
-	elapsed := time.Since(startTime).Milliseconds()
-	atomic.StoreInt64(&peer.ResponseTimeMs, elapsed)
-
-	log.Printf("[LB] Forwarded request to %s (took %dms)", peer.Instance.ID, elapsed)
+	log.Printf("[LB] Forwarded request to %s", peer.Instance.ID)
 	return true
 }
 
-// selectPeer selects a peer based on the configured policy
-func (lb *NodeLoadBalancer) selectPeer() *PeerNode {
+// selectPeer selects a peer using the configured strategy
+func (lb *LoadBalancer) selectPeer(requestPath string) *PeerNode {
 	lb.peersMu.RLock()
 	defer lb.peersMu.RUnlock()
 
-	// Use the configured policy to select a peer (policy handles filtering)
-	return lb.policy.Select(lb.getPeerSlice())
-}
-
-// getPeerSlice returns a slice of all peer nodes (internal helper)
-func (lb *NodeLoadBalancer) getPeerSlice() []*PeerNode {
+	// Extract peer slice from the map keys
 	peers := make([]*PeerNode, 0, len(lb.peers))
-	for _, peer := range lb.peers {
+	for peer := range lb.peers {
 		peers = append(peers, peer)
 	}
-	return peers
-}
 
-// SetPolicy changes the load balancing policy at runtime
-func (lb *NodeLoadBalancer) SetPolicy(policy LoadBalancerPolicy) {
-	lb.peersMu.Lock()
-	defer lb.peersMu.Unlock()
-	lb.policy = policy
-	log.Printf("[LB] Policy changed to: %s", policy.Name())
-}
-
-// GetPolicy returns the current load balancing policy
-func (lb *NodeLoadBalancer) GetPolicy() LoadBalancerPolicy {
-	lb.peersMu.RLock()
-	defer lb.peersMu.RUnlock()
-	return lb.policy
-}
-
-// GetPeerCount returns the number of peers
-func (lb *NodeLoadBalancer) GetPeerCount() int {
-	lb.peersMu.RLock()
-	defer lb.peersMu.RUnlock()
-	return len(lb.peers)
-}
-
-// GetHealthyPeerCount returns the number of healthy peers
-func (lb *NodeLoadBalancer) GetHealthyPeerCount() int {
-	lb.peersMu.RLock()
-	defer lb.peersMu.RUnlock()
-
-	count := 0
-	for _, peer := range lb.peers {
-		if peer.Healthy {
-			count++
-		}
-	}
-	return count
+	return lb.strategy.Select(peers, lb.peers, requestPath)
 }
 
 // enqueueRequest adds a request to the queue
-func (lb *NodeLoadBalancer) enqueueRequest(w http.ResponseWriter, r *http.Request) {
+func (lb *LoadBalancer) enqueueRequest(w http.ResponseWriter, r *http.Request) {
 	qr := &queuedRequest{
 		w:          w,
 		r:          r,
@@ -553,32 +621,28 @@ func (lb *NodeLoadBalancer) enqueueRequest(w http.ResponseWriter, r *http.Reques
 		enqueuedAt: time.Now(),
 	}
 
+	// Add to unbounded queue
+	lb.queueMu.Lock()
+	lb.queue = append(lb.queue, qr)
+	lb.queueMu.Unlock()
+
+	log.Printf("[LB] Request queued (queue size: %d)", len(lb.queue))
+
+	// Wait for processing or timeout
 	select {
-	case lb.queue <- qr:
-		lb.queueSize.Add(1)
-		atomic.AddInt64(&lb.metrics.QueuedRequests, 1)
-		log.Printf("[LB] Request queued (queue size: %d)", lb.queueSize.Load())
-
-		// Wait for processing or timeout
-		select {
-		case <-qr.done:
-			if qr.err != nil {
-				http.Error(w, qr.err.Error(), http.StatusServiceUnavailable)
-			}
-		case <-time.After(lb.config.QueueTimeout):
-			http.Error(w, "Queue timeout", http.StatusGatewayTimeout)
-		case <-r.Context().Done():
-			http.Error(w, "Request cancelled", http.StatusRequestTimeout)
+	case <-qr.done:
+		if qr.err != nil {
+			http.Error(w, qr.err.Error(), http.StatusServiceUnavailable)
 		}
-
-	default:
-		atomic.AddInt64(&lb.metrics.DroppedRequests, 1)
-		http.Error(w, "Queue full", http.StatusServiceUnavailable)
+	case <-time.After(lb.config.QueueTimeout):
+		http.Error(w, "Queue timeout", http.StatusGatewayTimeout)
+	case <-r.Context().Done():
+		http.Error(w, "Request cancelled", http.StatusRequestTimeout)
 	}
 }
 
-// processQueue processes queued requests when capacity becomes available
-func (lb *NodeLoadBalancer) processQueue() {
+// processQueue processes queued requests when local SGLang has capacity
+func (lb *LoadBalancer) processQueue() {
 	defer lb.wg.Done()
 
 	ticker := time.NewTicker(10 * time.Millisecond)
@@ -589,15 +653,17 @@ func (lb *NodeLoadBalancer) processQueue() {
 		case <-lb.ctx.Done():
 			return
 		case <-ticker.C:
-			// Check if we have capacity
-			if lb.currentRequests.Load() >= int64(lb.config.MaxConcurrentRequests) {
+			// Check if local SGLang has capacity using real metrics
+			if !lb.localHasCapacity() {
 				continue
 			}
 
 			// Try to dequeue
-			select {
-			case qr := <-lb.queue:
-				lb.queueSize.Add(-1)
+			lb.queueMu.Lock()
+			if len(lb.queue) > 0 {
+				qr := lb.queue[0]
+				lb.queue = lb.queue[1:] // Remove first element
+				lb.queueMu.Unlock()
 
 				// Check if request is still valid
 				if time.Since(qr.enqueuedAt) > lb.config.QueueTimeout {
@@ -606,282 +672,43 @@ func (lb *NodeLoadBalancer) processQueue() {
 					continue
 				}
 
-				// Process the request
-				startTime := time.Now()
-				lb.handleLocal(qr.w, qr.r, nil, startTime)
+				// Process the request locally
+				lb.localProxy.ServeHTTP(qr.w, qr.r)
 				close(qr.done)
-
-			default:
+			} else {
+				lb.queueMu.Unlock()
 				// No requests in queue
 			}
 		}
 	}
 }
 
-// healthCheckLoop periodically checks peer health
-func (lb *NodeLoadBalancer) healthCheckLoop() {
-	defer lb.wg.Done()
-
-	ticker := time.NewTicker(lb.config.HealthCheckInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-lb.ctx.Done():
-			return
-		case <-ticker.C:
-			lb.checkAllPeers()
-		}
-	}
+// CurrentLoad returns the current load from real SGLang metrics (running + waiting)
+func (lb *LoadBalancer) CurrentLoad() int {
+	lb.localMetricsMu.RLock()
+	defer lb.localMetricsMu.RUnlock()
+	return lb.localMetrics.NumTotalReqs
 }
 
-// checkAllPeers checks the health of all peers
-func (lb *NodeLoadBalancer) checkAllPeers() {
-	lb.peersMu.RLock()
-	peers := make([]*PeerNode, 0, len(lb.peers))
-	for _, peer := range lb.peers {
-		peers = append(peers, peer)
-	}
-	lb.peersMu.RUnlock()
-
-	var wg sync.WaitGroup
-	for _, peer := range peers {
-		wg.Add(1)
-		go func(p *PeerNode) {
-			defer wg.Done()
-			lb.checkPeerHealth(p)
-		}(peer)
-	}
-	wg.Wait()
-}
-
-// checkPeerHealth checks a single peer's health
-func (lb *NodeLoadBalancer) checkPeerHealth(peer *PeerNode) {
-	ctx, cancel := context.WithTimeout(lb.ctx, lb.config.HealthCheckTimeout)
-	defer cancel()
-
-	// Check the peer's load balancer status endpoint
-	statusURL := fmt.Sprintf("http://%s:%d/lb/status", peer.Instance.IP, peer.Port)
-	req, err := http.NewRequestWithContext(ctx, "GET", statusURL, nil)
-	if err != nil {
-		lb.markPeerUnhealthy(peer)
-		return
-	}
-
-	startTime := time.Now()
-	resp, err := lb.httpClient.Do(req)
-	if err != nil {
-		lb.markPeerUnhealthy(peer)
-		return
-	}
-	defer resp.Body.Close()
-
-	responseTime := time.Since(startTime).Milliseconds()
-
-	if resp.StatusCode != http.StatusOK {
-		lb.markPeerUnhealthy(peer)
-		return
-	}
-
-	// Parse peer status
-	var status PeerStatus
-	if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
-		lb.markPeerUnhealthy(peer)
-		return
-	}
-
-	// Update peer info
-	lb.peersMu.Lock()
-	peer.Healthy = status.Healthy
-	peer.CurrentLoad = status.CurrentLoad
-	peer.MaxLoad = status.MaxLoad
-	peer.ResponseTimeMs = responseTime
-	peer.LastHealthCheck = time.Now()
-	peer.ConsecutiveFails = 0
-	lb.peersMu.Unlock()
-}
-
-// markPeerUnhealthy marks a peer as unhealthy
-func (lb *NodeLoadBalancer) markPeerUnhealthy(peer *PeerNode) {
-	lb.peersMu.Lock()
-	defer lb.peersMu.Unlock()
-
-	peer.ConsecutiveFails++
-	if peer.ConsecutiveFails >= 3 {
-		if peer.Healthy {
-			log.Printf("[LB] Peer %s marked unhealthy after %d consecutive failures",
-				peer.Instance.ID, peer.ConsecutiveFails)
-		}
-		peer.Healthy = false
-	}
-	peer.LastHealthCheck = time.Now()
-}
-
-// handleInternalEndpoint handles internal load balancer endpoints
-func (lb *NodeLoadBalancer) handleInternalEndpoint(w http.ResponseWriter, r *http.Request) bool {
-	switch r.URL.Path {
-	case "/lb/status":
-		lb.handleStatus(w, r)
-		return true
-	case "/lb/metrics":
-		lb.handleMetrics(w, r)
-		return true
-	case "/lb/peers":
-		lb.handlePeers(w, r)
-		return true
-	}
-	return false
-}
-
-// handleStatus returns the current status of this node's load balancer
-func (lb *NodeLoadBalancer) handleStatus(w http.ResponseWriter, r *http.Request) {
-	status := PeerStatus{
-		NodeID:      lb.config.NodeID,
-		CurrentLoad: lb.currentRequests.Load(),
-		MaxLoad:     lb.config.MaxConcurrentRequests,
-		QueueSize:   int(lb.queueSize.Load()),
-		Healthy:     lb.running.Load(),
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(status)
-}
-
-// handleMetrics returns detailed metrics
-func (lb *NodeLoadBalancer) handleMetrics(w http.ResponseWriter, r *http.Request) {
-	lb.metricsMu.RLock()
-	metrics := lb.metrics
-	lb.metricsMu.RUnlock()
-
-	metrics.CurrentConcurrent = lb.currentRequests.Load()
-	metrics.PeakConcurrent = lb.peakRequests.Load()
-	metrics.LastUpdated = time.Now()
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(metrics)
-}
-
-// handlePeers returns information about peer nodes
-func (lb *NodeLoadBalancer) handlePeers(w http.ResponseWriter, r *http.Request) {
-	lb.peersMu.RLock()
-	peers := make([]*PeerNode, 0, len(lb.peers))
-	for _, peer := range lb.peers {
-		peers = append(peers, peer)
-	}
-	lb.peersMu.RUnlock()
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(peers)
-}
-
-// collectMetrics periodically updates aggregate metrics
-func (lb *NodeLoadBalancer) collectMetrics() {
-	defer lb.wg.Done()
-
-	ticker := time.NewTicker(1 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-lb.ctx.Done():
-			return
-		case <-ticker.C:
-			lb.metricsMu.Lock()
-			lb.metrics.CurrentConcurrent = lb.currentRequests.Load()
-			lb.metrics.PeakConcurrent = lb.peakRequests.Load()
-			lb.metrics.AvgResponseTimeMs = float64(lb.avgResponseTime.Load())
-			lb.metrics.LastUpdated = time.Now()
-			lb.metricsMu.Unlock()
-		}
-	}
-}
-
-// updateResponseTime updates the exponential moving average of response time
-func (lb *NodeLoadBalancer) updateResponseTime(elapsed int64) {
-	// EMA with alpha = 0.1
-	for {
-		current := lb.avgResponseTime.Load()
-		if current == 0 {
-			if lb.avgResponseTime.CompareAndSwap(0, elapsed) {
-				break
-			}
-		} else {
-			newAvg := int64(float64(current)*0.9 + float64(elapsed)*0.1)
-			if lb.avgResponseTime.CompareAndSwap(current, newAvg) {
-				break
-			}
-		}
-	}
-}
-
-// GetMetrics returns current metrics
-func (lb *NodeLoadBalancer) GetMetrics() LoadBalancerMetrics {
-	lb.metricsMu.RLock()
-	defer lb.metricsMu.RUnlock()
-
-	metrics := lb.metrics
-	metrics.CurrentConcurrent = lb.currentRequests.Load()
-	metrics.PeakConcurrent = lb.peakRequests.Load()
-	return metrics
-}
-
-// GetPeers returns current peer information
-func (lb *NodeLoadBalancer) GetPeers() []*PeerNode {
-	lb.peersMu.RLock()
-	defer lb.peersMu.RUnlock()
-
-	peers := make([]*PeerNode, 0, len(lb.peers))
-	for _, peer := range lb.peers {
-		peerCopy := *peer
-		peers = append(peers, &peerCopy)
-	}
-	return peers
-}
-
-// GetHealthyPeers returns only healthy peers
-func (lb *NodeLoadBalancer) GetHealthyPeers() []*PeerNode {
-	lb.peersMu.RLock()
-	defer lb.peersMu.RUnlock()
-
-	var healthy []*PeerNode
-	for _, peer := range lb.peers {
-		if peer.Healthy {
-			peerCopy := *peer
-			healthy = append(healthy, &peerCopy)
-		}
-	}
-	return healthy
-}
-
-// CurrentLoad returns the current number of concurrent requests
-func (lb *NodeLoadBalancer) CurrentLoad() int64 {
-	return lb.currentRequests.Load()
-}
-
-// IsAtCapacity returns true if the local node is at capacity
-func (lb *NodeLoadBalancer) IsAtCapacity() bool {
-	return lb.currentRequests.Load() >= int64(lb.config.MaxConcurrentRequests)
+// IsAtCapacity returns true if the local SGLang is at capacity
+func (lb *LoadBalancer) IsAtCapacity() bool {
+	return !lb.localHasCapacity()
 }
 
 // ListenAndServe starts the load balancer HTTP server
-func (lb *NodeLoadBalancer) ListenAndServe() error {
+func (lb *LoadBalancer) ListenAndServe() error {
 	if err := lb.Start(); err != nil {
 		return err
 	}
 
 	server := &http.Server{
-		Addr:         fmt.Sprintf(":%d", lb.config.ListenPort),
-		Handler:      lb.Handler(nil),
+		Addr:         fmt.Sprintf(":%d", lb.config.LoadBalancerPort),
+		Handler:      lb.Handler(),
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 30 * time.Second,
 		IdleTimeout:  120 * time.Second,
 	}
 
-	log.Printf("[LB] Starting HTTP server on port %d", lb.config.ListenPort)
+	log.Printf("[LB] Starting HTTP server on port %d", lb.config.LoadBalancerPort)
 	return server.ListenAndServe()
-}
-
-// WrapHandler wraps an existing handler with load balancing
-func (lb *NodeLoadBalancer) WrapHandler(handler http.Handler) http.Handler {
-	return lb.Handler(handler)
 }
