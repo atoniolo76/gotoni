@@ -576,6 +576,12 @@ func (lb *LoadBalancer) forwardToPeer(w http.ResponseWriter, r *http.Request) bo
 	forwardReq.Header.Set("X-Forwarded-For", r.RemoteAddr)
 	forwardReq.Header.Set("X-LB-Hop", "1")
 
+	// Pre-execute, add the requestPath to the prefix tree if doing PrefixTreePolicy
+	// func (p *PrefixTreePolicy) Insert(prefix string, peer *PeerNode) {
+	if lb.strategy.(*PrefixTreePolicy) != nil {
+		lb.strategy.(*PrefixTreePolicy).Insert(r.URL.Path, peer)
+	}
+
 	// Execute forward
 	resp, err := lb.httpClient.Do(forwardReq)
 	if err != nil {
