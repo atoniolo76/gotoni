@@ -86,6 +86,19 @@ type prefixNode struct {
 	prefix   string // variable length
 }
 
+type GORGOPolicy struct {
+	mu   sync.RWMutex
+	root *GORGONode
+}
+
+type GORGONode struct {
+	children map[byte]*GORGONode
+	peers    []*PeerNode
+	prefix   string // variable length
+}
+
+const GORGO_MS_PER_TOKEN = 0.094 // Cold-start prefill rate on 8xA100 with Mistral-7B
+
 type AvailabilityStatus struct {
 	Available       bool
 	RunningRequests int     // Actual requests in GPU batch (from SGLang)
@@ -108,6 +121,84 @@ func NewPrefixTreePolicy() *PrefixTreePolicy {
 			prefix:   "",
 		},
 	}
+}
+
+func (p *GORGOPolicy) Select(peers []*PeerNode, availabilityMap map[*PeerNode]AvailabilityStatus, requestPath string) *PeerNode {
+	if p.root == nil {
+		// No existing prefix trie (first request), fall back to least-loaded
+		return (&LeastLoadedPolicy{}).Select(peers, availabilityMap, requestPath)
+	}
+
+	if len(requestPath) == 0 {
+		return nil
+	}
+
+	matches := []MatchedPrefixNodes{}
+	currentNode := p.root
+
+	i := 0
+	for i < len(requestPath) {
+		currentChar := requestPath[i]
+		remainingText := requestPath[i:]
+		lookup, ok := currentNode.children[currentChar]
+		if !ok {
+			break
+		}
+
+		currentNode = lookup
+		sharedLen := sharedPrefixLength(remainingText, lookup.prefix)
+		i += sharedLen
+
+		// Check if this node has available replicas
+		availablePeers := []*PeerNode{}
+		for _, peerNode := range lookup.peers {
+			if status, ok := availabilityMap[peerNode]; ok && status.Available && status.Healthy {
+				availablePeers = append(availablePeers, peerNode)
+			}
+		}
+
+		if len(availablePeers) > 0 {
+			matchRate := float64(i) / float64(len(requestPath))
+			node := prefixNode{
+				prefix: lookup.prefix,
+				peers:  availablePeers,
+			}
+			matches = append(matches, MatchedPrefixNodes{
+				node:      node,
+				matchRate: matchRate,
+			})
+		}
+
+		if sharedLen < len(lookup.prefix) {
+			// partial match, no need to search further
+			break
+		}
+	}
+	sort.Slice(matches, func(i2, j int) bool {
+		return matches[i2].matchRate > matches[j].matchRate
+	})
+
+	// Core logic for GORGO: best match may not always be the best choice considering geographic proximity
+	// Cost = network latency + prefill time for unmatched tokens
+	lowestCost := int(^uint(0) >> 1)
+	var bestMatchedPeer *PeerNode = nil
+	for _, matchedPrefixNode := range matches {
+		// Calculate unmatched portion that needs fresh prefill
+		unmatchedText := requestPath[len(matchedPrefixNode.node.prefix):]
+		unmatchedTokens := GetTokenCount(unmatchedText)
+
+		for _, peer := range matchedPrefixNode.node.peers {
+			// Total cost = network latency (ms) + prefill cost (tokens × ms/token)
+			prefillCost := float64(unmatchedTokens) * GORGO_MS_PER_TOKEN
+			totalCost := int(peer.Metrics.Latency) + int(prefillCost)
+			if totalCost < lowestCost {
+				lowestCost = totalCost
+				bestMatchedPeer = peer
+			}
+		}
+	}
+
+	return bestMatchedPeer
 }
 
 func (p *PrefixTreePolicy) Select(peers []*PeerNode, availabilityMap map[*PeerNode]AvailabilityStatus, requestPath string) *PeerNode {

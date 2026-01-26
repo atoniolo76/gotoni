@@ -272,3 +272,49 @@ func (lb *LoadBalancer) GetPeerAvailability() map[string]AvailabilityStatus {
 	}
 	return availability
 }
+
+// FlushSGLangCache sends a POST request to flush the KV cache (RadixAttention cache)
+// This is essential for accurate TTFT benchmarking as it removes any prefix cache hits
+func FlushSGLangCache(serverURL string, timeout time.Duration) error {
+	client := &http.Client{Timeout: timeout}
+
+	// SGLang's flush_cache endpoint
+	flushURL := serverURL + "/flush_cache"
+
+	req, err := http.NewRequest("POST", flushURL, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create flush request: %w", err)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("flush request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("flush returned status %d", resp.StatusCode)
+	}
+
+	return nil
+}
+
+// GetSGLangCacheStats retrieves current cache statistics from SGLang
+func GetSGLangCacheStats(serverURL string, timeout time.Duration) (map[string]interface{}, error) {
+	client := &http.Client{Timeout: timeout}
+
+	statsURL := serverURL + "/get_server_info"
+
+	resp, err := client.Get(statsURL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get server info: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var stats map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&stats); err != nil {
+		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	return stats, nil
+}
