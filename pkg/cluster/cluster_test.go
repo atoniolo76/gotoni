@@ -1,12 +1,16 @@
 package serve
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
+	"io"
+	"math"
 	"net/http"
 	"os"
 	"os/exec"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -1997,4 +2001,854 @@ echo "=== END DIAGNOSTICS ==="
 	fmt.Println("4. GPU memory issues → Check nvidia-smi for OOM")
 	fmt.Println("5. Model not downloaded → First startup can take 10+ minutes")
 	fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+}
+
+// measureTTFT sends a chat completion request and returns the duration and prompt token count
+func measureTTFT(url, content string, client *http.Client) (duration time.Duration, promptTokens int, err error) {
+	payload := fmt.Sprintf(`{"model": "mistralai/Mistral-7B-Instruct-v0.3", "messages": [{"role": "user", "content": %q}], "max_tokens": 1}`, content)
+
+	req, err := http.NewRequest("POST", url, strings.NewReader(payload))
+	if err != nil {
+		return 0, 0, fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	start := time.Now()
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, 0, fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	duration = time.Since(start)
+
+	if err != nil {
+		return duration, 0, fmt.Errorf("failed to read response: %w", err)
+	}
+
+	// Parse prompt_tokens from response
+	var result struct {
+		Usage struct {
+			PromptTokens int `json:"prompt_tokens"`
+		} `json:"usage"`
+	}
+	if jsonErr := json.Unmarshal(body, &result); jsonErr == nil {
+		promptTokens = result.Usage.PromptTokens
+	}
+
+	return duration, promptTokens, nil
+}
+
+// wildchatPrompt represents a prompt from the WildChat dataset
+type wildchatPrompt struct {
+	Article       string `json:"article"`
+	SummaryTokens int    `json:"summary_tokens"`
+}
+
+func TestMeasureGORGO_MS_PER_CHAR(t *testing.T) {
+	url := "http://151.145.83.16:8080/v1/chat/completions"
+	client := &http.Client{Timeout: 30 * time.Second}
+
+	// Load prompts from WildChat dataset
+	wildchatPath := "../../benchmark/wildchat_flat.jsonl"
+	t.Logf("Loading prompts from %s...", wildchatPath)
+
+	file, err := os.Open(wildchatPath)
+	if err != nil {
+		t.Fatalf("Failed to open wildchat file: %v", err)
+	}
+	defer file.Close()
+
+	var allPrompts []wildchatPrompt
+	scanner := bufio.NewScanner(file)
+	// Increase scanner buffer for long lines
+	buf := make([]byte, 0, 64*1024)
+	scanner.Buffer(buf, 1024*1024)
+
+	for scanner.Scan() {
+		var prompt wildchatPrompt
+		if err := json.Unmarshal(scanner.Bytes(), &prompt); err != nil {
+			continue // skip malformed lines
+		}
+		// Filter out very short or very long prompts
+		if len(prompt.Article) >= 10 && len(prompt.Article) <= 10000 {
+			allPrompts = append(allPrompts, prompt)
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		t.Fatalf("Error reading wildchat file: %v", err)
+	}
+
+	t.Logf("Loaded %d prompts from WildChat", len(allPrompts))
+
+	// First, measure token counts for all prompts (one-time cost)
+	t.Log("Measuring token counts for prompts...")
+	type promptWithTokens struct {
+		content string
+		tokens  int
+	}
+	var promptsWithTokens []promptWithTokens
+
+	// Sample every Nth prompt to get token counts faster
+	sampleStep := max(1, len(allPrompts)/50)
+	for i := 0; i < len(allPrompts); i += sampleStep {
+		// Quick request just to get token count
+		_, tokens, err := measureTTFT(url, allPrompts[i].Article, client)
+		if err != nil {
+			continue
+		}
+		promptsWithTokens = append(promptsWithTokens, promptWithTokens{
+			content: allPrompts[i].Article,
+			tokens:  tokens,
+		})
+	}
+
+	// Sort by actual token count
+	sort.Slice(promptsWithTokens, func(i, j int) bool {
+		return promptsWithTokens[i].tokens < promptsWithTokens[j].tokens
+	})
+
+	t.Logf("Got token counts for %d prompts", len(promptsWithTokens))
+
+	// Helper to check if two strings share a prefix (min 20 chars to be meaningful)
+	sharesPrefix := func(a, b string, minLen int) bool {
+		maxCheck := min(len(a), len(b), 100) // check up to first 100 chars
+		if maxCheck < minLen {
+			return false
+		}
+		for i := minLen; i <= maxCheck; i++ {
+			if a[:i] == b[:i] {
+				return true
+			}
+		}
+		return false
+	}
+
+	// Select 10 evenly-spaced prompts by token count, avoiding prefix overlaps
+	numSamples := 10
+	if len(promptsWithTokens) < numSamples {
+		numSamples = len(promptsWithTokens)
+	}
+
+	var selectedPrompts []promptWithTokens
+	targetIndices := make([]int, numSamples)
+	for i := 0; i < numSamples; i++ {
+		targetIndices[i] = i * (len(promptsWithTokens) - 1) / (numSamples - 1)
+	}
+
+	for _, targetIdx := range targetIndices {
+		// Try to find a prompt near targetIdx that doesn't share prefix with selected ones
+		found := false
+		for offset := 0; offset < len(promptsWithTokens) && !found; offset++ {
+			// Alternate checking above and below target
+			for _, delta := range []int{offset, -offset} {
+				idx := targetIdx + delta
+				if idx < 0 || idx >= len(promptsWithTokens) {
+					continue
+				}
+				candidate := promptsWithTokens[idx]
+
+				// Check for prefix overlap with all selected prompts
+				hasOverlap := false
+				for _, selected := range selectedPrompts {
+					if sharesPrefix(candidate.content, selected.content, 20) {
+						hasOverlap = true
+						break
+					}
+				}
+
+				if !hasOverlap {
+					selectedPrompts = append(selectedPrompts, candidate)
+					found = true
+					break
+				}
+			}
+		}
+	}
+
+	t.Logf("Selected %d prompts with no overlapping prefixes", len(selectedPrompts))
+
+	// Build test cases from selected prompts
+	testCases := make([]struct {
+		name    string
+		content string
+	}, len(selectedPrompts))
+
+	for i, p := range selectedPrompts {
+		testCases[i] = struct {
+			name    string
+			content string
+		}{
+			name:    fmt.Sprintf("wc_%d", i+1),
+			content: p.content,
+		}
+		// Show first 40 chars of each prompt to verify no prefix overlap
+		preview := p.content
+		if len(preview) > 40 {
+			preview = preview[:40] + "..."
+		}
+		t.Logf("  %s: %d tokens, prefix: %q", testCases[i].name, p.tokens, preview)
+	}
+
+	t.Logf("Selected %d prompts with lengths: %v chars",
+		len(selectedPrompts),
+		func() []int {
+			lengths := make([]int, len(selectedPrompts))
+			for i, tc := range testCases {
+				lengths[i] = len(tc.content)
+			}
+			return lengths
+		}())
+
+	// Warmup request (not timed)
+	t.Log("Sending warmup requests...")
+	for i := 0; i < 3; i++ {
+		_, _, err := measureTTFT(url, "warmup", client)
+		if err != nil {
+			t.Fatalf("Warmup failed: %v", err)
+		}
+	}
+	t.Log("Warmup complete")
+
+	t.Log("\n=== TTFT Measurements (WildChat prompts) ===")
+	t.Logf("%-8s | %-6s | %-8s | %-12s", "Sample", "Tokens", "Chars", "TTFT")
+	t.Log(strings.Repeat("-", 50))
+
+	var results []struct {
+		tokens   int
+		duration time.Duration
+		chars    int
+	}
+
+	for _, tc := range testCases {
+		// Run 3 times and take the median to reduce noise
+		var durations []time.Duration
+		var tokens int
+
+		for i := 0; i < 3; i++ {
+			d, tok, err := measureTTFT(url, tc.content, client)
+			if err != nil {
+				t.Fatalf("Request failed for %s: %v", tc.name, err)
+			}
+			durations = append(durations, d)
+			tokens = tok
+			time.Sleep(50 * time.Millisecond) // small gap between requests
+		}
+
+		// Sort and take median
+		sort.Slice(durations, func(i, j int) bool {
+			return durations[i] < durations[j]
+		})
+		median := durations[len(durations)/2]
+
+		t.Logf("%-8s | %-6d | %-8d | %v", tc.name, tokens, len(tc.content), median)
+		results = append(results, struct {
+			tokens   int
+			duration time.Duration
+			chars    int
+		}{tokens, median, len(tc.content)})
+	}
+
+	// Calculate prefill rate using linear regression
+	// TTFT = base_latency + (prefill_rate * tokens)
+	// slope = prefill_rate (ms/token)
+	// intercept = base_latency (network + overhead)
+	if len(results) >= 2 {
+		t.Log(strings.Repeat("-", 50))
+
+		// Convert to float64 for regression
+		n := float64(len(results))
+		var sumX, sumY, sumXY, sumX2, sumY2 float64
+
+		for _, r := range results {
+			x := float64(r.tokens)
+			y := float64(r.duration.Microseconds()) / 1000.0 // convert to ms
+			sumX += x
+			sumY += y
+			sumXY += x * y
+			sumX2 += x * x
+			sumY2 += y * y
+		}
+
+		// Linear regression: y = intercept + slope * x
+		// slope = (n*Σxy - Σx*Σy) / (n*Σx² - (Σx)²)
+		// intercept = (Σy - slope*Σx) / n
+		denominator := n*sumX2 - sumX*sumX
+		if denominator != 0 {
+			slope := (n*sumXY - sumX*sumY) / denominator
+			intercept := (sumY - slope*sumX) / n
+
+			// Calculate R² (coefficient of determination)
+			// R² = 1 - (SS_res / SS_tot)
+			meanY := sumY / n
+			var ssRes, ssTot float64
+			for _, r := range results {
+				x := float64(r.tokens)
+				y := float64(r.duration.Microseconds()) / 1000.0
+				predicted := intercept + slope*x
+				ssRes += (y - predicted) * (y - predicted)
+				ssTot += (y - meanY) * (y - meanY)
+			}
+			r2 := 1.0 - (ssRes / ssTot)
+
+			t.Logf("Linear regression: TTFT = %.2f ms + %.4f ms/token × tokens", intercept, slope)
+			t.Logf("  Base latency (intercept): %.2f ms", intercept)
+			t.Logf("  Prefill rate (slope):     %.4f ms/token", slope)
+			t.Logf("  R² (goodness of fit):     %.4f", r2)
+
+			// Also show neighbor deltas for comparison
+			t.Log("")
+			t.Log("Neighbor deltas:")
+			var deltaSum float64
+			for i := 1; i < len(results); i++ {
+				tokenDelta := results[i].tokens - results[i-1].tokens
+				timeDelta := results[i].duration - results[i-1].duration
+				msPerToken := float64(timeDelta.Microseconds()) / float64(tokenDelta) / 1000.0
+				deltaSum += msPerToken
+				t.Logf("  %d→%d tokens: %+.3f ms/token", results[i-1].tokens, results[i].tokens, msPerToken)
+			}
+			avgDelta := deltaSum / float64(len(results)-1)
+			t.Logf("  Average delta: %.4f ms/token", avgDelta)
+		}
+	}
+}
+
+// TestMeasureGORGO_MS_PER_TOKEN measures prefill rate using local tokenizer
+// This uses GetTokenCount() which is what the load balancer will use for routing
+//
+// IMPORTANT: For accurate measurements, this test:
+// 1. Flushes KV cache before each measurement to ensure cold-start TTFT
+// 2. Uses ALL prompts from WildChat for maximum statistical power
+// 3. Filters prompts to avoid prefix overlaps that could cause cache hits
+func TestMeasureGORGO_MS_PER_TOKEN(t *testing.T) {
+	serverURL := "http://151.145.83.16:8080"
+	apiURL := serverURL + "/v1/chat/completions"
+	client := &http.Client{Timeout: 60 * time.Second}
+
+	t.Log("=== Flushing KV Cache for Accurate Measurements ===")
+	if err := FlushSGLangCache(serverURL, 10*time.Second); err != nil {
+		t.Logf("Warning: Could not flush KV cache: %v", err)
+		t.Log("Measurements may include cache hits. For most accurate results,")
+		t.Log("restart SGLang with --disable-radix-cache")
+	} else {
+		t.Log("✅ KV cache flushed successfully")
+	}
+	wildchatPath := "../../benchmark/wildchat_flat.jsonl"
+	t.Logf("Loading ALL prompts from %s...", wildchatPath)
+
+	file, err := os.Open(wildchatPath)
+	if err != nil {
+		t.Fatalf("Failed to open wildchat file: %v", err)
+	}
+	defer file.Close()
+
+	var allPrompts []string
+	scanner := bufio.NewScanner(file)
+	buf := make([]byte, 0, 64*1024)
+	scanner.Buffer(buf, 1024*1024)
+
+	for scanner.Scan() {
+		var prompt wildchatPrompt
+		if err := json.Unmarshal(scanner.Bytes(), &prompt); err != nil {
+			continue
+		}
+		// Accept all valid prompts (no length filtering)
+		if len(prompt.Article) >= 10 {
+			allPrompts = append(allPrompts, prompt.Article)
+		}
+	}
+
+	t.Logf("Loaded %d prompts from WildChat", len(allPrompts))
+
+	// Use LOCAL tokenizer to get token counts (this is what the load balancer will use)
+	t.Log("Computing token counts using local tokenizer (GetTokenCount)...")
+
+	type promptWithTokens struct {
+		content      string
+		localTokens  int
+		serverTokens int
+	}
+
+	var promptsWithTokens []promptWithTokens
+
+	// Process ALL prompts (no sampling)
+	for _, content := range allPrompts {
+		localTokens := GetTokenCount(content)
+		promptsWithTokens = append(promptsWithTokens, promptWithTokens{
+			content:     content,
+			localTokens: localTokens,
+		})
+	}
+
+	// Sort by LOCAL token count (what the load balancer sees)
+	sort.Slice(promptsWithTokens, func(i, j int) bool {
+		return promptsWithTokens[i].localTokens < promptsWithTokens[j].localTokens
+	})
+
+	t.Logf("Computed local token counts for ALL %d prompts", len(promptsWithTokens))
+
+	// Log token count distribution
+	if len(promptsWithTokens) > 0 {
+		minTokens := promptsWithTokens[0].localTokens
+		maxTokens := promptsWithTokens[len(promptsWithTokens)-1].localTokens
+		medianTokens := promptsWithTokens[len(promptsWithTokens)/2].localTokens
+		t.Logf("Token distribution: min=%d, median=%d, max=%d", minTokens, medianTokens, maxTokens)
+	}
+
+	// Helper to check prefix overlap
+	sharesPrefix := func(a, b string, minLen int) bool {
+		maxCheck := min(len(a), len(b), 100)
+		if maxCheck < minLen {
+			return false
+		}
+		for i := minLen; i <= maxCheck; i++ {
+			if a[:i] == b[:i] {
+				return true
+			}
+		}
+		return false
+	}
+
+	// Select ALL non-overlapping prompts (use all available data)
+	var selected []promptWithTokens
+	for _, candidate := range promptsWithTokens {
+		hasOverlap := false
+		for _, sel := range selected {
+			if sharesPrefix(candidate.content, sel.content, 20) {
+				hasOverlap = true
+				break
+			}
+		}
+		if !hasOverlap {
+			selected = append(selected, candidate)
+		}
+	}
+
+	t.Logf("Selected %d prompts with no overlapping prefixes (from %d total)",
+		len(selected), len(promptsWithTokens))
+
+	// Warmup
+	t.Log("Sending warmup requests...")
+	for i := 0; i < 3; i++ {
+		measureTTFT(apiURL, "warmup", client)
+	}
+	t.Log("Warmup complete")
+
+	// Flush cache AGAIN after warmup to ensure cold measurements
+	t.Log("Flushing KV cache again after warmup...")
+	if err := FlushSGLangCache(serverURL, 10*time.Second); err != nil {
+		t.Logf("Warning: Could not flush KV cache after warmup: %v", err)
+	} else {
+		t.Log("✅ KV cache flushed after warmup")
+	}
+
+	t.Log("\n=== TTFT Measurements (Local Tokenizer) - ALL PROMPTS ===")
+	t.Logf("%-8s | %-10s | %-10s | %-5s | %-12s", "Sample", "LocalToks", "ServerToks", "Diff", "TTFT")
+	t.Log(strings.Repeat("-", 65))
+
+	var results []struct {
+		localTokens  int
+		serverTokens int
+		duration     time.Duration
+	}
+
+	// Process all selected prompts, flushing cache AFTER EACH request for cold-start TTFT
+	for i, p := range selected {
+		// Measure TTFT
+		d, serverTok, err := measureTTFT(apiURL, p.content, client)
+		if err != nil {
+			t.Logf("Request %d failed: %v (skipping)", i+1, err)
+			continue
+		}
+
+		diff := p.localTokens - serverTok
+		diffStr := fmt.Sprintf("%+d", diff)
+
+		// Log every 10th result to avoid overwhelming output
+		if i < 10 || i%10 == 0 || i == len(selected)-1 {
+			t.Logf("wc_%-5d | %-10d | %-10d | %-5s | %v",
+				i+1, p.localTokens, serverTok, diffStr, d)
+		}
+
+		results = append(results, struct {
+			localTokens  int
+			serverTokens int
+			duration     time.Duration
+		}{p.localTokens, serverTok, d})
+
+		// Flush cache AFTER each request to ensure next request is cold-start
+		if err := FlushSGLangCache(serverURL, 5*time.Second); err != nil {
+			t.Logf("Warning: Cache flush after prompt %d failed: %v", i+1, err)
+		}
+	}
+
+	t.Logf("\nMeasured %d prompts successfully", len(results))
+	t.Log(strings.Repeat("-", 65))
+
+	// Calculate correlation between local and server token counts
+	var sumLocal, sumServer float64
+	for _, r := range results {
+		sumLocal += float64(r.localTokens)
+		sumServer += float64(r.serverTokens)
+	}
+	avgLocal := sumLocal / float64(len(results))
+	avgServer := sumServer / float64(len(results))
+
+	var covLS, varL, varS float64
+	for _, r := range results {
+		dL := float64(r.localTokens) - avgLocal
+		dS := float64(r.serverTokens) - avgServer
+		covLS += dL * dS
+		varL += dL * dL
+		varS += dS * dS
+	}
+	correlation := covLS / (math.Sqrt(varL) * math.Sqrt(varS))
+
+	t.Logf("Token count correlation (local vs server): %.4f", correlation)
+	t.Logf("Average difference: %.1f tokens", (sumLocal-sumServer)/float64(len(results)))
+
+	// Linear regression using LOCAL token counts
+	if len(results) >= 2 {
+		t.Log("\n=== Linear Regression (using LOCAL token counts) ===")
+
+		n := float64(len(results))
+		var sumX, sumY, sumXY, sumX2 float64
+
+		for _, r := range results {
+			x := float64(r.localTokens) // Use LOCAL tokens
+			y := float64(r.duration.Microseconds()) / 1000.0
+			sumX += x
+			sumY += y
+			sumXY += x * y
+			sumX2 += x * x
+		}
+
+		denominator := n*sumX2 - sumX*sumX
+		if denominator != 0 {
+			slope := (n*sumXY - sumX*sumY) / denominator
+			intercept := (sumY - slope*sumX) / n
+
+			// R²
+			meanY := sumY / n
+			var ssRes, ssTot float64
+			for _, r := range results {
+				x := float64(r.localTokens)
+				y := float64(r.duration.Microseconds()) / 1000.0
+				predicted := intercept + slope*x
+				ssRes += (y - predicted) * (y - predicted)
+				ssTot += (y - meanY) * (y - meanY)
+			}
+			r2 := 1.0 - (ssRes / ssTot)
+
+			t.Log("")
+			t.Logf("GORGO_MS_PER_TOKEN = %.4f ms/token", slope)
+			t.Log("")
+			t.Logf("Linear regression: TTFT = %.2f ms + %.4f ms/token × tokens", intercept, slope)
+			t.Logf("  Base latency (intercept): %.2f ms", intercept)
+			t.Logf("  Prefill rate (slope):     %.4f ms/token", slope)
+			t.Logf("  R² (goodness of fit):     %.4f", r2)
+
+			// Recommended constant for loadbalancer.go
+			t.Log("")
+			t.Log("=== RECOMMENDED UPDATE ===")
+			t.Logf("In loadbalancer.go, update:")
+			t.Logf("  const GORGO_MS_PER_TOKEN = %.4f", slope)
+		}
+	}
+}
+
+// setupTokenizerOnCluster installs the daulet/tokenizers library on all cluster instances
+// This enables fast, accurate token counting for GORGO routing decisions
+func setupTokenizerOnCluster(cluster *Cluster) error {
+	fmt.Println("=== Setting up Tokenizer Library on Cluster ===")
+
+	// Installation script for Linux (Ubuntu)
+	installScript := `#!/bin/bash
+set -e
+
+echo "=== Tokenizer Library Installation ==="
+
+# Check if already installed
+if [ -f /usr/local/lib/libtokenizers.a ]; then
+    echo "✅ libtokenizers.a already installed"
+    exit 0
+fi
+
+echo "1. Installing Rust (if not present)..."
+if ! command -v cargo &> /dev/null; then
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+    source $HOME/.cargo/env
+fi
+
+echo "2. Installing build dependencies..."
+sudo apt-get update -qq
+sudo apt-get install -y -qq build-essential pkg-config libssl-dev git
+
+echo "3. Cloning tokenizers repository..."
+rm -rf /tmp/tokenizers-build
+git clone --depth 1 https://github.com/daulet/tokenizers.git /tmp/tokenizers-build
+
+echo "4. Building tokenizers library..."
+cd /tmp/tokenizers-build
+source $HOME/.cargo/env
+make build
+
+echo "5. Installing library to /usr/local/lib..."
+sudo cp libtokenizers.a /usr/local/lib/
+sudo cp tokenizers.h /usr/local/include/ 2>/dev/null || true
+
+echo "6. Verifying installation..."
+ls -la /usr/local/lib/libtokenizers.a
+
+echo "✅ Tokenizer library installed successfully!"
+`
+
+	// Run installation on all instances in parallel
+	fmt.Printf("Installing tokenizer library on %d instances...\n", len(cluster.Instances))
+
+	var wg sync.WaitGroup
+	results := make(map[string]error)
+	var resultsMu sync.Mutex
+
+	for _, inst := range cluster.Instances {
+		wg.Add(1)
+		go func(instance remote.RunningInstance) {
+			defer wg.Done()
+
+			fmt.Printf("  → Installing on %s (%s)...\n", instance.Name, instance.IP)
+
+			output, err := cluster.sshMgr.ExecuteCommandWithTimeout(
+				instance.IP,
+				installScript,
+				15*time.Minute, // Rust compilation can take a while
+			)
+
+			resultsMu.Lock()
+			if err != nil {
+				results[instance.ID] = fmt.Errorf("installation failed: %w\nOutput: %s", err, output)
+				fmt.Printf("  ❌ Failed on %s: %v\n", instance.Name, err)
+			} else {
+				results[instance.ID] = nil
+				fmt.Printf("  ✅ Installed on %s\n", instance.Name)
+			}
+			resultsMu.Unlock()
+		}(inst)
+	}
+
+	wg.Wait()
+
+	// Count successes and failures
+	successCount := 0
+	for _, err := range results {
+		if err == nil {
+			successCount++
+		}
+	}
+
+	fmt.Printf("\nTokenizer installation complete: %d/%d instances successful\n",
+		successCount, len(cluster.Instances))
+
+	if successCount < len(cluster.Instances) {
+		return fmt.Errorf("tokenizer installation failed on %d instances",
+			len(cluster.Instances)-successCount)
+	}
+
+	return nil
+}
+
+// verifyTokenizerOnCluster verifies that the tokenizer is working on all cluster instances
+func verifyTokenizerOnCluster(cluster *Cluster) error {
+	fmt.Println("=== Verifying Tokenizer on Cluster ===")
+
+	// Test script that mimics the Go tokenizer test
+	testScript := `#!/bin/bash
+set -e
+
+echo "Verifying tokenizer library..."
+
+# Check library exists
+if [ ! -f /usr/local/lib/libtokenizers.a ]; then
+    echo "❌ libtokenizers.a not found"
+    exit 1
+fi
+
+echo "Library file exists: $(ls -la /usr/local/lib/libtokenizers.a)"
+
+# Try to compile and run a simple Go test
+cat > /tmp/tokenizer_test.go << 'GOEOF'
+package main
+
+import (
+    "fmt"
+    "os"
+    "github.com/daulet/tokenizers"
+)
+
+func main() {
+    tk, err := tokenizers.FromPretrained("mistralai/Mistral-7B-Instruct-v0.3")
+    if err != nil {
+        fmt.Printf("Failed to load tokenizer: %v\n", err)
+        os.Exit(1)
+    }
+    defer tk.Close()
+
+    // Test tokenization
+    ids, _ := tk.Encode("Hello, world!", false)
+    fmt.Printf("Token count for 'Hello, world!': %d\n", len(ids))
+
+    ids2, _ := tk.Encode("The quick brown fox jumps over the lazy dog.", false)
+    fmt.Printf("Token count for long text: %d\n", len(ids2))
+
+    if len(ids) < 1 || len(ids) > 10 {
+        fmt.Printf("Unexpected token count: %d\n", len(ids))
+        os.Exit(1)
+    }
+
+    fmt.Println("✅ Tokenizer verification passed!")
+}
+GOEOF
+
+# Check if Go is installed
+if ! command -v go &> /dev/null; then
+    echo "Installing Go..."
+    wget -q https://go.dev/dl/go1.21.5.linux-amd64.tar.gz -O /tmp/go.tar.gz
+    sudo rm -rf /usr/local/go
+    sudo tar -C /usr/local -xzf /tmp/go.tar.gz
+    export PATH=$PATH:/usr/local/go/bin
+fi
+
+export PATH=$PATH:/usr/local/go/bin
+
+# Initialize Go module and run test
+cd /tmp
+rm -rf tokenizer_verify && mkdir tokenizer_verify && cd tokenizer_verify
+go mod init tokenizer_verify
+go get github.com/daulet/tokenizers
+
+# Compile with library path
+CGO_LDFLAGS="-L/usr/local/lib" go run /tmp/tokenizer_test.go
+`
+
+	var wg sync.WaitGroup
+	results := make(map[string]error)
+	var resultsMu sync.Mutex
+
+	for _, inst := range cluster.Instances {
+		wg.Add(1)
+		go func(instance remote.RunningInstance) {
+			defer wg.Done()
+
+			fmt.Printf("  → Verifying on %s (%s)...\n", instance.Name, instance.IP)
+
+			output, err := cluster.sshMgr.ExecuteCommandWithTimeout(
+				instance.IP,
+				testScript,
+				5*time.Minute,
+			)
+
+			resultsMu.Lock()
+			if err != nil {
+				results[instance.ID] = fmt.Errorf("verification failed: %w\nOutput: %s", err, output)
+				fmt.Printf("  ❌ Failed on %s: %v\n", instance.Name, err)
+			} else {
+				results[instance.ID] = nil
+				fmt.Printf("  ✅ Verified on %s\n", instance.Name)
+				// Print the token counts from the output
+				if strings.Contains(output, "Token count") {
+					lines := strings.Split(output, "\n")
+					for _, line := range lines {
+						if strings.Contains(line, "Token count") {
+							fmt.Printf("    %s\n", strings.TrimSpace(line))
+						}
+					}
+				}
+			}
+			resultsMu.Unlock()
+		}(inst)
+	}
+
+	wg.Wait()
+
+	// Count successes
+	successCount := 0
+	for _, err := range results {
+		if err == nil {
+			successCount++
+		}
+	}
+
+	fmt.Printf("\nTokenizer verification complete: %d/%d instances passed\n",
+		successCount, len(cluster.Instances))
+
+	if successCount < len(cluster.Instances) {
+		return fmt.Errorf("tokenizer verification failed on %d instances",
+			len(cluster.Instances)-successCount)
+	}
+
+	return nil
+}
+
+// TestSetupTokenizerOnCluster is an integration test that sets up and verifies
+// the tokenizer library on all cluster instances
+func TestSetupTokenizerOnCluster(t *testing.T) {
+	fmt.Println("=== Testing Tokenizer Setup on Cluster ===")
+
+	// Load environment variables
+	if err := godotenv.Load("../../.env"); err != nil {
+		t.Logf("Warning: Could not load .env file: %v", err)
+	}
+
+	httpClient := remote.NewHTTPClient()
+	apiToken := os.Getenv("LAMBDA_API_KEY")
+
+	if apiToken == "" {
+		t.Skip("LAMBDA_API_KEY not set, skipping integration test")
+	}
+
+	// Get running instances
+	provider, _ := remote.GetCloudProvider()
+	allInstances, err := provider.ListRunningInstances(httpClient, apiToken)
+	if err != nil {
+		t.Fatalf("Failed to list running instances: %v", err)
+	}
+
+	if len(allInstances) == 0 {
+		t.Fatal("No running instances found")
+	}
+
+	t.Logf("Found %d running instances", len(allInstances))
+
+	// Initialize database for SSH key lookups
+	database, dbErr := db.InitDB()
+	if dbErr != nil {
+		t.Fatalf("Failed to initialize database: %v", dbErr)
+	}
+
+	// Create cluster
+	cluster := &Cluster{
+		Name:      "tokenizer-test-cluster",
+		Instances: allInstances,
+		sshMgr:    remote.NewSSHClientManager(),
+		database:  database,
+	}
+
+	// Connect to cluster
+	if err := cluster.Connect(); err != nil {
+		t.Fatalf("Failed to connect to cluster: %v", err)
+	}
+	defer cluster.Disconnect()
+
+	// Setup tokenizer on all instances
+	if err := setupTokenizerOnCluster(cluster); err != nil {
+		t.Fatalf("Failed to setup tokenizer: %v", err)
+	}
+
+	// Verify tokenizer works
+	if err := verifyTokenizerOnCluster(cluster); err != nil {
+		t.Fatalf("Failed to verify tokenizer: %v", err)
+	}
+
+	t.Log("✅ Tokenizer setup and verification complete!")
 }
