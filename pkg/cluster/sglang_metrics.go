@@ -28,6 +28,7 @@ type SGLangMetrics struct {
 	LastUpdated      time.Time
 	Healthy          bool
 	ConsecutiveFails int
+	Latency          int64 // point-to-point latency in miliseconds
 }
 
 // SGLangServerInfo is the raw response from SGLang's /get_server_info endpoint
@@ -128,11 +129,22 @@ func (lb *LoadBalancer) pollPeerMetrics(peer *PeerNode) {
 
 	metricsURL := fmt.Sprintf("http://%s:%d%s", peer.Instance.IP, peer.Port, lb.config.MetricsEndpoint)
 
+	// timestamp the start of the poll
+	start := time.Now()
+
 	metrics, err := lb.fetchSGLangMetrics(ctx, metricsURL)
 	if err != nil {
 		lb.markPeerUnhealthy(peer)
 		return
 	}
+
+	// timestamp the end of the poll
+	end := time.Now()
+	elapsed := end.Sub(start)
+	log.Printf("[LB] Poll peer metrics for %s took %s", peer.Instance.ID, elapsed)
+
+	// calculate point-to-point latency in miliseconds for policy usage
+	peer.Metrics.Latency = elapsed.Milliseconds()
 
 	// Update peer metrics and availability
 	lb.peersMu.Lock()
