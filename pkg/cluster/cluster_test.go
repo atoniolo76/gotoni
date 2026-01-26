@@ -1,6 +1,7 @@
 package serve
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
@@ -824,10 +825,13 @@ func setupLlamaCppDocker(cluster *Cluster, hfToken string) {
 func setupGotoniBinaryOnInstance(cluster *Cluster) []remote.Task {
 	fmt.Println("setting up gotoni binary on all instances...")
 
-	// first, build gotoni for current platform
+	// Get the project root directory (2 levels up from pkg/cluster/)
+	projectRoot := "../../"
+
+	// first, build gotoni for current platform from the project root
 	fmt.Println("Building gotoni for current platform...")
 	buildCmd := exec.Command("go", "build", "-o", "gotoni", ".")
-	buildCmd.Dir = "."
+	buildCmd.Dir = projectRoot
 	buildCmd.Stdout = os.Stdout
 	buildCmd.Stderr = os.Stderr
 	if err := buildCmd.Run(); err != nil {
@@ -838,6 +842,9 @@ func setupGotoniBinaryOnInstance(cluster *Cluster) []remote.Task {
 	fmt.Println("✅ gotoni binary built successfully")
 
 	out := []remote.Task{}
+
+	// Track which architectures we've already built
+	builtArchs := make(map[string]bool)
 
 	// next, build the process for linux amd64 or whatever the instance details
 	for _, inst := range cluster.Instances {
@@ -865,20 +872,38 @@ func setupGotoniBinaryOnInstance(cluster *Cluster) []remote.Task {
 			continue
 		}
 
-		fmt.Printf("Building for %s/%s on instance %s\n", goos, goarch, inst.ID[:16])
-
 		archName := "gotoni-" + goarch
-		crossBuildCmd := exec.Command("go", "build", "-o", archName, ".")
-		crossBuildCmd.Dir = "."
-		crossBuildCmd.Env = append(os.Environ(), "GOOS="+goos, "GOARCH="+goarch)
-		crossBuildCmd.Stdout = os.Stdout
-		crossBuildCmd.Stderr = os.Stderr
-		if err := crossBuildCmd.Run(); err != nil {
-			fmt.Printf("❌ Failed to build gotoni binary for %s/%s: %v\n", goos, goarch, err)
-			continue
-		}
+		archKey := goos + "/" + goarch
 
-		fmt.Printf("✅ Binary built for %s/%s\n", goos, goarch)
+		// Only build once per architecture
+		if !builtArchs[archKey] {
+			fmt.Printf("Building for %s/%s on instance %s\n", goos, goarch, inst.ID[:16])
+
+			// Build from project root with correct output path
+			crossBuildCmd := exec.Command("go", "build", "-o", archName, ".")
+			crossBuildCmd.Dir = projectRoot
+			crossBuildCmd.Env = append(os.Environ(), "GOOS="+goos, "GOARCH="+goarch, "CGO_ENABLED=0")
+			crossBuildCmd.Stdout = os.Stdout
+			crossBuildCmd.Stderr = os.Stderr
+			if err := crossBuildCmd.Run(); err != nil {
+				fmt.Printf("❌ Failed to build gotoni binary for %s/%s: %v\n", goos, goarch, err)
+				continue
+			}
+
+			// Verify the built binary is an ELF executable, not an archive
+			builtBinaryPath := projectRoot + archName
+			verifyLocalCmd := exec.Command("file", builtBinaryPath)
+			verifyOutput, _ := verifyLocalCmd.Output()
+			if !strings.Contains(string(verifyOutput), "ELF") {
+				fmt.Printf("❌ Built binary is not a valid ELF executable: %s\n", string(verifyOutput))
+				continue
+			}
+
+			fmt.Printf("✅ Binary built for %s/%s (verified as ELF executable)\n", goos, goarch)
+			builtArchs[archKey] = true
+		} else {
+			fmt.Printf("Using pre-built binary for %s/%s\n", goos, goarch)
+		}
 
 		// Get SSH key path for this instance
 		var sshKeyPath string
@@ -897,20 +922,22 @@ func setupGotoniBinaryOnInstance(cluster *Cluster) []remote.Task {
 		}
 
 		// Copy the binary to the instance using SCP with the SSH key
+		// Use the binary from project root
+		localBinaryPath := projectRoot + archName
 		remotePath := "/home/ubuntu/" + archName
-		fmt.Printf("📤 Copying %s to %s:%s via SCP...\n", archName, inst.IP, remotePath)
+		fmt.Printf("📤 Copying %s to %s:%s via SCP...\n", localBinaryPath, inst.IP, remotePath)
 
 		scpCmd := exec.Command("scp",
 			"-i", sshKeyPath,
 			"-o", "StrictHostKeyChecking=no",
 			"-o", "UserKnownHostsFile=/dev/null",
-			archName,
+			localBinaryPath,
 			fmt.Sprintf("ubuntu@%s:%s", inst.IP, remotePath),
 		)
 		scpCmd.Stdout = os.Stdout
 		scpCmd.Stderr = os.Stderr
 		fmt.Printf("🔧 Running: scp -i %s -o StrictHostKeyChecking=no %s ubuntu@%s:%s\n",
-			sshKeyPath, archName, inst.IP, remotePath)
+			sshKeyPath, localBinaryPath, inst.IP, remotePath)
 
 		if err := scpCmd.Run(); err != nil {
 			fmt.Printf("❌ Failed to SCP binary to %s: %v\n", inst.ID[:16], err)
@@ -924,13 +951,19 @@ func setupGotoniBinaryOnInstance(cluster *Cluster) []remote.Task {
 			continue
 		}
 
-		// Verify the binary was copied correctly
+		// Verify the binary was copied correctly - must be ELF executable
 		verifyCmd := fmt.Sprintf("ls -la %s && file %s", remotePath, remotePath)
 		verifyOutput, err := sshMgr.ExecuteCommand(inst.IP, verifyCmd)
 		if err != nil {
 			fmt.Printf("❌ Failed to verify binary on %s: %v\n", inst.ID[:16], err)
 			continue
 		}
+
+		if !strings.Contains(verifyOutput, "ELF") {
+			fmt.Printf("❌ Binary on %s is NOT an ELF executable:\n%s\n", inst.ID[:16], verifyOutput)
+			continue
+		}
+
 		fmt.Printf("✅ Binary copied and verified on %s:\n%s\n", inst.ID[:16], verifyOutput)
 
 		out = append(out, remote.Task{
@@ -1436,4 +1469,532 @@ func ensureLokiFirewallRule(httpClient *http.Client, apiToken string) error {
 
 	fmt.Printf("✅ Firewall rule added for port %d\n", lokiPort)
 	return nil
+}
+
+// TestClusterSGLang tests SGLang server deployment on a cluster (no Loki logging)
+func TestClusterSGLang(t *testing.T) {
+	fmt.Println("=== Testing Cluster SGLang Server Deployment ===")
+
+	// Load environment variables from .env file
+	if err := godotenv.Load("../../.env"); err != nil {
+		t.Logf("Warning: Could not load .env file: %v", err)
+	}
+
+	httpClient := remote.NewHTTPClient()
+	apiToken := os.Getenv("LAMBDA_API_KEY")
+
+	if apiToken == "" {
+		t.Skip("LAMBDA_API_KEY not set, skipping integration test")
+	}
+
+	// Get ALL running instances from the provider
+	fmt.Println("1. Discovering all running instances...")
+	provider, _ := remote.GetCloudProvider()
+	allInstances, err := provider.ListRunningInstances(httpClient, apiToken)
+	if err != nil {
+		t.Fatalf("Failed to list running instances: %v", err)
+	}
+
+	if len(allInstances) == 0 {
+		t.Fatal("No running instances found. Please launch some instances first.")
+	}
+
+	fmt.Printf("Found %d running instance(s):\n", len(allInstances))
+	for _, inst := range allInstances {
+		fmt.Printf("  - %s (%s) @ %s [%s]\n", inst.Name, inst.ID[:16], inst.IP, inst.Region.Name)
+	}
+
+	// Create or load cluster with all running instances
+	clusterName := "sglang-auto-cluster"
+	cluster, err := GetCluster(httpClient, apiToken, clusterName)
+	if err != nil {
+		// Cluster doesn't exist, create a new one
+		fmt.Printf("\nCreating new cluster '%s' with all %d instances...\n", clusterName, len(allInstances))
+
+		// Initialize database for SSH key lookups
+		database, dbErr := db.InitDB()
+		if dbErr != nil {
+			t.Fatalf("Failed to initialize database: %v", dbErr)
+		}
+
+		cluster = &Cluster{
+			Name:      clusterName,
+			Instances: allInstances,
+			sshMgr:    remote.NewSSHClientManager(),
+			database:  database,
+		}
+	} else {
+		// Cluster exists, sync it with all running instances
+		fmt.Printf("\nSyncing cluster '%s' with all running instances...\n", clusterName)
+
+		// Build set of existing instance IDs
+		existingIDs := make(map[string]bool)
+		for _, inst := range cluster.Instances {
+			existingIDs[inst.ID] = true
+		}
+
+		// Add any new instances not already in cluster
+		for _, inst := range allInstances {
+			if !existingIDs[inst.ID] {
+				fmt.Printf("  → Adding instance: %s (%s) @ %s\n", inst.Name, inst.ID[:16], inst.IP)
+				if addErr := cluster.AddInstance(inst); addErr != nil {
+					fmt.Printf("    ⚠️  Failed to add: %v\n", addErr)
+				} else {
+					fmt.Printf("    ✅ Added!\n")
+				}
+			}
+		}
+
+		// Update cluster instances to match all running instances
+		cluster.Instances = allInstances
+	}
+
+	fmt.Printf("Cluster '%s' has %d instances\n", clusterName, len(cluster.Instances))
+
+	// 2. Connect to the cluster instances FIRST (required for heartbeat to work)
+	fmt.Println("2. Connecting to cluster instances...")
+
+	if err := cluster.Connect(); err != nil {
+		t.Fatalf("Failed to connect to cluster: %v", err)
+	}
+	defer cluster.Disconnect()
+
+	// Wait for all instances to be healthy (requires SSH connection)
+	if err := waitForHealthyCluster(cluster, len(cluster.Instances), 10*time.Minute); err != nil {
+		t.Fatalf("Failed to get healthy cluster: %v", err)
+	}
+
+	fmt.Printf("Connected to %d instances in cluster\n", len(cluster.Instances))
+
+	// 3. Setup: Check and install SGLang if needed
+	fmt.Println("\n3. Setting up SGLang on cluster instances...")
+	hfToken := os.Getenv("HF_TOKEN")
+	if hfToken == "" {
+		fmt.Println("Warning: HF_TOKEN not set, model download may fail for gated models")
+	}
+
+	setupSGLangDocker(cluster, hfToken)
+
+	// 4. Define SGLang server tasks
+	fmt.Println("\n4. Defining SGLang server tasks...")
+
+	// Task for SGLang server running in Docker container
+	// Using Mistral-7B-Instruct-v0.3 - no gating required (Llama requires approval)
+	sglangServerTask := remote.Task{
+		Name: "sglang-server-docker",
+		Command: `#!/bin/bash
+# Check if container is already running AND healthy
+if sudo docker ps --filter name=sglang-server --filter status=running | grep -q sglang-server; then
+    # Verify it's actually responding
+    if curl -s --connect-timeout 5 http://localhost:8080/health > /dev/null 2>&1; then
+        echo "Container sglang-server is already running and healthy"
+        exit 0
+    else
+        echo "Container exists but not healthy, restarting..."
+        sudo docker rm -f sglang-server 2>/dev/null || true
+    fi
+fi
+
+# Check if Docker image exists, pull if not
+if ! sudo docker images lmsysorg/sglang | grep -q sglang; then
+    echo "Pulling lmsysorg/sglang:latest image..."
+    sudo docker pull lmsysorg/sglang:latest
+fi
+
+# Remove any stopped containers with the same name
+sudo docker rm -f sglang-server 2>/dev/null || true
+
+# Also remove any old llama-server container that might be using port 8080
+sudo docker rm -f llama-server 2>/dev/null || true
+
+# Read HF_TOKEN from the cached file if it exists (for private models)
+HF_TOKEN_FILE="/home/ubuntu/.cache/huggingface/token"
+HF_TOKEN_ENV=""
+if [ -f "$HF_TOKEN_FILE" ]; then
+    HF_TOKEN=$(cat "$HF_TOKEN_FILE")
+    if [ -n "$HF_TOKEN" ]; then
+        HF_TOKEN_ENV="-e HF_TOKEN=$HF_TOKEN -e HUGGING_FACE_HUB_TOKEN=$HF_TOKEN"
+        echo "Using HF_TOKEN from cache file"
+    fi
+fi
+
+# Start the SGLang container with OpenAI-compatible API
+# Using mistralai/Mistral-7B-Instruct-v0.3 - NO GATING REQUIRED
+# (Llama models require HuggingFace approval which can take hours)
+sudo docker run --gpus all \
+    -v /home/ubuntu/.cache/huggingface:/root/.cache/huggingface \
+    -p 8080:8080 \
+    $HF_TOKEN_ENV \
+    --name sglang-server \
+    --restart unless-stopped \
+    -d lmsysorg/sglang:latest \
+    python -m sglang.launch_server \
+    --model-path mistralai/Mistral-7B-Instruct-v0.3 \
+    --port 8080 \
+    --host 0.0.0.0
+
+echo 'SGLang container started successfully'
+echo 'Note: Model loading can take 2-5 minutes on first run'
+`,
+		Background: true,
+		WorkingDir: "/home/ubuntu",
+		Env: map[string]string{
+			"CUDA_VISIBLE_DEVICES": "0",
+		},
+	}
+
+	// 5. Deploy SGLang tasks to cluster instances
+	fmt.Println("5. Deploying SGLang servers to cluster instances...")
+
+	for _, task := range []remote.Task{sglangServerTask} {
+		fmt.Printf("Deploying %s to all instances...\n", task.Name)
+
+		// Run task asynchronously on all instances
+		resultChan := make(chan map[string]error, 1)
+		go func(task remote.Task) {
+			results := cluster.RunTaskOnCluster(task)
+			resultChan <- results
+		}(task)
+
+		// Wait for completion with timeout
+		select {
+		case results := <-resultChan:
+			successCount := 0
+			for instanceID, err := range results {
+				if err != nil {
+					fmt.Printf("❌ Task %s failed on instance %s: %v\n", task.Name, instanceID, err)
+				} else {
+					fmt.Printf("✅ Task %s completed successfully on instance %s\n", task.Name, instanceID)
+					successCount++
+				}
+			}
+			fmt.Printf("Task %s deployed on %d/%d instances\n", task.Name, successCount, len(cluster.Instances))
+		case <-time.After(5 * time.Minute):
+			fmt.Printf("⏰ Task %s timed out after 5 minutes\n", task.Name)
+		}
+		fmt.Println()
+	}
+
+	// 6. Check task health (background processes)
+	fmt.Println("6. Checking task health...")
+	// Give SGLang time to start and load model (this can take a while)
+	fmt.Println("Waiting 60 seconds for SGLang to initialize and load model...")
+	time.Sleep(60 * time.Second)
+
+	// Run diagnostics on all instances to identify why port 8080 might not be reachable
+	fmt.Println("\n=== Running SGLang Diagnostics ===")
+	diagnoseSGLangOnCluster(cluster)
+
+	taskHealth := cluster.CheckTaskHealth()
+	fmt.Printf("Task Health Summary:\n")
+	fmt.Printf("Running tasks: %d/%d\n", taskHealth.RunningTasks, taskHealth.TotalTasks)
+	fmt.Printf("Checked at: %s\n\n", taskHealth.CheckedAt.Format(time.RFC3339))
+
+	// Display results for each task
+	for _, result := range taskHealth.Results {
+		status := "✅ RUNNING"
+		if !result.IsRunning {
+			status = "❌ STOPPED"
+		}
+
+		fmt.Printf("%s Task '%s' on %s (%s):\n", status, result.TaskName, result.InstanceID, result.InstanceIP)
+		if result.SessionName != "" {
+			fmt.Printf("  Session: %s\n", result.SessionName)
+		}
+		if result.Error != nil {
+			fmt.Printf("  Error: %v\n", result.Error)
+		}
+		fmt.Println()
+	}
+
+	// Check specific tasks
+	sglangRunning := cluster.IsTaskRunning("sglang-server-docker")
+
+	if sglangRunning {
+		fmt.Println("🎉 sglang-server-docker is running!")
+	} else {
+		fmt.Println("⚠️  sglang-server-docker is not running")
+	}
+
+	// 7. Test cluster heartbeat
+	fmt.Println("7. Test cluster heartbeat...")
+	testClusterHeartbeat(t, cluster)
+
+	// 8. Test SGLang API endpoints using /get_server_info (from sglang_metrics.go)
+	fmt.Println("8. Testing SGLang API endpoints...")
+	testSGLangAPIEndpoints(cluster, cluster.Instances)
+
+	// 9. Start load balancing processes
+	fmt.Println("9. Setting up load balancers...")
+	tasks := setupGotoniBinaryOnInstance(cluster)
+	if tasks == nil {
+		fmt.Println("❌ Failed to setup gotoni binary on instances")
+		return
+	}
+
+	for i, task := range tasks {
+		err := remote.ExecuteTask(cluster.sshMgr, cluster.Instances[i].IP, task, make(map[string]bool))
+		if err != nil {
+			fmt.Printf("❌ Failed to start gotoni load balancer on %s: %v\n", cluster.Instances[i].IP, err)
+		} else {
+			fmt.Printf("✅ Gotoni load balancer started on %s\n", cluster.Instances[i].IP)
+		}
+	}
+
+	// Test load balancers on cluster using the gotoni binary we already have
+	fmt.Println("Testing remote load balancer status...")
+
+	// Build gotoni binary from project root (../../ from pkg/cluster/)
+	fmt.Println("🏗️  Building gotoni binary for test...")
+	buildCmd := exec.Command("go", "build", "-o", "../../gotoni", "../../.")
+	buildCmd.Stdout = os.Stdout
+	buildCmd.Stderr = os.Stderr
+	if err := buildCmd.Run(); err != nil {
+		fmt.Printf("❌ Failed to build gotoni binary: %v\n", err)
+		return
+	}
+
+	// Run lb-remote-status from the built binary
+	statusCmd := exec.Command("../../gotoni", "lb-remote-status", "--all")
+	statusCmd.Stdout = os.Stdout
+	statusCmd.Stderr = os.Stderr
+	if err := statusCmd.Run(); err != nil {
+		fmt.Printf("❌ Failed to test remote load balancers: %v\n", err)
+		return
+	}
+	fmt.Println("✅ Remote load balancers tested successfully")
+	fmt.Println("=== Cluster SGLang Test Complete ===")
+}
+
+// testSGLangAPIEndpoints tests the SGLang server endpoints using /get_server_info
+func testSGLangAPIEndpoints(cluster *Cluster, instances []remote.RunningInstance) {
+	testClient := &http.Client{Timeout: 10 * time.Second}
+
+	// All SGLang servers run on port 8080
+	port := 8080
+
+	for _, instance := range instances {
+		// Test health endpoint
+		healthURL := fmt.Sprintf("http://%s:%d/health", instance.IP, port)
+		resp, err := testClient.Get(healthURL)
+		if err != nil {
+			fmt.Printf("❌ Health check failed for %s:%d - %v\n", instance.IP, port, err)
+		} else {
+			resp.Body.Close()
+			if resp.StatusCode == 200 {
+				fmt.Printf("✅ Health endpoint %s:%d is responding\n", instance.IP, port)
+			} else {
+				fmt.Printf("⚠️  Health endpoint %s:%d returned status %d\n", instance.IP, port, resp.StatusCode)
+			}
+		}
+
+		// Test SGLang metrics endpoint (/get_server_info) as used in sglang_metrics.go
+		metricsURL := fmt.Sprintf("http://%s:%d/get_server_info", instance.IP, port)
+		resp, err = testClient.Get(metricsURL)
+		if err != nil {
+			fmt.Printf("❌ Metrics check failed for %s:%d - %v\n", instance.IP, port, err)
+			continue
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode == 200 {
+			// Parse the SGLang server info
+			var serverInfo SGLangServerInfo
+			if decodeErr := json.NewDecoder(resp.Body).Decode(&serverInfo); decodeErr != nil {
+				fmt.Printf("⚠️  Failed to decode server info from %s:%d: %v\n", instance.IP, port, decodeErr)
+			} else {
+				fmt.Printf("✅ SGLang metrics from %s:%d:\n", instance.IP, port)
+				fmt.Printf("   Running requests: %d\n", serverInfo.NumRunningReqs)
+				fmt.Printf("   Waiting requests: %d\n", serverInfo.NumWaitingReqs)
+				fmt.Printf("   Max running requests: %d\n", serverInfo.MaxRunningReqs)
+				fmt.Printf("   GPU cache usage: %.2f%%\n", serverInfo.GPUCacheUsage*100)
+			}
+		} else {
+			fmt.Printf("⚠️  Metrics endpoint %s:%d returned status %d\n", instance.IP, port, resp.StatusCode)
+		}
+	}
+}
+
+// setupSGLangDocker sets up Docker-based SGLang deployment (parallel)
+func setupSGLangDocker(cluster *Cluster, hfToken string) {
+	fmt.Println("Checking SGLang Docker setup on all instances...")
+
+	// Check if SGLang container is already running
+	checkCmd := "sudo docker ps --filter name=sglang-server --filter status=running --format '{{.Names}}' 2>/dev/null | grep -q sglang-server && echo 'running' || echo 'not_running'"
+	results := cluster.ExecuteOnCluster(checkCmd)
+
+	// Collect instances that need setup
+	var needsSetup []string
+	for instanceID, result := range results {
+		if result.Error != nil {
+			fmt.Printf("❌ Failed to check SGLang on %s: %v\n", instanceID[:16], result.Error)
+			needsSetup = append(needsSetup, instanceID)
+			continue
+		}
+
+		output := strings.TrimSpace(result.Output)
+		if output == "running" {
+			fmt.Printf("✅ SGLang already running on %s\n", instanceID[:16])
+		} else {
+			needsSetup = append(needsSetup, instanceID)
+		}
+	}
+
+	// Setup HuggingFace credentials and pull Docker image in parallel
+	if len(needsSetup) > 0 {
+		fmt.Printf("\n📦 Setting up SGLang on %d instances in parallel...\n", len(needsSetup))
+		var wg sync.WaitGroup
+		for _, instanceID := range needsSetup {
+			wg.Add(1)
+			go func(id string) {
+				defer wg.Done()
+				fmt.Printf("  → Starting SGLang setup on %s...\n", id[:16])
+				setupSGLangOnInstance(cluster, id, hfToken)
+			}(instanceID)
+		}
+		wg.Wait()
+		fmt.Println("✅ All SGLang setups complete!")
+	}
+}
+
+// setupSGLangOnInstance sets up SGLang on a specific instance
+func setupSGLangOnInstance(cluster *Cluster, instanceID string, hfToken string) {
+	// Find the instance IP
+	var instanceIP string
+	for _, inst := range cluster.Instances {
+		if inst.ID == instanceID {
+			instanceIP = inst.IP
+			break
+		}
+	}
+	if instanceIP == "" {
+		fmt.Printf("❌ Instance %s not found\n", instanceID[:16])
+		return
+	}
+
+	// Setup HuggingFace credentials and pull SGLang Docker image
+	setupScript := fmt.Sprintf(`#!/bin/bash
+set -e
+
+echo "Setting up HuggingFace credentials..."
+mkdir -p /home/ubuntu/.cache/huggingface
+if [ -n "%s" ]; then
+    echo "%s" > /home/ubuntu/.cache/huggingface/token
+    echo "HF_TOKEN saved to cache"
+fi
+
+echo "Checking Docker installation..."
+if ! command -v docker &> /dev/null; then
+    echo "Docker not found, installing..."
+    curl -fsSL https://get.docker.com -o get-docker.sh
+    sudo sh get-docker.sh
+    rm get-docker.sh
+    sudo usermod -aG docker ubuntu
+fi
+
+echo "Pulling SGLang Docker image (this may take a while)..."
+sudo docker pull lmsysorg/sglang:latest
+
+echo "SGLang Docker setup complete!"
+`, hfToken, hfToken)
+
+	output, err := cluster.sshMgr.ExecuteCommandWithTimeout(instanceIP, setupScript, 15*time.Minute)
+	if err != nil {
+		fmt.Printf("❌ Failed to setup SGLang on %s: %v\n", instanceID[:16], err)
+		fmt.Printf("Output: %s\n", output)
+		return
+	}
+	fmt.Printf("✅ SGLang setup complete on %s\n", instanceID[:16])
+}
+
+// diagnoseSGLangOnCluster runs diagnostic commands on all instances to identify connectivity issues
+func diagnoseSGLangOnCluster(cluster *Cluster) {
+	fmt.Println("Running diagnostics on all cluster instances...")
+
+	diagScript := `#!/bin/bash
+echo "=== DIAGNOSTICS FOR $(hostname) ==="
+
+echo ""
+echo "1. Docker container status:"
+sudo docker ps -a --filter name=sglang-server --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+
+echo ""
+echo "2. Container running check:"
+if sudo docker ps --filter name=sglang-server --filter status=running | grep -q sglang-server; then
+    echo "✅ Container is RUNNING"
+else
+    echo "❌ Container is NOT RUNNING"
+    echo "   Last 20 lines of container logs (if available):"
+    sudo docker logs sglang-server --tail 20 2>&1 || echo "   No logs available"
+fi
+
+echo ""
+echo "3. Port 8080 listening check (netstat/ss):"
+ss -tlnp | grep :8080 || echo "   Port 8080 is NOT listening on any interface"
+
+echo ""
+echo "4. Docker port mappings:"
+sudo docker port sglang-server 2>/dev/null || echo "   No port mappings (container not running?)"
+
+echo ""
+echo "5. Local connectivity test (curl localhost:8080):"
+curl -s -o /dev/null -w "HTTP Status: %{http_code}\n" --connect-timeout 5 http://localhost:8080/health 2>/dev/null || echo "   Failed to connect to localhost:8080"
+
+echo ""
+echo "6. Local metrics endpoint test:"
+curl -s --connect-timeout 5 http://localhost:8080/get_server_info 2>/dev/null | head -c 500 || echo "   Failed to get server info"
+
+echo ""
+echo "7. Network interfaces (for binding verification):"
+ip addr show | grep "inet " | head -5
+
+echo ""
+echo "8. Docker network inspection:"
+sudo docker inspect sglang-server --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' 2>/dev/null || echo "   Container not found"
+
+echo ""
+echo "9. GPU availability check:"
+nvidia-smi --query-gpu=name,memory.used,memory.total --format=csv,noheader 2>/dev/null || echo "   nvidia-smi not available"
+
+echo ""
+echo "10. Container environment (HF_TOKEN check):"
+sudo docker exec sglang-server env 2>/dev/null | grep -E "^(HF_|HUGGING)" || echo "   No HF environment variables set in container"
+
+echo ""
+echo "=== END DIAGNOSTICS ==="
+`
+
+	results := cluster.ExecuteOnCluster(diagScript)
+
+	for instanceID, result := range results {
+		// Find instance IP for display
+		var instanceIP string
+		for _, inst := range cluster.Instances {
+			if inst.ID == instanceID {
+				instanceIP = inst.IP
+				break
+			}
+		}
+
+		fmt.Printf("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+		fmt.Printf("Instance: %s (%s)\n", instanceID[:16], instanceIP)
+		fmt.Printf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+
+		if result.Error != nil {
+			fmt.Printf("❌ Diagnostic failed: %v\n", result.Error)
+		} else {
+			fmt.Println(result.Output)
+		}
+	}
+
+	// Summary of potential issues
+	fmt.Println("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+	fmt.Println("COMMON ISSUES TO CHECK:")
+	fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+	fmt.Println("1. Container not running → Check Docker logs for crash reason")
+	fmt.Println("2. Port not listening → Server failed to start inside container")
+	fmt.Println("3. No HF environment vars → Model download will fail for gated models")
+	fmt.Println("4. GPU memory issues → Check nvidia-smi for OOM")
+	fmt.Println("5. Model not downloaded → First startup can take 10+ minutes")
+	fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 }
