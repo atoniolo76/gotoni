@@ -98,4 +98,4 @@ gotoni
 
 # Test coverage
 *.coverprofile
-coverage.html
+coverage.html.env
