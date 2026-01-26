@@ -12,6 +12,7 @@ package serve
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -482,6 +483,24 @@ func (lb *LoadBalancer) Stop() {
 // Handler returns an HTTP handler that implements the load balancing logic
 func (lb *LoadBalancer) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Handle load balancer status endpoint
+		if r.URL.Path == "/lb/status" {
+			lb.handleStatusEndpoint(w, r)
+			return
+		}
+
+		// Handle load balancer health endpoint
+		if r.URL.Path == "/lb/health" {
+			lb.handleHealthEndpoint(w, r)
+			return
+		}
+
+		// Handle load balancer metrics endpoint
+		if r.URL.Path == "/lb/metrics" {
+			lb.handleMetricsEndpoint(w, r)
+			return
+		}
+
 		// Check if LOCAL SGLang has capacity using real metrics
 		if lb.localHasCapacity() {
 			// Process locally - user is routed here, KV cache is warm
@@ -687,6 +706,119 @@ func (lb *LoadBalancer) processQueue() {
 			}
 		}
 	}
+}
+
+// handleStatusEndpoint returns the load balancer status as JSON
+func (lb *LoadBalancer) handleStatusEndpoint(w http.ResponseWriter, r *http.Request) {
+	lb.localMetricsMu.RLock()
+	localMetrics := lb.localMetrics
+	lb.localMetricsMu.RUnlock()
+
+	lb.peersMu.RLock()
+	peerCount := len(lb.peers)
+	healthyPeers := 0
+	for _, status := range lb.peers {
+		if status.Healthy && status.Available {
+			healthyPeers++
+		}
+	}
+	lb.peersMu.RUnlock()
+
+	// Get queue size
+	lb.queueMu.Lock()
+	queueSize := len(lb.queue)
+	lb.queueMu.Unlock()
+
+	status := map[string]interface{}{
+		"running":         lb.running.Load(),
+		"current_load":    localMetrics.NumTotalReqs,
+		"max_load":        lb.config.MaxConcurrentRequests,
+		"running_reqs":    localMetrics.NumRunningReqs,
+		"waiting_reqs":    localMetrics.NumWaitingReqs,
+		"gpu_cache":       localMetrics.GPUCacheUsage,
+		"healthy":         localMetrics.Healthy,
+		"peer_count":      peerCount,
+		"healthy_peers":   healthyPeers,
+		"queue_size":      queueSize,
+		"queue_enabled":   lb.config.QueueEnabled,
+		"listen_port":     lb.config.LoadBalancerPort,
+		"backend_port":    lb.config.ApplicationPort,
+		"metrics_enabled": lb.config.MetricsEnabled,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(status)
+}
+
+// handleHealthEndpoint returns a simple health check
+func (lb *LoadBalancer) handleHealthEndpoint(w http.ResponseWriter, r *http.Request) {
+	if !lb.running.Load() {
+		http.Error(w, "Load balancer not running", http.StatusServiceUnavailable)
+		return
+	}
+
+	lb.localMetricsMu.RLock()
+	healthy := lb.localMetrics.Healthy
+	lb.localMetricsMu.RUnlock()
+
+	if !healthy {
+		http.Error(w, "Backend unhealthy", http.StatusServiceUnavailable)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":  "healthy",
+		"running": true,
+	})
+}
+
+// handleMetricsEndpoint returns detailed metrics for all peers
+func (lb *LoadBalancer) handleMetricsEndpoint(w http.ResponseWriter, r *http.Request) {
+	lb.localMetricsMu.RLock()
+	localMetrics := lb.localMetrics
+	lb.localMetricsMu.RUnlock()
+
+	lb.peersMu.RLock()
+	peers := make(map[string]interface{})
+	for peer, status := range lb.peers {
+		peers[peer.Instance.ID] = map[string]interface{}{
+			"ip":           peer.Instance.IP,
+			"port":         peer.Port,
+			"available":    status.Available,
+			"healthy":      status.Healthy,
+			"running_reqs": status.RunningRequests,
+			"waiting_reqs": status.WaitingRequests,
+			"total_reqs":   status.TotalRequests,
+			"gpu_cache":    status.GPUCacheUsage,
+			"max_running":  peer.Metrics.MaxRunningReqs,
+			"latency_ms":   peer.Metrics.Latency,
+		}
+	}
+	lb.peersMu.RUnlock()
+
+	metrics := map[string]interface{}{
+		"local": map[string]interface{}{
+			"running_reqs": localMetrics.NumRunningReqs,
+			"waiting_reqs": localMetrics.NumWaitingReqs,
+			"total_reqs":   localMetrics.NumTotalReqs,
+			"gpu_cache":    localMetrics.GPUCacheUsage,
+			"max_running":  localMetrics.MaxRunningReqs,
+			"healthy":      localMetrics.Healthy,
+			"last_updated": localMetrics.LastUpdated,
+		},
+		"peers": peers,
+		"config": map[string]interface{}{
+			"max_concurrent":  lb.config.MaxConcurrentRequests,
+			"queue_enabled":   lb.config.QueueEnabled,
+			"queue_timeout":   lb.config.QueueTimeout.String(),
+			"request_timeout": lb.config.RequestTimeout.String(),
+			"gpu_threshold":   lb.config.GPUCacheThreshold,
+		},
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(metrics)
 }
 
 // CurrentLoad returns the current load from real SGLang metrics (running + waiting)

@@ -95,6 +95,8 @@ func init() {
 	lbStartCmd.Flags().Duration("request-timeout", 30*time.Second, "Request timeout for forwarded requests")
 	lbStartCmd.Flags().StringSlice("peers", []string{}, "Peer addresses in format ip:port (can specify multiple)")
 	lbStartCmd.Flags().String("pid-file", "/tmp/gotoni-lb.pid", "Path to PID file")
+	lbStartCmd.Flags().String("strategy", "least-loaded", "Load balancing strategy (least-loaded, round-robin, prefix-tree)")
+	lbStartCmd.Flags().String("node-id", "", "Unique identifier for this node in the cluster")
 
 	// Flags for lb status
 	lbStatusCmd.Flags().Int("port", 8000, "Load balancer port to check")
@@ -140,6 +142,20 @@ func runLBStart(cmd *cobra.Command, args []string) {
 		config.RequestTimeout, _ = cmd.Flags().GetDuration("request-timeout")
 	}
 
+	// Get strategy and node-id (used for cluster mode, logged for debugging)
+	strategy, _ := cmd.Flags().GetString("strategy")
+	nodeID, _ := cmd.Flags().GetString("node-id")
+
+	// Set strategy based on flag
+	switch strategy {
+	case "least-loaded":
+		config.Strategy = &serve.LeastLoadedPolicy{}
+	case "prefix-tree":
+		config.Strategy = serve.NewPrefixTreePolicy()
+	default:
+		config.Strategy = &serve.LeastLoadedPolicy{}
+	}
+
 	// Write PID file
 	pidFile, _ := cmd.Flags().GetString("pid-file")
 	if pidFile != "" {
@@ -174,10 +190,12 @@ func runLBStart(cmd *cobra.Command, args []string) {
 
 	// Print startup info
 	fmt.Printf("Starting load balancer:\n")
+	fmt.Printf("  Node ID:          %s\n", nodeID)
 	fmt.Printf("  Listen port:      %d\n", config.LoadBalancerPort)
 	fmt.Printf("  Local SGLang:     localhost:%d\n", config.ApplicationPort)
 	fmt.Printf("  Max concurrent:   %d\n", config.MaxConcurrentRequests)
 	fmt.Printf("  Queue enabled:    %v\n", config.QueueEnabled)
+	fmt.Printf("  Strategy:         %s\n", strategy)
 	fmt.Printf("  Metrics polling:  %v\n", config.MetricsEnabled)
 	fmt.Printf("  PID file:         %s\n", pidFile)
 	fmt.Println()
