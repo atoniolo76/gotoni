@@ -7,6 +7,8 @@ import argparse
 import asyncio
 import collections
 import json
+import os
+import sqlite3
 import statistics
 import time
 from dataclasses import dataclass, field, asdict
@@ -18,9 +20,84 @@ from openai import AsyncOpenAI
 
 DATASET_NAME = 'allenai/WildChat-1M'
 
+# Default cluster name used by TestClusterSGLang
+DEFAULT_CLUSTER_NAME = 'sglang-auto-cluster'
+
+# Default load balancer port
+DEFAULT_LB_PORT = 8000
+
 # Single client for load balancer endpoint
 client: Optional[AsyncOpenAI] = None
 lb_endpoint: str = ""
+
+
+def get_gotoni_db_path() -> str:
+    """Return path to the gotoni SQLite database."""
+    if os.name == 'nt':
+        config_dir = os.path.join(os.environ.get('LOCALAPPDATA', ''), 'gotoni')
+    elif os.uname().sysname == 'Darwin':
+        config_dir = os.path.join(os.path.expanduser('~'), 'Library', 'Application Support', 'gotoni')
+    else:
+        config_dir = os.path.join(os.environ.get('XDG_CONFIG_HOME', os.path.expanduser('~/.config')), 'gotoni')
+    return os.path.join(config_dir, 'data.db')
+
+
+def discover_cluster_instances(cluster_name: str) -> List[str]:
+    """Discover instance IPs for a cluster from the gotoni SQLite database.
+
+    Args:
+        cluster_name: Name of the cluster (e.g., 'sglang-auto-cluster')
+
+    Returns:
+        List of IP addresses for instances in the cluster.
+
+    Raises:
+        RuntimeError: If cluster not found or database unavailable.
+    """
+    db_path = get_gotoni_db_path()
+    if not os.path.exists(db_path):
+        raise RuntimeError(f"Gotoni database not found at {db_path}. "
+                           "Has the cluster been created?")
+
+    conn = sqlite3.connect(db_path)
+    try:
+        cursor = conn.cursor()
+
+        # Find the cluster by name
+        cursor.execute("SELECT id FROM clusters WHERE name = ?", (cluster_name,))
+        row = cursor.fetchone()
+        if not row:
+            # List available clusters to help the user
+            cursor.execute("SELECT name FROM clusters")
+            available = [r[0] for r in cursor.fetchall()]
+            raise RuntimeError(
+                f"Cluster '{cluster_name}' not found. "
+                f"Available clusters: {available or 'none'}"
+            )
+        cluster_id = row[0]
+
+        # Get instance IPs for this cluster
+        cursor.execute("""
+            SELECT DISTINCT i.ip_address, i.name, i.id
+            FROM instances i
+            JOIN cluster_instances ci ON i.id = ci.instance_id
+            WHERE ci.cluster_id = ?
+              AND i.ip_address IS NOT NULL
+              AND i.ip_address != ''
+        """, (cluster_id,))
+        instances = cursor.fetchall()
+
+        if not instances:
+            raise RuntimeError(f"No instances with IPs found for cluster '{cluster_name}'")
+
+        print(f"Discovered {len(instances)} instance(s) in cluster '{cluster_name}':")
+        ips = []
+        for ip, name, inst_id in instances:
+            print(f"  - {name} ({inst_id[:16]}) @ {ip}")
+            ips.append(ip)
+        return ips
+    finally:
+        conn.close()
 
 
 @dataclass
@@ -122,6 +199,65 @@ async def periodic_metrics_poller(
             pass  # Continue polling
 
 
+async def periodic_request_stats_printer(
+    stats: Dict[str, Any],
+    tic: float,
+    interval: int,
+    stop_event: asyncio.Event,
+):
+    """Print live request metrics every `interval` seconds during benchmark."""
+    prev_requests = 0
+    prev_errors = 0
+    prev_time = tic
+
+    while not stop_event.is_set():
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=interval)
+        except asyncio.TimeoutError:
+            pass  # Continue printing
+
+        if stop_event.is_set():
+            break
+
+        now = time.time()
+        elapsed = now - tic
+        dt = now - prev_time
+        reqs = stats['requests']
+        errs = stats['errors']
+        delta_reqs = reqs - prev_requests
+        delta_errs = errs - prev_errors
+        interval_rps = delta_reqs / dt if dt > 0 else 0.0
+
+        latencies = stats['latencies']
+        if latencies:
+            recent = latencies[-delta_reqs:] if delta_reqs > 0 else latencies[-1:]
+            avg = statistics.mean(recent) if recent else 0.0
+            sorted_all = sorted(latencies)
+            n = len(sorted_all)
+            p50 = sorted_all[n // 2]
+            p95 = sorted_all[int(n * 0.95)] if n > 1 else sorted_all[-1]
+        else:
+            avg = p50 = p95 = 0.0
+
+        dist_summary = ', '.join(
+            f'{k}:{v}' for k, v in sorted(
+                stats['instance_requests'].items(), key=lambda x: -x[1]
+            )
+        )
+
+        print(f'\n--- [{elapsed:.0f}s] REQUEST METRICS ---')
+        print(f'  Requests: {reqs} (+{delta_reqs})  Errors: {errs} (+{delta_errs})')
+        print(f'  Interval throughput: {interval_rps:.2f} req/s')
+        print(f'  Latency (recent avg): {avg:.3f}s  P50: {p50:.3f}s  P95: {p95:.3f}s')
+        if dist_summary:
+            print(f'  Distribution: {dist_summary}')
+        print()
+
+        prev_requests = reqs
+        prev_errors = errs
+        prev_time = now
+
+
 async def call_chat_completion(
     messages: List[Dict[str, str]],
     model: str,
@@ -161,7 +297,7 @@ def _load_dataset(start_index: int) -> List[Dict[str, Any]]:
     multi_turn_data = []
     for d in chunk_data:
         # At least 2 full turns: user + assistant + user + assistant (len >= 4)
-        if d['turn'] >= 2 and isinstance(d['conversation'], list) and len(d['conversation']) >= 4:
+        if d['turn'] >= 2 and isinstance(d['conversation'], list) and len(d['conversation']) >= 20:
             if d.get('hashed_ip', 'unknown') == 'unknown':
                 continue
             conv = {
@@ -255,7 +391,7 @@ async def run_benchmark(
     endpoint: str,
     strategy: str,
     duration: int = 30,
-    num_users: int = 4,
+    num_users: int = 20,
     start_index: int = 0,
     model: str = 'default',
     max_convs: int = 100,
@@ -336,6 +472,11 @@ async def run_benchmark(
 
     tic = time.time()
 
+    # Start periodic request stats printer
+    stats_printer_task = asyncio.create_task(
+        periodic_request_stats_printer(stats, tic, metrics_interval, stop_event)
+    )
+
     tasks = []
     for uid, user_convs in groups.items():
         if user_convs:
@@ -346,9 +487,10 @@ async def run_benchmark(
 
     total_time = time.time() - tic
 
-    # Stop metrics poller
+    # Stop metrics poller and stats printer
     stop_event.set()
     await poller_task
+    await stats_printer_task
 
     # Collect post-benchmark metrics
     print("\nCollecting post-benchmark metrics...")
@@ -438,22 +580,52 @@ def export_benchmark_results(metrics: BenchmarkMetrics, output_file: str):
     print(f'\nResults exported to {output_file}')
 
 
+async def find_healthy_endpoint(instance_ips: List[str], port: int) -> str:
+    """Find the first healthy load balancer endpoint from a list of instance IPs.
+
+    Checks all instances in parallel and returns the first healthy one.
+    """
+    async def check_health(ip: str) -> Optional[str]:
+        endpoint = f"http://{ip}:{port}"
+        if await fetch_lb_health(endpoint):
+            return endpoint
+        return None
+
+    tasks = [check_health(ip) for ip in instance_ips]
+    results = await asyncio.gather(*tasks)
+    healthy = [r for r in results if r is not None]
+
+    if not healthy:
+        tried = [f"http://{ip}:{port}" for ip in instance_ips]
+        raise RuntimeError(
+            f"No healthy load balancer found. Tried: {tried}\n"
+            "Are the load balancers running? Check with: gotoni lb-remote-status --all"
+        )
+
+    print(f"Found {len(healthy)} healthy load balancer(s), using: {healthy[0]}")
+    return healthy[0]
+
+
 def main():
     parser = argparse.ArgumentParser(description='WildChat benchmark with gotoni load balancing')
 
-    # Required argument
-    parser.add_argument('--lb-endpoint', type=str, required=True,
-                        help='Load balancer endpoint (e.g., http://192.168.1.10:8000)')
+    # Cluster discovery (auto-discovers IPs from gotoni database)
+    parser.add_argument('--cluster-name', type=str, default=DEFAULT_CLUSTER_NAME,
+                        help=f'Cluster name to discover instances from (default: {DEFAULT_CLUSTER_NAME})')
+    parser.add_argument('--lb-endpoint', type=str, default=None,
+                        help='Override: use this LB endpoint directly instead of cluster discovery')
+    parser.add_argument('--lb-port', type=int, default=DEFAULT_LB_PORT,
+                        help=f'Load balancer port on each instance (default: {DEFAULT_LB_PORT})')
 
     # Strategy selection (for documentation/output - LB must be pre-configured)
     parser.add_argument('--strategy', type=str, default='least-loaded',
-                        choices=['least-loaded', 'prefix-tree'],
+                        choices=['least-loaded', 'prefix-tree', 'gorgo'],
                         help='Load balancing policy label (default: least-loaded)')
 
     # Benchmark parameters
     parser.add_argument('--duration', type=int, default=30,
                         help='Benchmark duration in seconds')
-    parser.add_argument('--num-users', type=int, default=4,
+    parser.add_argument('--num-users', type=int, default=20,
                         help='Number of concurrent users')
     parser.add_argument('--start-index', type=int, default=0,
                         help='Dataset chunk index (0-9)')
@@ -470,9 +642,20 @@ def main():
 
     args = parser.parse_args()
 
+    # Resolve the LB endpoint
+    if args.lb_endpoint:
+        # User provided an explicit endpoint - use it directly
+        endpoint = args.lb_endpoint
+        print(f"Using provided endpoint: {endpoint}")
+    else:
+        # Auto-discover from cluster database
+        print(f"Discovering instances from cluster '{args.cluster_name}'...")
+        instance_ips = discover_cluster_instances(args.cluster_name)
+        endpoint = asyncio.run(find_healthy_endpoint(instance_ips, args.lb_port))
+
     # Run benchmark
     metrics = asyncio.run(run_benchmark(
-        endpoint=args.lb_endpoint,
+        endpoint=endpoint,
         strategy=args.strategy,
         duration=args.duration,
         num_users=args.num_users,
