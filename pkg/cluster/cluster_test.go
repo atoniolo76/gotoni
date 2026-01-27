@@ -1972,7 +1972,21 @@ func deployLBStrategy(cluster *Cluster, strategy string) error {
 	if failCount == len(cluster.Instances) {
 		return fmt.Errorf("failed to start load balancer on all instances")
 	}
+	// 9. Verify local tokenizer (for GORGO policy) - SKIPPED, will test on remote after deploy
+	fmt.Println("9. Skipping local tokenizer test (will verify on remote instances after deploy)...")
 
+	// 10. Start load balancing processes with GORGO policy
+	fmt.Println("10. Setting up load balancers with GORGO policy...")
+
+	// First, stop any existing load balancers to ensure we run the new code
+	fmt.Println("Stopping any existing load balancers...")
+	stopOldLoadBalancers(cluster)
+
+	tasks := setupGotoniBinaryOnInstanceWithStrategy(cluster, "gorgo")
+	if tasks == nil {
+		fmt.Println("❌ Failed to setup gotoni binary on instances")
+		return
+	}
 	// Wait for LB to start accepting connections
 	time.Sleep(3 * time.Second)
 
@@ -2048,7 +2062,172 @@ func TestClusterSGLang(t *testing.T) {
 		})
 	}
 
+
+	// Wait a moment for all load balancers to fully initialize
+	fmt.Println("\nWaiting 5 seconds for load balancers to fully initialize...")
+	time.Sleep(5 * time.Second)
+
+	// 11. Verify tokenizer on remote instances (critical for GORGO policy)
+	fmt.Println("\n11. Verifying CGO tokenizer on remote instances...")
+	testRemoteTokenizers(t, cluster)
+
 	fmt.Println("=== Cluster SGLang Test Complete ===")
+}
+
+// stopOldLoadBalancers stops any running gotoni load balancer processes on all cluster instances
+// This ensures the newly deployed code will be used
+func stopOldLoadBalancers(cluster *Cluster) {
+	stopScript := `#!/bin/bash
+set +e  # Don't exit on error
+
+echo "Stopping old load balancers..."
+
+# Kill ALL tmux sessions related to gotoni (more aggressive)
+for session in $(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep gotoni); do
+    echo "Killing tmux session: $session"
+    tmux kill-session -t "$session" 2>/dev/null
+done
+
+# Kill any gotoni processes
+pkill -9 -f "gotoni" 2>/dev/null || true
+pkill -9 -f "/home/ubuntu/gotoni" 2>/dev/null || true
+
+# Kill anything on port 8000
+fuser -k 8000/tcp 2>/dev/null || true
+
+# Wait for processes to terminate
+sleep 2
+
+# Double-check and force kill if still running
+if ss -tlnp 2>/dev/null | grep -q ":8000 "; then
+    echo "Port 8000 still in use, forcing..."
+    fuser -k -9 8000/tcp 2>/dev/null || true
+    sleep 1
+fi
+
+# Final verification
+if ss -tlnp 2>/dev/null | grep -q ":8000 "; then
+    echo "WARNING: Port 8000 still in use after cleanup"
+    ss -tlnp | grep ":8000 "
+else
+    echo "Port 8000 is free"
+fi
+
+# Remove old binary to force rebuild (optional, ensures fresh binary)
+# rm -f /home/ubuntu/gotoni 2>/dev/null || true
+
+echo "Cleanup complete"
+`
+
+	results := cluster.ExecuteOnCluster(stopScript)
+
+	for instanceID, result := range results {
+		// Find instance name for display
+		var instanceName string
+		for _, inst := range cluster.Instances {
+			if inst.ID == instanceID {
+				instanceName = inst.Name
+				break
+			}
+		}
+
+		if result.Error != nil {
+			// Ignore exit code errors since pkill returns non-zero when no processes found
+			output := strings.TrimSpace(result.Output)
+			if strings.Contains(output, "Port 8000 is free") || strings.Contains(output, "Cleanup complete") {
+				fmt.Printf("✅ Old LB stopped on %s\n", instanceName)
+			} else {
+				fmt.Printf("⚠️  %s: cleanup had issues - %s\n", instanceName, output)
+			}
+		} else {
+			output := strings.TrimSpace(result.Output)
+			if strings.Contains(output, "Port 8000 is free") {
+				fmt.Printf("✅ Old LB stopped on %s\n", instanceName)
+			} else if strings.Contains(output, "WARNING") {
+				fmt.Printf("⚠️  %s: %s\n", instanceName, output)
+			} else {
+				fmt.Printf("✅ %s: %s\n", instanceName, output)
+			}
+		}
+	}
+}
+
+// testRemoteTokenizers verifies that the CGO tokenizer is working on all remote load balancers
+// This is critical for GORGO policy which uses GetTokenCount() in the Select method
+func testRemoteTokenizers(t *testing.T, cluster *Cluster) {
+	testClient := &http.Client{Timeout: 10 * time.Second}
+
+	// Load balancers run on port 8000
+	port := 8000
+
+	allPassed := true
+	cgoCount := 0
+
+	for _, instance := range cluster.Instances {
+		// Test tokenizer endpoint with a custom phrase that exercises the GORGO code path
+		tokenizerURL := fmt.Sprintf("http://%s:%d/lb/tokenizer?text=What+is+the+meaning+of+life?", instance.IP, port)
+
+		resp, err := testClient.Get(tokenizerURL)
+		if err != nil {
+			fmt.Printf("❌ Tokenizer test failed for %s:%d - %v\n", instance.IP, port, err)
+			allPassed = false
+			continue
+		}
+
+		var result struct {
+			Success    bool   `json:"success"`
+			CGOEnabled bool   `json:"cgo_enabled"`
+			Message    string `json:"message"`
+			Results    []struct {
+				Text       string `json:"text"`
+				TokenCount int    `json:"token_count"`
+				CharCount  int    `json:"char_count"`
+				LikelyCGO  bool   `json:"likely_cgo"`
+			} `json:"results"`
+		}
+
+		if decodeErr := json.NewDecoder(resp.Body).Decode(&result); decodeErr != nil {
+			resp.Body.Close()
+			fmt.Printf("❌ Failed to decode tokenizer response from %s: %v\n", instance.IP, decodeErr)
+			allPassed = false
+			continue
+		}
+		resp.Body.Close()
+
+		if result.Success && result.CGOEnabled {
+			fmt.Printf("✅ %s (%s): CGO tokenizer working\n", instance.Name, instance.IP)
+			for _, r := range result.Results {
+				fmt.Printf("   → \"%s\" = %d tokens (chars: %d)\n", 
+					truncateString(r.Text, 30), r.TokenCount, r.CharCount)
+			}
+			cgoCount++
+		} else if result.Success {
+			fmt.Printf("⚠️  %s (%s): Using FALLBACK tokenizer (char/4)\n", instance.Name, instance.IP)
+			fmt.Printf("   Message: %s\n", result.Message)
+		} else {
+			fmt.Printf("❌ %s (%s): Tokenizer test failed\n", instance.Name, instance.IP)
+			fmt.Printf("   Message: %s\n", result.Message)
+			allPassed = false
+		}
+	}
+
+	fmt.Printf("\nTokenizer Summary: %d/%d instances have CGO tokenizer enabled\n", cgoCount, len(cluster.Instances))
+
+	if cgoCount == 0 {
+		t.Log("WARNING: No instances have CGO tokenizer enabled. GORGO policy will use fallback (less accurate).")
+	}
+
+	if !allPassed {
+		t.Log("WARNING: Some tokenizer tests failed. Check instance logs for details.")
+	}
+}
+
+// truncateString truncates a string to maxLen and adds "..." if truncated
+func truncateString(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen-3] + "..."
 }
 
 // testSGLangAPIEndpoints tests the SGLang server endpoints using /get_server_info

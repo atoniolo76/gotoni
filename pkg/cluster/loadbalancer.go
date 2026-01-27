@@ -20,6 +20,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -592,6 +593,24 @@ func (lb *LoadBalancer) Handler() http.Handler {
 			return
 		}
 
+		// Handle load balancer config endpoint (GET/POST for runtime config changes)
+		if r.URL.Path == "/lb/config" {
+			lb.handleConfigEndpoint(w, r)
+			return
+		}
+
+		// Handle policy switching endpoint (convenience shortcut)
+		if r.URL.Path == "/lb/policy" {
+			lb.handlePolicyEndpoint(w, r)
+			return
+		}
+
+		// Handle tokenizer test endpoint (verify CGO tokenizer is working)
+		if r.URL.Path == "/lb/tokenizer" {
+			lb.handleTokenizerEndpoint(w, r)
+			return
+		}
+
 		// Check if LOCAL SGLang has capacity using real metrics
 		if lb.localHasCapacity() {
 			// Process locally - user is routed here, KV cache is warm
@@ -910,6 +929,291 @@ func (lb *LoadBalancer) handleMetricsEndpoint(w http.ResponseWriter, r *http.Req
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(metrics)
+}
+
+// getStrategyName returns the name of the current strategy
+func (lb *LoadBalancer) getStrategyName() string {
+	switch lb.strategy.(type) {
+	case *LeastLoadedPolicy:
+		return "least-loaded"
+	case *PrefixTreePolicy:
+		return "prefix-tree"
+	case *GORGOPolicy:
+		return "gorgo"
+	default:
+		return "unknown"
+	}
+}
+
+// handleConfigEndpoint handles runtime configuration changes
+// GET: returns current config
+// POST/PUT: updates config (supports {"policy": "gorgo|least-loaded|prefix-tree"})
+func (lb *LoadBalancer) handleConfigEndpoint(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	if r.Method == http.MethodGet {
+		// Return current config
+		config := map[string]interface{}{
+			"policy":              lb.getStrategyName(),
+			"max_concurrent":      lb.config.MaxConcurrentRequests,
+			"queue_enabled":       lb.config.QueueEnabled,
+			"queue_timeout":       lb.config.QueueTimeout.String(),
+			"request_timeout":     lb.config.RequestTimeout.String(),
+			"metrics_enabled":     lb.config.MetricsEnabled,
+			"gpu_cache_threshold": lb.config.GPUCacheThreshold,
+			"listen_port":         lb.config.LoadBalancerPort,
+			"backend_port":        lb.config.ApplicationPort,
+		}
+		json.NewEncoder(w).Encode(config)
+		return
+	}
+
+	if r.Method == http.MethodPost || r.Method == http.MethodPut {
+		// Parse request body
+		var req struct {
+			Policy            string   `json:"policy"`
+			MaxConcurrent     *int     `json:"max_concurrent"`
+			QueueEnabled      *bool    `json:"queue_enabled"`
+			GPUCacheThreshold *float64 `json:"gpu_cache_threshold"`
+		}
+
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, fmt.Sprintf(`{"error": "invalid JSON: %v"}`, err), http.StatusBadRequest)
+			return
+		}
+
+		changes := []string{}
+
+		// Update policy if specified
+		if req.Policy != "" {
+			oldPolicy := lb.getStrategyName()
+			if err := lb.SetStrategy(req.Policy); err != nil {
+				http.Error(w, fmt.Sprintf(`{"error": "%v"}`, err), http.StatusBadRequest)
+				return
+			}
+			changes = append(changes, fmt.Sprintf("policy: %s -> %s", oldPolicy, req.Policy))
+			log.Printf("[LB] Policy changed: %s -> %s", oldPolicy, req.Policy)
+		}
+
+		// Update max concurrent if specified
+		if req.MaxConcurrent != nil {
+			old := lb.config.MaxConcurrentRequests
+			lb.config.MaxConcurrentRequests = *req.MaxConcurrent
+			changes = append(changes, fmt.Sprintf("max_concurrent: %d -> %d", old, *req.MaxConcurrent))
+		}
+
+		// Update queue enabled if specified
+		if req.QueueEnabled != nil {
+			old := lb.config.QueueEnabled
+			lb.config.QueueEnabled = *req.QueueEnabled
+			changes = append(changes, fmt.Sprintf("queue_enabled: %v -> %v", old, *req.QueueEnabled))
+		}
+
+		// Update GPU cache threshold if specified
+		if req.GPUCacheThreshold != nil {
+			old := lb.config.GPUCacheThreshold
+			lb.config.GPUCacheThreshold = *req.GPUCacheThreshold
+			changes = append(changes, fmt.Sprintf("gpu_cache_threshold: %.2f -> %.2f", old, *req.GPUCacheThreshold))
+		}
+
+		response := map[string]interface{}{
+			"success": true,
+			"changes": changes,
+			"config": map[string]interface{}{
+				"policy":              lb.getStrategyName(),
+				"max_concurrent":      lb.config.MaxConcurrentRequests,
+				"queue_enabled":       lb.config.QueueEnabled,
+				"gpu_cache_threshold": lb.config.GPUCacheThreshold,
+			},
+		}
+		json.NewEncoder(w).Encode(response)
+		return
+	}
+
+	http.Error(w, `{"error": "method not allowed, use GET or POST"}`, http.StatusMethodNotAllowed)
+}
+
+// handlePolicyEndpoint is a convenience endpoint for switching policies
+// GET: returns available policies and current policy
+// POST: switches policy (body: {"policy": "gorgo"} or just the policy name as plain text)
+func (lb *LoadBalancer) handlePolicyEndpoint(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	availablePolicies := []string{"least-loaded", "prefix-tree", "gorgo"}
+
+	if r.Method == http.MethodGet {
+		// Also check query parameter for quick switching: /lb/policy?set=gorgo
+		if newPolicy := r.URL.Query().Get("set"); newPolicy != "" {
+			oldPolicy := lb.getStrategyName()
+			if err := lb.SetStrategy(newPolicy); err != nil {
+				http.Error(w, fmt.Sprintf(`{"error": "%v", "available": %v}`, err, availablePolicies), http.StatusBadRequest)
+				return
+			}
+			log.Printf("[LB] Policy changed via query param: %s -> %s", oldPolicy, newPolicy)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success":    true,
+				"old_policy": oldPolicy,
+				"new_policy": newPolicy,
+				"available":  availablePolicies,
+			})
+			return
+		}
+
+		// Return current policy info
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"current":   lb.getStrategyName(),
+			"available": availablePolicies,
+			"hint":      "POST with {\"policy\": \"gorgo\"} or GET /lb/policy?set=gorgo to switch",
+		})
+		return
+	}
+
+	if r.Method == http.MethodPost || r.Method == http.MethodPut {
+		// Try to parse as JSON first
+		var req struct {
+			Policy string `json:"policy"`
+		}
+
+		body, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(body, &req); err != nil {
+			// Try plain text (just the policy name)
+			req.Policy = strings.TrimSpace(string(body))
+		}
+
+		if req.Policy == "" {
+			http.Error(w, fmt.Sprintf(`{"error": "policy required", "available": %v}`, availablePolicies), http.StatusBadRequest)
+			return
+		}
+
+		oldPolicy := lb.getStrategyName()
+		if err := lb.SetStrategy(req.Policy); err != nil {
+			http.Error(w, fmt.Sprintf(`{"error": "%v", "available": %v}`, err, availablePolicies), http.StatusBadRequest)
+			return
+		}
+
+		log.Printf("[LB] Policy changed: %s -> %s", oldPolicy, req.Policy)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":    true,
+			"old_policy": oldPolicy,
+			"new_policy": req.Policy,
+		})
+		return
+	}
+
+	http.Error(w, `{"error": "method not allowed, use GET or POST"}`, http.StatusMethodNotAllowed)
+}
+
+// SetStrategy changes the load balancing strategy at runtime
+func (lb *LoadBalancer) SetStrategy(name string) error {
+	var newStrategy LoadBalancingStrategy
+
+	switch strings.ToLower(name) {
+	case "least-loaded", "leastloaded", "least_loaded":
+		newStrategy = &LeastLoadedPolicy{}
+	case "prefix-tree", "prefixtree", "prefix_tree", "prefix":
+		newStrategy = NewPrefixTreePolicy()
+	case "gorgo":
+		newStrategy = &GORGOPolicy{
+			root: &GORGONode{
+				children: make(map[byte]*GORGONode),
+				peers:    []*PeerNode{},
+				prefix:   "",
+			},
+		}
+	default:
+		return fmt.Errorf("unknown policy: %s (available: least-loaded, prefix-tree, gorgo)", name)
+	}
+
+	lb.peersMu.Lock()
+	lb.strategy = newStrategy
+	lb.config.Strategy = newStrategy
+	lb.peersMu.Unlock()
+
+	return nil
+}
+
+// handleTokenizerEndpoint tests the tokenizer and returns results
+// GET: test with default phrases
+// POST: test with custom text (body: {"text": "your text here"})
+func (lb *LoadBalancer) handleTokenizerEndpoint(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	// Default test phrases
+	testPhrases := []string{
+		"Hello, world!",
+		"The quick brown fox jumps over the lazy dog.",
+	}
+
+	// Check for custom text in POST body or query param
+	customText := r.URL.Query().Get("text")
+	if r.Method == http.MethodPost {
+		var req struct {
+			Text string `json:"text"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err == nil && req.Text != "" {
+			customText = req.Text
+		}
+	}
+
+	if customText != "" {
+		testPhrases = append(testPhrases, customText)
+	}
+
+	// Run tokenizer tests
+	results := make([]map[string]interface{}, 0, len(testPhrases))
+	allPassed := true
+	isCGO := false
+
+	for _, phrase := range testPhrases {
+		tokenCount := GetTokenCount(phrase)
+		charCount := len(phrase)
+
+		// Estimate what we'd get with fallback (chars/4)
+		fallbackEstimate := charCount / 4
+
+		// If token count differs significantly from fallback, CGO tokenizer is working
+		// CGO tokenizer gives more accurate counts (usually different from simple char/4)
+		likelyCGO := tokenCount != fallbackEstimate
+		if likelyCGO {
+			isCGO = true
+		}
+
+		// Sanity check: tokens should be reasonable (1-50% of char count, roughly)
+		reasonable := tokenCount >= 1 && tokenCount <= charCount
+		if !reasonable {
+			allPassed = false
+		}
+
+		results = append(results, map[string]interface{}{
+			"text":              phrase,
+			"token_count":       tokenCount,
+			"char_count":        charCount,
+			"fallback_estimate": fallbackEstimate,
+			"likely_cgo":        likelyCGO,
+			"reasonable":        reasonable,
+		})
+	}
+
+	// Summary
+	response := map[string]interface{}{
+		"success":     allPassed,
+		"cgo_enabled": isCGO,
+		"results":     results,
+		"message":     "",
+	}
+
+	if isCGO {
+		response["message"] = "CGO tokenizer is working correctly (token counts differ from char/4 fallback)"
+	} else {
+		response["message"] = "WARNING: Likely using fallback tokenizer (char/4). CGO may not be enabled."
+	}
+
+	if !allPassed {
+		w.WriteHeader(http.StatusInternalServerError)
+		response["message"] = "Tokenizer test failed: unreasonable token counts detected"
+	}
+
+	json.NewEncoder(w).Encode(response)
 }
 
 // CurrentLoad returns the current load from real SGLang metrics (running + waiting)
