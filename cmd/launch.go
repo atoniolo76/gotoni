@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/atoniolo76/gotoni/pkg/db"
 	"github.com/atoniolo76/gotoni/pkg/remote"
 
 	"github.com/spf13/cobra"
@@ -268,6 +269,53 @@ Examples:
 				if err == nil && details.IP != "" {
 					if err := remote.UpdateSSHConfig(instanceName, details.IP, instance.SSHKeyFile); err != nil {
 						fmt.Printf("Warning: Failed to update SSH config: %v\n", err)
+					}
+				}
+			}
+		}
+
+		// Save instance details to database
+		if launchErr == nil {
+			database, dbErr := db.InitDB()
+			if dbErr != nil {
+				fmt.Printf("Warning: Failed to initialize database: %v\n", dbErr)
+			} else {
+				for _, instance := range launchedInstances {
+					// Get full instance details from API
+					details, err := remote.GetInstance(httpClient, apiToken, instance.ID)
+
+					dbInstance := &db.Instance{
+						ID:           instance.ID,
+						Name:         instanceName,
+						Region:       actualRegion,
+						Status:       "active",
+						SSHKeyName:   instance.SSHKeyName,
+						InstanceType: instanceType,
+						CreatedAt:    time.Now(),
+					}
+
+					// Add IP if available
+					if err == nil && details != nil {
+						dbInstance.IPAddress = details.IP
+						dbInstance.InstanceType = details.InstanceType.Name
+						dbInstance.Region = details.Region.Name
+					}
+
+					if saveErr := database.SaveInstance(dbInstance); saveErr != nil {
+						fmt.Printf("Warning: Failed to save instance to database: %v\n", saveErr)
+					} else {
+						fmt.Printf("Instance %s saved to local database\n", instance.ID)
+					}
+
+					// Also save SSH key to database
+					if instance.SSHKeyName != "" && instance.SSHKeyFile != "" {
+						sshKey := &db.SSHKey{
+							Name:       instance.SSHKeyName,
+							PrivateKey: instance.SSHKeyFile,
+						}
+						if saveErr := database.SaveSSHKey(sshKey); saveErr != nil {
+							fmt.Printf("Warning: Failed to save SSH key to database: %v\n", saveErr)
+						}
 					}
 				}
 			}
