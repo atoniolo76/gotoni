@@ -827,158 +827,205 @@ func setupLlamaCppDocker(cluster *Cluster, hfToken string) {
 }
 
 func setupGotoniBinaryOnInstance(cluster *Cluster) []remote.Task {
-	fmt.Println("setting up gotoni binary on all instances...")
+	return setupGotoniBinaryOnInstanceWithStrategy(cluster, "least-loaded")
+}
 
-	// Get the project root directory (2 levels up from pkg/cluster/)
-	projectRoot := "../../"
-
-	// first, build gotoni for current platform from the project root
-	fmt.Println("Building gotoni for current platform...")
-	buildCmd := exec.Command("go", "build", "-o", "gotoni", ".")
-	buildCmd.Dir = projectRoot
-	buildCmd.Stdout = os.Stdout
-	buildCmd.Stderr = os.Stderr
-	if err := buildCmd.Run(); err != nil {
-		fmt.Printf("❌ Failed to build gotoni binary: %v\n", err)
-		return nil
-	}
-
-	fmt.Println("✅ gotoni binary built successfully")
+// setupGotoniBinaryOnInstanceWithStrategy builds gotoni with CGO directly on Linux instances
+// This enables the tokenizer for accurate GORGO routing
+func setupGotoniBinaryOnInstanceWithStrategy(cluster *Cluster, strategy string) []remote.Task {
+	fmt.Printf("Setting up gotoni binary on all instances (strategy: %s)...\n", strategy)
+	fmt.Println("Building DIRECTLY on Linux instances to enable CGO tokenizer")
 
 	out := []remote.Task{}
+	projectRoot := "../../"
 
-	// Track which architectures we've already built
-	builtArchs := make(map[string]bool)
+	// Create tarball of source code
+	fmt.Println("Creating source tarball...")
+	tarballPath := "/tmp/gotoni-src.tar.gz"
 
-	// next, build the process for linux amd64 or whatever the instance details
+	// Create tarball excluding .git, vendor, and binaries
+	tarCmd := exec.Command("tar",
+		"--exclude=.git",
+		"--exclude=vendor",
+		"--exclude=gotoni",
+		"--exclude=gotoni-amd64",
+		"--exclude=gotoni-arm64",
+		"--exclude=*.tar.gz",
+		"-czf", tarballPath,
+		"-C", projectRoot,
+		".",
+	)
+	tarCmd.Stdout = os.Stdout
+	tarCmd.Stderr = os.Stderr
+	if err := tarCmd.Run(); err != nil {
+		fmt.Printf("❌ Failed to create tarball: %v\n", err)
+		return nil
+	}
+	fmt.Printf("✅ Source tarball created: %s\n", tarballPath)
+
+	// Build script that installs dependencies and builds gotoni with CGO
+	buildScript := `#!/bin/bash
+set -e
+
+echo "=== Setting up gotoni build environment ==="
+
+# Install Go if not present
+if ! command -v go &> /dev/null; then
+    echo "Installing Go..."
+    wget -q https://go.dev/dl/go1.21.5.linux-amd64.tar.gz -O /tmp/go.tar.gz
+    sudo rm -rf /usr/local/go
+    sudo tar -C /usr/local -xzf /tmp/go.tar.gz
+    rm /tmp/go.tar.gz
+fi
+export PATH=$PATH:/usr/local/go/bin
+export GOPATH=/home/ubuntu/go
+export PATH=$PATH:$GOPATH/bin
+
+echo "Go version: $(go version)"
+
+# Install Rust if not present (needed for tokenizer library)
+if ! command -v cargo &> /dev/null; then
+    echo "Installing Rust..."
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+fi
+source $HOME/.cargo/env 2>/dev/null || true
+
+echo "Rust version: $(rustc --version 2>/dev/null || echo 'installing...')"
+
+# Install build dependencies
+echo "Installing build dependencies..."
+sudo apt-get update -qq
+sudo apt-get install -y -qq build-essential pkg-config libssl-dev git
+
+# Build tokenizer library if not present
+TOKENIZER_LIB="/usr/local/lib/libtokenizers.a"
+if [ ! -f "$TOKENIZER_LIB" ]; then
+    echo "Building tokenizer library (this may take a few minutes)..."
+    rm -rf /tmp/tokenizers-build
+    git clone --depth 1 https://github.com/daulet/tokenizers.git /tmp/tokenizers-build
+    cd /tmp/tokenizers-build
+    source $HOME/.cargo/env
+    make build
+    sudo cp libtokenizers.a /usr/local/lib/
+    echo "✅ Tokenizer library installed"
+else
+    echo "✅ Tokenizer library already installed"
+fi
+
+# Extract source code
+echo "Extracting gotoni source..."
+rm -rf /home/ubuntu/gotoni-src
+mkdir -p /home/ubuntu/gotoni-src
+tar -xzf /home/ubuntu/gotoni-src.tar.gz -C /home/ubuntu/gotoni-src
+
+# Build gotoni with CGO enabled
+echo "Building gotoni with CGO (tokenizer enabled)..."
+cd /home/ubuntu/gotoni-src
+export CGO_ENABLED=1
+export CGO_LDFLAGS="-L/usr/local/lib"
+go build -o /home/ubuntu/gotoni .
+
+# Verify build
+if [ -f /home/ubuntu/gotoni ]; then
+    echo "✅ gotoni built successfully!"
+    file /home/ubuntu/gotoni
+    # Test tokenizer
+    echo "Testing tokenizer..."
+    /home/ubuntu/gotoni lb status 2>&1 || echo "(lb not running, expected)"
+else
+    echo "❌ gotoni build failed"
+    exit 1
+fi
+`
+
+	// Track which instances we've set up
+	var wg sync.WaitGroup
+	resultsMu := sync.Mutex{}
+	results := make(map[string]bool)
+
 	for _, inst := range cluster.Instances {
-		fmt.Printf("installing gotoni binary on instance %s...\n", inst.ID)
+		wg.Add(1)
+		go func(instance remote.RunningInstance) {
+			defer wg.Done()
 
-		// get the current architecture of the system
-		sshMgr := cluster.sshMgr
+			fmt.Printf("  → Setting up gotoni on %s (%s)...\n", instance.Name, instance.IP)
 
-		archOutput, err := sshMgr.ExecuteCommand(inst.IP, "python3 -c 'import platform; print(platform.machine())'")
-		if err != nil {
-			fmt.Printf("❌ Failed to get architecture on %s: %v\n", inst.ID[:16], err)
-			archOutput = ""
-		}
-
-		// Clean up the output and map to Go architecture
-		archOutput = strings.TrimSpace(archOutput)
-		var goos, goarch string
-		switch archOutput {
-		case "x86_64":
-			goos, goarch = "linux", "amd64"
-		case "aarch64", "arm64":
-			goos, goarch = "linux", "arm64"
-		default:
-			fmt.Printf("❌ Unsupported architecture on %s: %s\n", inst.ID[:16], archOutput)
-			continue
-		}
-
-		archName := "gotoni-" + goarch
-		archKey := goos + "/" + goarch
-
-		// Only build once per architecture
-		if !builtArchs[archKey] {
-			fmt.Printf("Building for %s/%s on instance %s\n", goos, goarch, inst.ID[:16])
-
-			// Build from project root with correct output path
-			crossBuildCmd := exec.Command("go", "build", "-o", archName, ".")
-			crossBuildCmd.Dir = projectRoot
-			crossBuildCmd.Env = append(os.Environ(), "GOOS="+goos, "GOARCH="+goarch, "CGO_ENABLED=0")
-			crossBuildCmd.Stdout = os.Stdout
-			crossBuildCmd.Stderr = os.Stderr
-			if err := crossBuildCmd.Run(); err != nil {
-				fmt.Printf("❌ Failed to build gotoni binary for %s/%s: %v\n", goos, goarch, err)
-				continue
+			// Get SSH key for SCP
+			var sshKeyPath string
+			if len(instance.SSHKeyNames) > 0 {
+				sshKey, err := cluster.database.GetSSHKey(instance.SSHKeyNames[0])
+				if err != nil {
+					fmt.Printf("  ❌ Failed to get SSH key for %s: %v\n", instance.Name, err)
+					resultsMu.Lock()
+					results[instance.ID] = false
+					resultsMu.Unlock()
+					return
+				}
+				sshKeyPath = sshKey.PrivateKey
+			} else {
+				fmt.Printf("  ❌ No SSH key found for %s\n", instance.Name)
+				resultsMu.Lock()
+				results[instance.ID] = false
+				resultsMu.Unlock()
+				return
 			}
 
-			// Verify the built binary is an ELF executable, not an archive
-			builtBinaryPath := projectRoot + archName
-			verifyLocalCmd := exec.Command("file", builtBinaryPath)
-			verifyOutput, _ := verifyLocalCmd.Output()
-			if !strings.Contains(string(verifyOutput), "ELF") {
-				fmt.Printf("❌ Built binary is not a valid ELF executable: %s\n", string(verifyOutput))
-				continue
+			// Copy tarball to instance
+			fmt.Printf("  → Copying source to %s...\n", instance.Name)
+			scpCmd := exec.Command("scp",
+				"-i", sshKeyPath,
+				"-o", "StrictHostKeyChecking=no",
+				"-o", "UserKnownHostsFile=/dev/null",
+				tarballPath,
+				fmt.Sprintf("ubuntu@%s:/home/ubuntu/gotoni-src.tar.gz", instance.IP),
+			)
+			if err := scpCmd.Run(); err != nil {
+				fmt.Printf("  ❌ Failed to copy source to %s: %v\n", instance.Name, err)
+				resultsMu.Lock()
+				results[instance.ID] = false
+				resultsMu.Unlock()
+				return
 			}
 
-			fmt.Printf("✅ Binary built for %s/%s (verified as ELF executable)\n", goos, goarch)
-			builtArchs[archKey] = true
-		} else {
-			fmt.Printf("Using pre-built binary for %s/%s\n", goos, goarch)
-		}
+			// Execute build script on instance
+			fmt.Printf("  → Building on %s (this may take 5-10 minutes on first run)...\n", instance.Name)
+			output, err := cluster.sshMgr.ExecuteCommandWithTimeout(
+				instance.IP,
+				buildScript,
+				20*time.Minute, // Rust compilation can take a while
+			)
 
-		// Get SSH key path for this instance
-		var sshKeyPath string
-		if len(inst.SSHKeyNames) > 0 {
-			sshKeyName := inst.SSHKeyNames[0]
-			sshKey, err := cluster.database.GetSSHKey(sshKeyName)
+			resultsMu.Lock()
 			if err != nil {
-				fmt.Printf("❌ Failed to get SSH key %s for %s: %v\n", sshKeyName, inst.ID[:16], err)
-				continue
+				fmt.Printf("  ❌ Build failed on %s: %v\n", instance.Name, err)
+				if len(output) > 500 {
+					output = output[len(output)-500:]
+				}
+				fmt.Printf("     Last output: %s\n", output)
+				results[instance.ID] = false
+			} else {
+				fmt.Printf("  ✅ gotoni built on %s\n", instance.Name)
+				results[instance.ID] = true
 			}
-			sshKeyPath = sshKey.PrivateKey
-			fmt.Printf("🔑 Using SSH key: %s\n", sshKeyPath)
-		} else {
-			fmt.Printf("❌ No SSH key found for instance %s\n", inst.ID[:16])
-			continue
-		}
-
-		// Copy the binary to the instance using SCP with the SSH key
-		// Use the binary from project root
-		localBinaryPath := projectRoot + archName
-		remotePath := "/home/ubuntu/" + archName
-		fmt.Printf("📤 Copying %s to %s:%s via SCP...\n", localBinaryPath, inst.IP, remotePath)
-
-		scpCmd := exec.Command("scp",
-			"-i", sshKeyPath,
-			"-o", "StrictHostKeyChecking=no",
-			"-o", "UserKnownHostsFile=/dev/null",
-			localBinaryPath,
-			fmt.Sprintf("ubuntu@%s:%s", inst.IP, remotePath),
-		)
-		scpCmd.Stdout = os.Stdout
-		scpCmd.Stderr = os.Stderr
-		fmt.Printf("🔧 Running: scp -i %s -o StrictHostKeyChecking=no %s ubuntu@%s:%s\n",
-			sshKeyPath, localBinaryPath, inst.IP, remotePath)
-
-		if err := scpCmd.Run(); err != nil {
-			fmt.Printf("❌ Failed to SCP binary to %s: %v\n", inst.ID[:16], err)
-			continue
-		}
-
-		// Make executable
-		chmodCmd := fmt.Sprintf("chmod +x %s", remotePath)
-		if _, err := sshMgr.ExecuteCommand(inst.IP, chmodCmd); err != nil {
-			fmt.Printf("❌ Failed to chmod +x on %s: %v\n", inst.ID[:16], err)
-			continue
-		}
-
-		// Verify the binary was copied correctly - must be ELF executable
-		verifyCmd := fmt.Sprintf("ls -la %s && file %s", remotePath, remotePath)
-		verifyOutput, err := sshMgr.ExecuteCommand(inst.IP, verifyCmd)
-		if err != nil {
-			fmt.Printf("❌ Failed to verify binary on %s: %v\n", inst.ID[:16], err)
-			continue
-		}
-
-		if !strings.Contains(verifyOutput, "ELF") {
-			fmt.Printf("❌ Binary on %s is NOT an ELF executable:\n%s\n", inst.ID[:16], verifyOutput)
-			continue
-		}
-
-		fmt.Printf("✅ Binary copied and verified on %s:\n%s\n", inst.ID[:16], verifyOutput)
-
-		out = append(out, remote.Task{
-			Name:       "start gotoni load balancer",
-			Command:    "/home/ubuntu/" + archName + " lb start --listen-port 8000 --local-port 8080",
-			Background: true,
-			WorkingDir: "/home/ubuntu",
-		})
+			resultsMu.Unlock()
+		}(inst)
 	}
 
-	// Open port 8000 for load balancer (global firewall, only need to do once)
+	wg.Wait()
+
+	// Create tasks for successful builds
+	for _, inst := range cluster.Instances {
+		if results[inst.ID] {
+			out = append(out, remote.Task{
+				Name:       "start gotoni load balancer",
+				Command:    fmt.Sprintf("/home/ubuntu/gotoni lb start --listen-port 8000 --local-port 8080 --strategy %s", strategy),
+				Background: true,
+				WorkingDir: "/home/ubuntu",
+			})
+		}
+	}
+
+	// Open port 8000 for load balancer
 	fmt.Println("Opening port 8000 in firewall for load balancer...")
 	provider, _ := remote.GetCloudProvider()
 	httpClient := remote.NewHTTPClient()
@@ -989,7 +1036,14 @@ func setupGotoniBinaryOnInstance(cluster *Cluster) []remote.Task {
 		fmt.Println("✅ Port 8000 opened in firewall")
 	}
 
-	fmt.Println("✅ gotoni binary installed on all instances")
+	successCount := 0
+	for _, ok := range results {
+		if ok {
+			successCount++
+		}
+	}
+	fmt.Printf("✅ gotoni binary built on %d/%d instances\n", successCount, len(cluster.Instances))
+
 	return out
 }
 
@@ -1728,9 +1782,18 @@ echo 'Note: Model loading can take 2-5 minutes on first run'
 	fmt.Println("8. Testing SGLang API endpoints...")
 	testSGLangAPIEndpoints(cluster, cluster.Instances)
 
-	// 9. Start load balancing processes
-	fmt.Println("9. Setting up load balancers...")
-	tasks := setupGotoniBinaryOnInstance(cluster)
+	// 9. Verify local tokenizer (for GORGO policy)
+	fmt.Println("9. Verifying local tokenizer for GORGO policy...")
+	testTokenCount := GetTokenCount("Hello, world!")
+	if testTokenCount > 0 {
+		fmt.Printf("✅ Local tokenizer working: 'Hello, world!' = %d tokens\n", testTokenCount)
+	} else {
+		fmt.Println("⚠️  Local tokenizer not available, GORGO will use character-based fallback")
+	}
+
+	// 10. Start load balancing processes with GORGO policy
+	fmt.Println("10. Setting up load balancers with GORGO policy...")
+	tasks := setupGotoniBinaryOnInstanceWithStrategy(cluster, "gorgo")
 	if tasks == nil {
 		fmt.Println("❌ Failed to setup gotoni binary on instances")
 		return
@@ -1741,7 +1804,7 @@ echo 'Note: Model loading can take 2-5 minutes on first run'
 		if err != nil {
 			fmt.Printf("❌ Failed to start gotoni load balancer on %s: %v\n", cluster.Instances[i].IP, err)
 		} else {
-			fmt.Printf("✅ Gotoni load balancer started on %s\n", cluster.Instances[i].IP)
+			fmt.Printf("✅ Gotoni load balancer (GORGO) started on %s\n", cluster.Instances[i].IP)
 		}
 	}
 
