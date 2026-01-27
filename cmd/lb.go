@@ -95,7 +95,7 @@ func init() {
 	lbStartCmd.Flags().Duration("request-timeout", 30*time.Second, "Request timeout for forwarded requests")
 	lbStartCmd.Flags().StringSlice("peers", []string{}, "Peer addresses in format ip:port (can specify multiple)")
 	lbStartCmd.Flags().String("pid-file", "/tmp/gotoni-lb.pid", "Path to PID file")
-	lbStartCmd.Flags().String("strategy", "least-loaded", "Load balancing strategy (least-loaded, round-robin, prefix-tree)")
+	lbStartCmd.Flags().String("strategy", "least-loaded", "Load balancing strategy (least-loaded, prefix-tree, gorgo)")
 	lbStartCmd.Flags().String("node-id", "", "Unique identifier for this node in the cluster")
 
 	// Flags for lb status
@@ -152,6 +152,8 @@ func runLBStart(cmd *cobra.Command, args []string) {
 		config.Strategy = &serve.LeastLoadedPolicy{}
 	case "prefix-tree":
 		config.Strategy = serve.NewPrefixTreePolicy()
+	case "gorgo":
+		config.Strategy = &serve.GORGOPolicy{}
 	default:
 		config.Strategy = &serve.LeastLoadedPolicy{}
 	}
