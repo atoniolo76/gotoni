@@ -237,8 +237,8 @@ async def init_node_clients() -> None:
             url = f"http://{ip}:{port}"
             try:
                 async with session.get(f'{url}/v1/models', timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                data = await resp.json()
-            model = data['data'][0]['id']
+                    data = await resp.json()
+                    model = data['data'][0]['id']
                     node_models[name] = model
                     node_clients[name] = openai.AsyncOpenAI(
         base_url=f'{url}/v1',
@@ -303,7 +303,7 @@ async def send_request(
             t_now = time.time()
             
             if chunk.choices and len(chunk.choices) > 0:
-            choice = chunk.choices[0]
+                choice = chunk.choices[0]
             
                 if metric.ttft is None and choice.delta and choice.delta.content:
                     metric.ttft = t_now - st
@@ -318,7 +318,7 @@ async def send_request(
             
             # Usage comes in final chunk
             if chunk.usage:
-                        metric.input_tokens = chunk.usage.prompt_tokens
+                metric.input_tokens = chunk.usage.prompt_tokens
                 metric.output_tokens = chunk.usage.completion_tokens
         
         # Fallback token count if usage wasn't provided
@@ -429,7 +429,7 @@ async def run_constant_rate_benchmark(
         for i, msg in enumerate(conv['conv'][:2]):  # Just first exchange
             messages.append({'role': msg['role'], 'content': msg['content']})
             if msg['role'] == 'assistant':
-            break
+                break
 
         if not messages or messages[-1]['role'] != 'user':
             # Need to end with user message
