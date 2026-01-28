@@ -79,11 +79,32 @@ var lbStatusCmd = &cobra.Command{
 	Run:   runLBStatus,
 }
 
+// lbPolicyCmd switches or shows load balancer policy
+var lbPolicyCmd = &cobra.Command{
+	Use:   "policy [policy-name]",
+	Short: "Get or set load balancer policy",
+	Long: `Get the current policy or switch to a new one.
+
+Available policies: least-loaded, prefix-tree, gorgo
+
+Examples:
+  # Show current policy
+  gotoni lb policy --host 192.168.1.100
+
+  # Switch to gorgo policy
+  gotoni lb policy gorgo --host 192.168.1.100
+
+  # Switch policy on multiple hosts
+  gotoni lb policy gorgo --host 192.168.1.100,192.168.1.101,192.168.1.102`,
+	Run: runLBPolicy,
+}
+
 func init() {
 	rootCmd.AddCommand(lbCmd)
 	lbCmd.AddCommand(lbStartCmd)
 	lbCmd.AddCommand(lbStopCmd)
 	lbCmd.AddCommand(lbStatusCmd)
+	lbCmd.AddCommand(lbPolicyCmd)
 
 	// Flags for lb start
 	lbStartCmd.Flags().String("config", "", "Path to JSON config file")
@@ -104,6 +125,10 @@ func init() {
 
 	// Flags for lb stop
 	lbStopCmd.Flags().String("pid-file", "/tmp/gotoni-lb.pid", "Path to PID file")
+
+	// Flags for lb policy
+	lbPolicyCmd.Flags().StringSlice("host", []string{"localhost"}, "Load balancer host(s) to target (comma-separated)")
+	lbPolicyCmd.Flags().Int("port", 8000, "Load balancer port")
 }
 
 func runLBStart(cmd *cobra.Command, args []string) {
@@ -261,4 +286,68 @@ func runLBStatus(cmd *cobra.Command, args []string) {
 	// we can only confirm it's responding to requests
 	fmt.Printf("\nNote: Detailed status/metrics not available in new SGLang-integrated version\n")
 	fmt.Printf("The load balancer is running and can handle requests.\n")
+}
+
+func runLBPolicy(cmd *cobra.Command, args []string) {
+	hosts, _ := cmd.Flags().GetStringSlice("host")
+	port, _ := cmd.Flags().GetInt("port")
+
+	client := &http.Client{Timeout: 5 * time.Second}
+
+	// Expand comma-separated hosts
+	var allHosts []string
+	for _, h := range hosts {
+		for _, host := range strings.Split(h, ",") {
+			host = strings.TrimSpace(host)
+			if host != "" {
+				allHosts = append(allHosts, host)
+			}
+		}
+	}
+
+	for _, host := range allHosts {
+		policyURL := fmt.Sprintf("http://%s:%d/lb/policy", host, port)
+
+		if len(args) == 0 {
+			// GET current policy
+			resp, err := client.Get(policyURL)
+			if err != nil {
+				fmt.Printf("❌ %s: failed to connect - %v\n", host, err)
+				continue
+			}
+			defer resp.Body.Close()
+
+			var result map[string]interface{}
+			if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+				fmt.Printf("❌ %s: failed to parse response - %v\n", host, err)
+				continue
+			}
+
+			fmt.Printf("✅ %s: policy=%s (available: %v)\n",
+				host, result["current"], result["available"])
+		} else {
+			// SET new policy
+			newPolicy := args[0]
+			setPolicyURL := fmt.Sprintf("%s?set=%s", policyURL, newPolicy)
+
+			resp, err := client.Get(setPolicyURL)
+			if err != nil {
+				fmt.Printf("❌ %s: failed to connect - %v\n", host, err)
+				continue
+			}
+			defer resp.Body.Close()
+
+			var result map[string]interface{}
+			if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+				fmt.Printf("❌ %s: failed to parse response - %v\n", host, err)
+				continue
+			}
+
+			if result["success"] == true {
+				fmt.Printf("✅ %s: %s -> %s\n", host, result["old_policy"], result["new_policy"])
+			} else {
+				fmt.Printf("❌ %s: %v\n", host, result["error"])
+			}
+		}
+	}
 }
