@@ -11,8 +11,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -56,7 +59,7 @@ func DefaultMetricsConfig() MetricsConfig {
 	return MetricsConfig{
 		Enabled:            true,
 		PollInterval:       1 * time.Second,
-		Endpoint:           "/get_server_info",
+		Endpoint:           "/metrics", // Prometheus metrics endpoint (requires --enable-metrics flag in SGLang)
 		Timeout:            500 * time.Millisecond,
 		UnhealthyThreshold: 3,
 		GPUCacheThreshold:  0.95,
@@ -214,9 +217,9 @@ func (lb *LoadBalancer) pollPeerMetrics(peer *PeerNode) {
 				Timestamp: time.Now(),
 				EventType: EventPeerRecovered,
 				Metadata: map[string]interface{}{
-					"peer_id":  peer.Instance.ID,
-					"peer_ip":  peer.Instance.IP,
-					"poll_ms":  float64(elapsed.Microseconds()) / 1000.0,
+					"peer_id": peer.Instance.ID,
+					"peer_ip": peer.Instance.IP,
+					"poll_ms": float64(elapsed.Microseconds()) / 1000.0,
 				},
 			})
 		}
@@ -224,6 +227,7 @@ func (lb *LoadBalancer) pollPeerMetrics(peer *PeerNode) {
 }
 
 // fetchSGLangMetrics makes an HTTP request to fetch metrics from an SGLang server
+// Supports both Prometheus format (/metrics) and JSON format (/get_server_info)
 func (lb *LoadBalancer) fetchSGLangMetrics(ctx context.Context, url string) (*SGLangMetrics, error) {
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
@@ -240,9 +244,21 @@ func (lb *LoadBalancer) fetchSGLangMetrics(ctx context.Context, url string) (*SG
 		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 	}
 
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	// Check if response is Prometheus format (starts with # or metric name)
+	bodyStr := string(body)
+	if strings.HasPrefix(bodyStr, "#") || strings.HasPrefix(bodyStr, "sglang:") {
+		return parsePrometheusMetrics(bodyStr)
+	}
+
+	// Fallback to JSON format
 	var serverInfo SGLangServerInfo
-	if err := json.NewDecoder(resp.Body).Decode(&serverInfo); err != nil {
-		return nil, fmt.Errorf("failed to decode response: %w", err)
+	if err := json.Unmarshal(body, &serverInfo); err != nil {
+		return nil, fmt.Errorf("failed to decode JSON response: %w", err)
 	}
 
 	return &SGLangMetrics{
@@ -256,6 +272,65 @@ func (lb *LoadBalancer) fetchSGLangMetrics(ctx context.Context, url string) (*SG
 		Healthy:          true,
 		ConsecutiveFails: 0,
 	}, nil
+}
+
+// parsePrometheusMetrics parses Prometheus text format metrics from SGLang's /metrics endpoint
+func parsePrometheusMetrics(body string) (*SGLangMetrics, error) {
+	metrics := &SGLangMetrics{
+		LastUpdated:      time.Now(),
+		Healthy:          true,
+		ConsecutiveFails: 0,
+	}
+
+	// Parse line by line, looking for specific metrics
+	lines := strings.Split(body, "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		// Parse format: metric_name{labels} value
+		// We only care about the metric name and value
+		parts := strings.Fields(line)
+		if len(parts) < 2 {
+			continue
+		}
+
+		metricNameWithLabels := parts[0]
+		valueStr := parts[1]
+
+		// Extract metric name (before any labels)
+		metricName := metricNameWithLabels
+		if idx := strings.Index(metricNameWithLabels, "{"); idx != -1 {
+			metricName = metricNameWithLabels[:idx]
+		}
+
+		// Parse value
+		value, err := strconv.ParseFloat(valueStr, 64)
+		if err != nil {
+			continue
+		}
+
+		// Map Prometheus metrics to our struct
+		switch metricName {
+		case "sglang:num_running_reqs":
+			metrics.NumRunningReqs = int(value)
+		case "sglang:num_waiting_reqs":
+			metrics.NumWaitingReqs = int(value)
+		case "sglang:token_usage":
+			metrics.GPUCacheUsage = value
+		case "sglang:max_running_reqs":
+			metrics.MaxRunningReqs = int(value)
+		case "sglang:max_total_tokens":
+			metrics.MaxTotalTokens = int(value)
+		}
+	}
+
+	// Calculate total requests
+	metrics.NumTotalReqs = metrics.NumRunningReqs + metrics.NumWaitingReqs
+
+	return metrics, nil
 }
 
 // markLocalUnhealthy marks the local SGLang as unhealthy after failed poll

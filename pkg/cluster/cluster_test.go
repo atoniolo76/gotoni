@@ -1684,9 +1684,10 @@ sudo docker run --gpus all \
     python -m sglang.launch_server \
     --model-path mistralai/Mistral-7B-Instruct-v0.3 \
     --port 8080 \
-    --host 0.0.0.0
+    --host 0.0.0.0 \
+    --enable-metrics
 
-echo 'SGLang container started successfully'
+echo 'SGLang container started successfully (with --enable-metrics)'
 echo 'Note: Model loading can take 2-5 minutes on first run'
 `,
 		Background: true,
@@ -1936,24 +1937,54 @@ fi
 	return nil
 }
 
+// LBDeployConfig holds configuration for load balancer deployment
+type LBDeployConfig struct {
+	Strategy             string
+	ObservabilityEnabled bool
+	LokiEndpoint         string
+}
+
 // deployLBStrategy stops any existing load balancer and starts a new one with the given strategy
 // on all cluster instances. This is lightweight and can be called multiple times with different
 // strategies on the same cluster.
 func deployLBStrategy(cluster *Cluster, strategy string) error {
-	fmt.Printf("=== Deploying LB Strategy: %s ===\n", strategy)
+	return deployLBStrategyWithConfig(cluster, LBDeployConfig{Strategy: strategy})
+}
+
+// deployLBStrategyWithObservability deploys LB with observability enabled to push to Loki
+func deployLBStrategyWithObservability(cluster *Cluster, strategy, lokiEndpoint string) error {
+	return deployLBStrategyWithConfig(cluster, LBDeployConfig{
+		Strategy:             strategy,
+		ObservabilityEnabled: true,
+		LokiEndpoint:         lokiEndpoint,
+	})
+}
+
+// deployLBStrategyWithConfig deploys LB with full configuration options
+func deployLBStrategyWithConfig(cluster *Cluster, config LBDeployConfig) error {
+	fmt.Printf("=== Deploying LB Strategy: %s ===\n", config.Strategy)
+	if config.ObservabilityEnabled {
+		fmt.Printf("Observability enabled, pushing to: %s\n", config.LokiEndpoint)
+	}
 
 	// Kill existing load balancer tmux sessions on all instances
 	fmt.Println("Stopping existing load balancers...")
-	killCmd := "tmux kill-session -t gotoni-start_gotoni_load_balancer 2>/dev/null || true"
+	killCmd := "tmux kill-session -t gotoni-start_gotoni_load_balancer 2>/dev/null || true; pkill -f 'gotoni lb' 2>/dev/null || true"
 	cluster.ExecuteOnCluster(killCmd)
 
 	// Brief pause to let processes clean up
 	time.Sleep(2 * time.Second)
 
+	// Build the command with optional observability flags
+	lbCommand := fmt.Sprintf("/home/ubuntu/gotoni lb start --listen-port 8000 --local-port 8080 --strategy %s", config.Strategy)
+	if config.ObservabilityEnabled && config.LokiEndpoint != "" {
+		lbCommand += fmt.Sprintf(" --observability --loki-endpoint %s", config.LokiEndpoint)
+	}
+
 	// Start load balancer with new strategy on each instance
 	lbTask := remote.Task{
 		Name:       "start gotoni load balancer",
-		Command:    fmt.Sprintf("/home/ubuntu/gotoni lb start --listen-port 8000 --local-port 8080 --strategy %s", strategy),
+		Command:    lbCommand,
 		Background: true,
 		WorkingDir: "/home/ubuntu",
 	}
@@ -1965,7 +1996,7 @@ func deployLBStrategy(cluster *Cluster, strategy string) error {
 			fmt.Printf("Failed to start LB on %s: %v\n", inst.IP, err)
 			failCount++
 		} else {
-			fmt.Printf("LB (%s) started on %s\n", strategy, inst.IP)
+			fmt.Printf("LB (%s) started on %s\n", config.Strategy, inst.IP)
 		}
 	}
 
@@ -1976,7 +2007,7 @@ func deployLBStrategy(cluster *Cluster, strategy string) error {
 	// Wait for LB to start accepting connections
 	time.Sleep(3 * time.Second)
 
-	fmt.Printf("=== LB Strategy %s Deployed ===\n", strategy)
+	fmt.Printf("=== LB Strategy %s Deployed ===\n", config.Strategy)
 	return nil
 }
 
