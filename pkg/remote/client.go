@@ -358,48 +358,49 @@ func RunCommandOnInstance(instanceIP string) error {
 	return fmt.Errorf("RunCommandOnInstance not implemented")
 }
 
-// ConnectToInstance connects to a remote instance via SSH using the key from config
+// ConnectToInstance connects to a remote instance via SSH.
+// It first tries to find the instance from Lambda API to get the SSH key name,
+// then looks up the key file path locally.
 func ConnectToInstance(instanceIP string) error {
-	db, err := getDB()
-	if err != nil {
-		return fmt.Errorf("failed to init db: %w", err)
-	}
-	defer db.Close()
+	// First, try to find the instance from Lambda API to get SSH key name
+	httpClient := NewHTTPClient()
+	apiToken := GetAPIToken()
 
-	// Find instance by IP
-	instance, err := db.GetInstanceByIP(instanceIP)
-	if err != nil {
-		// Fallback: Try to find ANY key? Or assume key name?
-		// In original logic, we grabbed "first key".
-		// Let's grab "first key" if no instance found.
-		keys, kerr := db.ListSSHKeys()
+	var sshKeyFile string
+
+	if apiToken != "" {
+		instances, err := ListRunningInstances(httpClient, apiToken)
+		if err == nil {
+			for _, inst := range instances {
+				if inst.IP == instanceIP {
+					// Found the instance, get SSH key file
+					keyFile, keyErr := GetSSHKeyFileForInstance(&inst)
+					if keyErr == nil {
+						sshKeyFile = keyFile
+						break
+					}
+				}
+			}
+		}
+	}
+
+	// Fallback: try to find any available key
+	if sshKeyFile == "" {
+		database, err := getDB()
+		if err != nil {
+			return fmt.Errorf("failed to init db: %w", err)
+		}
+		defer database.Close()
+
+		keys, kerr := database.ListSSHKeys()
 		if kerr != nil || len(keys) == 0 {
-			return fmt.Errorf("instance not found in db and no ssh keys available")
+			return fmt.Errorf("no ssh keys available")
 		}
 		// Use first key
-		sshKeyFile := keys[0].PrivateKey
-		// Check existence
+		sshKeyFile = keys[0].PrivateKey
 		if _, err := os.Stat(sshKeyFile); os.IsNotExist(err) {
 			return fmt.Errorf("SSH key file %s does not exist", sshKeyFile)
 		}
-
-		// Use ssh command to connect
-		cmd := exec.Command("ssh", "-i", sshKeyFile, "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", fmt.Sprintf("ubuntu@%s", instanceIP))
-		cmd.Stdin = os.Stdin
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		return cmd.Run()
-	}
-
-	// Found instance, get key name
-	key, err := db.GetSSHKey(instance.SSHKeyName)
-	if err != nil {
-		return fmt.Errorf("ssh key %s not found for instance: %w", instance.SSHKeyName, err)
-	}
-
-	sshKeyFile := key.PrivateKey
-	if _, err := os.Stat(sshKeyFile); os.IsNotExist(err) {
-		return fmt.Errorf("SSH key file %s does not exist", sshKeyFile)
 	}
 
 	// Use ssh command to connect
@@ -412,6 +413,7 @@ func ConnectToInstance(instanceIP string) error {
 }
 
 // GetSSHKeyForInstance returns the SSH key file for a given instance ID
+// Deprecated: Use GetSSHKeyFileForKeyName instead with the instance's SSHKeyNames from the API
 func GetSSHKeyForInstance(instanceID string) (string, error) {
 	db, err := getDB()
 	if err != nil {
@@ -436,15 +438,66 @@ func GetSSHKeyForInstance(instanceID string) (string, error) {
 	return key.PrivateKey, nil
 }
 
-// RemoveInstanceFromConfig removes an instance from the config
-func RemoveInstanceFromConfig(instanceID string) error {
-	db, err := getDB()
+// GetSSHKeyFileForKeyName returns the private key file path for a given SSH key name.
+// This looks up the key in the local database where key name -> file path mappings are stored.
+// The key name typically comes from the instance's SSHKeyNames field from Lambda API.
+func GetSSHKeyFileForKeyName(keyName string) (string, error) {
+	database, err := getDB()
 	if err != nil {
-		return fmt.Errorf("failed to init db: %w", err)
+		return "", fmt.Errorf("failed to init db: %w", err)
 	}
-	defer db.Close()
+	defer database.Close()
 
-	return db.DeleteInstance(instanceID)
+	key, err := database.GetSSHKey(keyName)
+	if err != nil {
+		// Try common locations as fallback
+		sshDir, dirErr := getSSHDir()
+		if dirErr != nil {
+			return "", fmt.Errorf("ssh key %s not found in db and could not get ssh dir: %w", keyName, err)
+		}
+
+		// Try .pem extension
+		pemPath := filepath.Join(sshDir, keyName+".pem")
+		if _, statErr := os.Stat(pemPath); statErr == nil {
+			return pemPath, nil
+		}
+
+		// Try without extension
+		noExtPath := filepath.Join(sshDir, keyName)
+		if _, statErr := os.Stat(noExtPath); statErr == nil {
+			return noExtPath, nil
+		}
+
+		return "", fmt.Errorf("ssh key %s not found in db or filesystem", keyName)
+	}
+
+	if _, err := os.Stat(key.PrivateKey); os.IsNotExist(err) {
+		return "", fmt.Errorf("SSH key file %s does not exist", key.PrivateKey)
+	}
+
+	return key.PrivateKey, nil
+}
+
+// GetSSHKeyFileForInstance returns the private key file path for a RunningInstance.
+// It uses the instance's SSHKeyNames from the Lambda API and looks up the file path locally.
+func GetSSHKeyFileForInstance(instance *RunningInstance) (string, error) {
+	if len(instance.SSHKeyNames) == 0 {
+		return "", fmt.Errorf("instance %s has no SSH keys configured", instance.ID)
+	}
+
+	// Use the first SSH key name
+	keyName := instance.SSHKeyNames[0]
+	return GetSSHKeyFileForKeyName(keyName)
+}
+
+// RemoveInstanceFromConfig removes an instance from the config
+// Deprecated: Instance state is now managed by Lambda API, not local DB.
+// This function is kept for backwards compatibility but does nothing meaningful.
+func RemoveInstanceFromConfig(instanceID string) error {
+	// Instance state is managed by Lambda API, not local DB
+	// No action needed - when an instance is terminated via Lambda API,
+	// it will no longer appear in ListRunningInstances
+	return nil
 }
 
 func ListRunningInstances(httpClient *http.Client, apiToken string) ([]RunningInstance, error) {

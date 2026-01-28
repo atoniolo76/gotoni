@@ -3,6 +3,7 @@ Copyright © 2025 ALESSIO TONIOLO
 
 lb-deploy.go implements remote load balancer deployment and management.
 Uses SSH to deploy and manage load balancer processes on remote instances.
+Instance state comes from Lambda API; SSH key paths are looked up locally.
 */
 package cmd
 
@@ -13,7 +14,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/atoniolo76/gotoni/pkg/db"
 	"github.com/atoniolo76/gotoni/pkg/remote"
 	"github.com/spf13/cobra"
 )
@@ -144,32 +144,19 @@ func runLBDeploy(cmd *cobra.Command, args []string) {
 
 	fmt.Printf("Deploying load balancer to %d instance(s)...\n\n", len(targetInstances))
 
-	// Initialize database for SSH keys
-	database, err := db.InitDB()
-	if err != nil {
-		log.Fatalf("Failed to initialize database: %v", err)
-	}
-	defer database.Close()
-
 	// Create SSH manager
 	sshMgr := remote.NewSSHClientManager()
 
 	// Connect to all instances
 	for _, inst := range targetInstances {
-		// Get SSH key for instance
-		dbInstance, err := database.GetInstanceByIP(inst.IP)
-		if err != nil {
-			log.Printf("Warning: Could not find instance %s in database: %v", inst.IP, err)
-			continue
-		}
-
-		sshKey, err := database.GetSSHKey(dbInstance.SSHKeyName)
+		// Get SSH key using Lambda API key names + local file lookup
+		sshKeyPath, err := remote.GetSSHKeyFileForInstance(&inst)
 		if err != nil {
 			log.Printf("Warning: Could not find SSH key for instance %s: %v", inst.IP, err)
 			continue
 		}
 
-		if err := sshMgr.ConnectToInstance(inst.IP, sshKey.PrivateKey); err != nil {
+		if err := sshMgr.ConnectToInstance(inst.IP, sshKeyPath); err != nil {
 			log.Printf("Warning: Failed to connect to instance %s: %v", inst.IP, err)
 			continue
 		}
@@ -280,33 +267,20 @@ func runLBRemoteStatus(cmd *cobra.Command, args []string) {
 		log.Fatal("No matching instances found")
 	}
 
-	// Initialize database for SSH keys
-	database, err := db.InitDB()
-	if err != nil {
-		log.Fatalf("Failed to initialize database: %v", err)
-	}
-	defer database.Close()
-
 	// Create SSH manager
 	sshMgr := remote.NewSSHClientManager()
 
 	fmt.Printf("Checking load balancer status on %d instance(s)...\n\n", len(targetInstances))
 
 	for _, inst := range targetInstances {
-		// Connect to instance
-		dbInstance, err := database.GetInstanceByIP(inst.IP)
+		// Get SSH key using Lambda API key names + local file lookup
+		sshKeyPath, err := remote.GetSSHKeyFileForInstance(&inst)
 		if err != nil {
-			fmt.Printf("❌ %s: Could not find in database\n", inst.Name)
+			fmt.Printf("❌ %s: Could not find SSH key: %v\n", inst.Name, err)
 			continue
 		}
 
-		sshKey, err := database.GetSSHKey(dbInstance.SSHKeyName)
-		if err != nil {
-			fmt.Printf("❌ %s: Could not find SSH key\n", inst.Name)
-			continue
-		}
-
-		if err := sshMgr.ConnectToInstance(inst.IP, sshKey.PrivateKey); err != nil {
+		if err := sshMgr.ConnectToInstance(inst.IP, sshKeyPath); err != nil {
 			fmt.Printf("❌ %s: Connection failed\n", inst.Name)
 			continue
 		}
@@ -386,33 +360,20 @@ func runLBRemoteStop(cmd *cobra.Command, args []string) {
 		log.Fatal("No matching instances found")
 	}
 
-	// Initialize database for SSH keys
-	database, err := db.InitDB()
-	if err != nil {
-		log.Fatalf("Failed to initialize database: %v", err)
-	}
-	defer database.Close()
-
 	// Create SSH manager
 	sshMgr := remote.NewSSHClientManager()
 
 	fmt.Printf("Stopping load balancer on %d instance(s)...\n\n", len(targetInstances))
 
 	for _, inst := range targetInstances {
-		// Connect to instance
-		dbInstance, err := database.GetInstanceByIP(inst.IP)
+		// Get SSH key using Lambda API key names + local file lookup
+		sshKeyPath, err := remote.GetSSHKeyFileForInstance(&inst)
 		if err != nil {
-			fmt.Printf("❌ %s: Could not find in database\n", inst.Name)
+			fmt.Printf("❌ %s: Could not find SSH key: %v\n", inst.Name, err)
 			continue
 		}
 
-		sshKey, err := database.GetSSHKey(dbInstance.SSHKeyName)
-		if err != nil {
-			fmt.Printf("❌ %s: Could not find SSH key\n", inst.Name)
-			continue
-		}
-
-		if err := sshMgr.ConnectToInstance(inst.IP, sshKey.PrivateKey); err != nil {
+		if err := sshMgr.ConnectToInstance(inst.IP, sshKeyPath); err != nil {
 			fmt.Printf("❌ %s: Connection failed\n", inst.Name)
 			continue
 		}

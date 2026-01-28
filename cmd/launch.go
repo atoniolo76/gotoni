@@ -274,40 +274,16 @@ Examples:
 			}
 		}
 
-		// Save instance details to database
+		// Save SSH key to database (so we can look up file paths later)
+		// Note: Instance state is managed by Lambda API, not local DB
 		if launchErr == nil {
 			database, dbErr := db.InitDB()
 			if dbErr != nil {
 				fmt.Printf("Warning: Failed to initialize database: %v\n", dbErr)
 			} else {
+				defer database.Close()
 				for _, instance := range launchedInstances {
-					// Get full instance details from API
-					details, err := remote.GetInstance(httpClient, apiToken, instance.ID)
-
-					dbInstance := &db.Instance{
-						ID:           instance.ID,
-						Name:         instanceName,
-						Region:       actualRegion,
-						Status:       "active",
-						SSHKeyName:   instance.SSHKeyName,
-						InstanceType: instanceType,
-						CreatedAt:    time.Now(),
-					}
-
-					// Add IP if available
-					if err == nil && details != nil {
-						dbInstance.IPAddress = details.IP
-						dbInstance.InstanceType = details.InstanceType.Name
-						dbInstance.Region = details.Region.Name
-					}
-
-					if saveErr := database.SaveInstance(dbInstance); saveErr != nil {
-						fmt.Printf("Warning: Failed to save instance to database: %v\n", saveErr)
-					} else {
-						fmt.Printf("Instance %s saved to local database\n", instance.ID)
-					}
-
-					// Also save SSH key to database
+					// Save SSH key to database (maps key name -> file path)
 					if instance.SSHKeyName != "" && instance.SSHKeyFile != "" {
 						sshKey := &db.SSHKey{
 							Name:       instance.SSHKeyName,
@@ -315,6 +291,8 @@ Examples:
 						}
 						if saveErr := database.SaveSSHKey(sshKey); saveErr != nil {
 							fmt.Printf("Warning: Failed to save SSH key to database: %v\n", saveErr)
+						} else {
+							fmt.Printf("SSH key %s registered in local database\n", instance.SSHKeyName)
 						}
 					}
 				}

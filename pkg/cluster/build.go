@@ -51,15 +51,10 @@ func DeployGotoniToCluster(cluster *Cluster, binaryPath string) error {
 		go func(instance remote.RunningInstance) {
 			defer wg.Done()
 
-			// Get SSH key
-			var sshKeyPath string
-			if len(instance.SSHKeyNames) > 0 {
-				if sshKey, err := cluster.database.GetSSHKey(instance.SSHKeyNames[0]); err == nil {
-					sshKeyPath = sshKey.PrivateKey
-				}
-			}
-			if sshKeyPath == "" {
-				fmt.Printf("  %s: ❌ no SSH key\n", instance.Name)
+			// Get SSH key using Lambda API key names + local file lookup
+			sshKeyPath, err := remote.GetSSHKeyFileForInstance(&instance)
+			if err != nil {
+				fmt.Printf("  %s: ❌ no SSH key: %v\n", instance.Name, err)
 				mu.Lock()
 				failCount++
 				mu.Unlock()

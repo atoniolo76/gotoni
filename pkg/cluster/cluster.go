@@ -2,12 +2,12 @@
 Copyright © 2025 ALESSIO TONIOLO
 
 cluster.go contains cluster management functionality.
-Trimmed to essentials: connection, execution, health checks, SGLang setup.
+A "cluster" is simply the set of all running instances from Lambda API.
+SSH key paths are stored locally in the database (key name -> file path).
 */
 package serve
 
 import (
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -16,16 +16,16 @@ import (
 	"sync"
 	"time"
 
-	"github.com/atoniolo76/gotoni/pkg/db"
 	"github.com/atoniolo76/gotoni/pkg/remote"
 )
 
+// Cluster represents a collection of running instances.
+// The source of truth for instances is the Lambda API.
+// SSH key file paths are looked up from the local database.
 type Cluster struct {
-	ID        int64
 	Name      string
 	Instances []remote.RunningInstance
 	sshMgr    *remote.SSHClientManager
-	database  *db.DB
 	mu        sync.RWMutex
 	connected bool
 }
@@ -42,117 +42,70 @@ type LBDeployConfig struct {
 }
 
 // NewCluster creates a new cluster with the given name and instances
-func NewCluster(name string, instances []remote.RunningInstance, database *db.DB) *Cluster {
+func NewCluster(name string, instances []remote.RunningInstance) *Cluster {
 	return &Cluster{
 		Name:      name,
 		Instances: instances,
 		sshMgr:    remote.NewSSHClientManager(),
-		database:  database,
 	}
 }
 
-// GetCluster loads a cluster from the database by name and populates running instances
+// GetCluster fetches all running instances from Lambda API and returns them as a cluster.
+// The name parameter is optional and used for display/logging purposes.
+// This replaces the old database-based cluster lookup.
 func GetCluster(httpClient *http.Client, apiToken string, name string) (*Cluster, error) {
-	database, err := db.InitDB()
+	provider, _ := remote.GetCloudProvider()
+	instances, err := provider.ListRunningInstances(httpClient, apiToken)
 	if err != nil {
-		return nil, fmt.Errorf("failed to initialize database: %w", err)
-	}
-
-	dbCluster, err := database.GetCluster(name)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			return nil, fmt.Errorf("cluster %s not found", name)
-		}
-		return nil, fmt.Errorf("failed to get cluster from database: %w", err)
+		return nil, fmt.Errorf("failed to list running instances from API: %w", err)
 	}
 
 	cluster := &Cluster{
-		ID:       dbCluster.ID,
-		Name:     dbCluster.Name,
-		sshMgr:   remote.NewSSHClientManager(),
-		database: database,
-	}
-
-	instanceIDs, err := database.GetClusterInstances(dbCluster.ID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get cluster instances: %w", err)
-	}
-
-	if len(instanceIDs) > 0 {
-		provider, _ := remote.GetCloudProvider()
-		allRunning, err := provider.ListRunningInstances(httpClient, apiToken)
-		if err != nil {
-			return nil, fmt.Errorf("failed to list running instances: %w", err)
-		}
-
-		instanceIDMap := make(map[string]bool)
-		for _, id := range instanceIDs {
-			instanceIDMap[id] = true
-		}
-
-		for _, instance := range allRunning {
-			if instanceIDMap[instance.ID] {
-				cluster.Instances = append(cluster.Instances, instance)
-			}
-		}
+		Name:      name,
+		Instances: instances,
+		sshMgr:    remote.NewSSHClientManager(),
 	}
 
 	return cluster, nil
 }
 
-// ListClusters returns all clusters from the database
-func ListClusters() ([]db.Cluster, error) {
-	database, err := db.InitDB()
-	if err != nil {
-		return nil, fmt.Errorf("failed to initialize database: %w", err)
-	}
-	defer database.Close()
-	return database.ListClusters()
+// GetRunningInstances fetches all running instances from Lambda API.
+// This is the primary way to get the current cluster state.
+func GetRunningInstances(httpClient *http.Client, apiToken string) ([]remote.RunningInstance, error) {
+	provider, _ := remote.GetCloudProvider()
+	return provider.ListRunningInstances(httpClient, apiToken)
 }
 
-// DeleteClusterByName deletes a cluster from the database (does not terminate instances)
-func DeleteClusterByName(name string) error {
-	database, err := db.InitDB()
-	if err != nil {
-		return fmt.Errorf("failed to initialize database: %w", err)
+// TerminateInstances terminates the specified instances via Lambda API.
+func TerminateInstances(httpClient *http.Client, apiToken string, instanceIDs []string) error {
+	if len(instanceIDs) == 0 {
+		return nil
 	}
-	defer database.Close()
-	return database.DeleteCluster(name)
+	_, err := remote.TerminateInstance(httpClient, apiToken, instanceIDs)
+	return err
 }
 
-// TerminateCluster terminates all instances in a cluster and removes it from the database
-func TerminateCluster(httpClient *http.Client, apiToken string, name string) error {
-	database, err := db.InitDB()
+// TerminateAllInstances terminates all running instances.
+func TerminateAllInstances(httpClient *http.Client, apiToken string) error {
+	instances, err := GetRunningInstances(httpClient, apiToken)
 	if err != nil {
-		return fmt.Errorf("failed to initialize database: %w", err)
-	}
-	defer database.Close()
-
-	dbCluster, err := database.GetCluster(name)
-	if err != nil {
-		return fmt.Errorf("failed to get cluster: %w", err)
+		return fmt.Errorf("failed to get running instances: %w", err)
 	}
 
-	instanceIDs, err := database.GetClusterInstances(dbCluster.ID)
-	if err != nil {
-		return fmt.Errorf("failed to get cluster instances: %w", err)
+	if len(instances) == 0 {
+		return nil
 	}
 
-	if len(instanceIDs) > 0 {
-		_, err := remote.TerminateInstance(httpClient, apiToken, instanceIDs)
-		if err != nil {
-			log.Printf("Warning: failed to terminate some instances: %v", err)
-		}
+	var ids []string
+	for _, inst := range instances {
+		ids = append(ids, inst.ID)
 	}
 
-	if err := database.UpdateClusterStatus(name, "terminated"); err != nil {
-		log.Printf("Warning: failed to update cluster status: %v", err)
-	}
-
-	return database.DeleteCluster(name)
+	return TerminateInstances(httpClient, apiToken, ids)
 }
 
-// Connect establishes SSH connections to all instances in the cluster
+// Connect establishes SSH connections to all instances in the cluster.
+// SSH key file paths are looked up from the local database using the key names from Lambda API.
 func (c *Cluster) Connect() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -167,14 +120,14 @@ func (c *Cluster) Connect() error {
 			continue
 		}
 
-		sshKeyName := instance.SSHKeyNames[0]
-		sshKey, err := c.database.GetSSHKey(sshKeyName)
+		// Look up SSH key file path using the key name from Lambda API
+		sshKeyPath, err := remote.GetSSHKeyFileForInstance(&instance)
 		if err != nil {
-			log.Printf("Failed to get SSH key %s for instance %s: %v", sshKeyName, instance.ID, err)
+			log.Printf("Failed to get SSH key for instance %s: %v", instance.ID, err)
 			continue
 		}
 
-		err = c.sshMgr.ConnectToInstance(instance.IP, sshKey.PrivateKey)
+		err = c.sshMgr.ConnectToInstance(instance.IP, sshKeyPath)
 		if err != nil {
 			log.Printf("Failed to connect to instance %s (%s): %v", instance.ID, instance.IP, err)
 			continue
@@ -222,21 +175,12 @@ func (c *Cluster) Disconnect() {
 	c.sshMgr.CloseAllConnections()
 	c.connected = false
 
-	if c.database != nil && c.Name != "" {
-		if err := c.database.UpdateClusterStatus(c.Name, "disconnected"); err != nil {
-			log.Printf("Warning: failed to update cluster status: %v", err)
-		}
-	}
-
 	log.Println("Disconnected from all cluster instances")
 }
 
-// Close closes the cluster and its database connection
+// Close closes the cluster (alias for Disconnect for backwards compatibility)
 func (c *Cluster) Close() {
 	c.Disconnect()
-	if c.database != nil {
-		c.database.Close()
-	}
 }
 
 // SSHMgr returns the SSH manager for this cluster
@@ -256,14 +200,11 @@ func (c *Cluster) ExecuteCommandWithTimeout(instanceIP string, command string, t
 	return c.sshMgr.ExecuteCommandWithTimeout(instanceIP, command, timeout)
 }
 
-// AddInstance adds an instance to the cluster
+// AddInstance adds an instance to the in-memory cluster list.
+// Note: This only affects the local Cluster object - the Lambda API is the source of truth.
 func (c *Cluster) AddInstance(instance remote.RunningInstance) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-
-	if err := c.database.AddInstanceToCluster(c.ID, instance.ID); err != nil {
-		return fmt.Errorf("failed to add instance to cluster in database: %w", err)
-	}
 
 	c.Instances = append(c.Instances, instance)
 	return nil
@@ -474,15 +415,14 @@ func (c *Cluster) RunTaskOnCluster(task remote.Task) map[string]error {
 // SGLANG SETUP HELPERS
 // =====================================================
 
-// SetupSGLangCluster discovers running instances, creates/loads a cluster, connects via SSH,
+// SetupSGLangCluster discovers running instances from Lambda API, connects via SSH,
 // sets up SGLang Docker, deploys SGLang servers, and waits for them to be healthy.
 func SetupSGLangCluster(httpClient *http.Client, apiToken, clusterName, hfToken string) (*Cluster, error) {
 	fmt.Println("=== Setting up SGLang Cluster ===")
 
-	// 1. Discover all running instances
+	// 1. Discover all running instances from Lambda API
 	fmt.Println("1. Discovering running instances...")
-	provider, _ := remote.GetCloudProvider()
-	allInstances, err := provider.ListRunningInstances(httpClient, apiToken)
+	allInstances, err := GetRunningInstances(httpClient, apiToken)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list running instances: %w", err)
 	}
@@ -495,24 +435,8 @@ func SetupSGLangCluster(httpClient *http.Client, apiToken, clusterName, hfToken 
 		fmt.Printf("  - %s (%s) @ %s\n", inst.Name, inst.ID[:16], inst.IP)
 	}
 
-	// 2. Load or create cluster
-	cl, err := GetCluster(httpClient, apiToken, clusterName)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get/create cluster: %w", err)
-	}
-
-	existingIDs := make(map[string]bool)
-	for _, inst := range cl.Instances {
-		existingIDs[inst.ID] = true
-	}
-	for _, inst := range allInstances {
-		if !existingIDs[inst.ID] {
-			if addErr := cl.AddInstance(inst); addErr != nil {
-				fmt.Printf("    Failed to add: %v\n", addErr)
-			}
-		}
-	}
-	cl.Instances = allInstances
+	// 2. Create cluster with all running instances
+	cl := NewCluster(clusterName, allInstances)
 
 	// 3. Connect SSH
 	fmt.Println("2. Connecting to cluster...")

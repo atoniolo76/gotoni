@@ -2,6 +2,8 @@
 Copyright © 2025 ALESSIO TONIOLO
 
 cluster.go implements cluster management commands for remote operations.
+The source of truth for cluster state is the Lambda API (running instances).
+SSH key file paths are looked up locally using the key names from Lambda API.
 */
 package cmd
 
@@ -15,7 +17,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/atoniolo76/gotoni/pkg/db"
 	"github.com/atoniolo76/gotoni/pkg/remote"
 	"github.com/spf13/cobra"
 )
@@ -204,13 +205,6 @@ func runClusterRestartLB(cmd *cobra.Command, args []string) {
 		allIPs = append(allIPs, inst.IP)
 	}
 
-	// Initialize database and SSH manager
-	database, err := db.InitDB()
-	if err != nil {
-		fmt.Printf("Failed to init DB: %v\n", err)
-		os.Exit(1)
-	}
-
 	sshMgr := remote.NewSSHClientManager()
 
 	fmt.Printf("Restarting LBs with strategy=%s, max_concurrent=%d\n\n", strategy, maxConcurrent)
@@ -221,15 +215,10 @@ func runClusterRestartLB(cmd *cobra.Command, args []string) {
 		go func(instance remote.RunningInstance, idx int) {
 			defer wg.Done()
 
-			// Get SSH key
-			var sshKeyPath string
-			if len(instance.SSHKeyNames) > 0 {
-				if key, err := database.GetSSHKey(instance.SSHKeyNames[0]); err == nil {
-					sshKeyPath = key.PrivateKey
-				}
-			}
-			if sshKeyPath == "" {
-				fmt.Printf("%-20s: ❌ no SSH key\n", instance.Name)
+			// Get SSH key using Lambda API key names + local file lookup
+			sshKeyPath, err := remote.GetSSHKeyFileForInstance(&instance)
+			if err != nil {
+				fmt.Printf("%-20s: ❌ no SSH key: %v\n", instance.Name, err)
 				return
 			}
 
@@ -305,12 +294,6 @@ func runClusterUpload(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
-	database, err := db.InitDB()
-	if err != nil {
-		fmt.Printf("Failed to init DB: %v\n", err)
-		os.Exit(1)
-	}
-
 	fmt.Println("Uploading to nodes...")
 
 	var wg sync.WaitGroup
@@ -319,15 +302,10 @@ func runClusterUpload(cmd *cobra.Command, args []string) {
 		go func(instance remote.RunningInstance) {
 			defer wg.Done()
 
-			// Get SSH key
-			var sshKeyPath string
-			if len(instance.SSHKeyNames) > 0 {
-				if key, err := database.GetSSHKey(instance.SSHKeyNames[0]); err == nil {
-					sshKeyPath = key.PrivateKey
-				}
-			}
-			if sshKeyPath == "" {
-				fmt.Printf("%-20s: ❌ no SSH key\n", instance.Name)
+			// Get SSH key using Lambda API key names + local file lookup
+			sshKeyPath, err := remote.GetSSHKeyFileForInstance(&instance)
+			if err != nil {
+				fmt.Printf("%-20s: ❌ no SSH key: %v\n", instance.Name, err)
 				return
 			}
 
@@ -479,12 +457,6 @@ func runClusterStartTokenizer(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
-	database, err := db.InitDB()
-	if err != nil {
-		fmt.Printf("Failed to init DB: %v\n", err)
-		os.Exit(1)
-	}
-
 	sshMgr := remote.NewSSHClientManager()
 
 	fmt.Println("Starting tokenizer-sidecar on all nodes...")
@@ -509,15 +481,10 @@ fi
 		go func(instance remote.RunningInstance) {
 			defer wg.Done()
 
-			// Get SSH key
-			var sshKeyPath string
-			if len(instance.SSHKeyNames) > 0 {
-				if key, err := database.GetSSHKey(instance.SSHKeyNames[0]); err == nil {
-					sshKeyPath = key.PrivateKey
-				}
-			}
-			if sshKeyPath == "" {
-				fmt.Printf("%-20s: ❌ no SSH key\n", instance.Name)
+			// Get SSH key using Lambda API key names + local file lookup
+			sshKeyPath, err := remote.GetSSHKeyFileForInstance(&instance)
+			if err != nil {
+				fmt.Printf("%-20s: ❌ no SSH key: %v\n", instance.Name, err)
 				return
 			}
 
@@ -551,12 +518,6 @@ func runClusterTokenizerStatus(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
-	database, err := db.InitDB()
-	if err != nil {
-		fmt.Printf("Failed to init DB: %v\n", err)
-		os.Exit(1)
-	}
-
 	sshMgr := remote.NewSSHClientManager()
 
 	fmt.Println("Checking tokenizer-sidecar status...")
@@ -578,14 +539,9 @@ fi
 		go func(instance remote.RunningInstance) {
 			defer wg.Done()
 
-			// Get SSH key
-			var sshKeyPath string
-			if len(instance.SSHKeyNames) > 0 {
-				if key, err := database.GetSSHKey(instance.SSHKeyNames[0]); err == nil {
-					sshKeyPath = key.PrivateKey
-				}
-			}
-			if sshKeyPath == "" {
+			// Get SSH key using Lambda API key names + local file lookup
+			sshKeyPath, err := remote.GetSSHKeyFileForInstance(&instance)
+			if err != nil {
 				fmt.Printf("%-20s %-12s %-40s\n", instance.Name, "❌", "no SSH key")
 				return
 			}
