@@ -128,7 +128,15 @@ func DeployLBStrategyWithConfig(cluster *Cluster, config LBDeployConfig) error {
 	fmt.Printf("Deploying LB strategy: %s\n", config.Strategy)
 
 	// Stop existing load balancers (silently)
-	cluster.ExecuteOnCluster("tmux kill-session -t gotoni-start_gotoni_load_balancer 2>/dev/null; pkill -f 'gotoni lb' 2>/dev/null; exit 0")
+	// Note: Use pgrep + kill instead of pkill -f to avoid killing the SSH session
+	stopScript := `
+tmux kill-session -t gotoni-start_gotoni_load_balancer 2>/dev/null || true
+tmux kill-session -t gotoni-lb 2>/dev/null || true
+PIDS=$(pgrep -f "gotoni lb" 2>/dev/null | head -5)
+if [ -n "$PIDS" ]; then kill $PIDS 2>/dev/null; fi
+exit 0
+`
+	cluster.ExecuteOnCluster(stopScript)
 	time.Sleep(2 * time.Second)
 
 	// Collect all peer IPs

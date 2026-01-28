@@ -251,8 +251,11 @@ func runClusterRestartLB(cmd *cobra.Command, args []string) {
 			}
 
 			restartCmd := fmt.Sprintf(`
-# Kill existing LB
-pkill -f 'gotoni lb' 2>/dev/null || true
+# Kill existing LB (use pgrep + kill to avoid killing this script)
+tmux kill-session -t gotoni-lb 2>/dev/null || true
+tmux kill-session -t gotoni-start_gotoni_load_balancer 2>/dev/null || true
+PIDS=$(pgrep -f "gotoni lb" 2>/dev/null | head -5)
+if [ -n "$PIDS" ]; then kill $PIDS 2>/dev/null; fi
 sleep 1
 
 # Check binary exists
@@ -271,6 +274,7 @@ nohup /home/ubuntu/gotoni lb start \
   --node-id %s \
   %s %s \
   > /home/ubuntu/lb.log 2>&1 &
+disown
 
 # Wait for startup
 sleep 3

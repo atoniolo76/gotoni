@@ -11,7 +11,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
+	"os/exec"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/atoniolo76/gotoni/pkg/remote"
@@ -21,33 +24,27 @@ import (
 // lbDeployCmd deploys load balancer to remote instances
 var lbDeployCmd = &cobra.Command{
 	Use:   "lb-deploy [instance-id-or-name...]",
-	Short: "Deploy and start load balancer on remote instances",
-	Long: `Deploy and start the load balancer process on one or more remote instances via SSH.
+	Short: "Build, upload, and start load balancer on all instances (one command)",
+	Long: `Full load balancer deployment: build gotoni, upload to instances, and start LB.
 
-This command assumes:
-1. The gotoni binary is already installed on the remote instance (see Phase 1)
-2. SSH access is configured for the instance
-
-The command will:
-1. Connect to each instance via SSH
-2. Start the load balancer in the background using tmux
-3. Configure peers to form a cluster
+This is the ONE COMMAND to deploy load balancers. It will:
+1. Build gotoni for Linux
+2. Stop any running LB processes on all instances
+3. Upload the new binary to all instances
+4. Start the load balancer with all instances as peers
 
 Examples:
-  # Deploy to a single instance
-  gotoni lb-deploy my-instance
-
-  # Deploy to multiple instances
-  gotoni lb-deploy instance-1 instance-2 instance-3
-
-  # Deploy to all running instances
+  # Full deployment to all instances (recommended)
   gotoni lb-deploy --all
 
-  # Deploy with custom config
-  gotoni lb-deploy my-instance --local-port 8080 --listen-port 8000
+  # Deploy to specific instances
+  gotoni lb-deploy instance-1 instance-2
 
-  # Deploy and configure all instances as peers of each other
-  gotoni lb-deploy --all --cluster-mode`,
+  # Skip build if binary already up-to-date
+  gotoni lb-deploy --all --skip-build
+
+  # Use custom strategy
+  gotoni lb-deploy --all --strategy gorgo`,
 	Run: runLBDeploy,
 }
 
@@ -74,11 +71,11 @@ func init() {
 
 	// Flags for lb-deploy
 	lbDeployCmd.Flags().Bool("all", false, "Deploy to all running instances")
-	lbDeployCmd.Flags().Bool("cluster-mode", false, "Configure all instances as peers of each other")
-	lbDeployCmd.Flags().Int("local-port", 8080, "Port of the local backend service")
+	lbDeployCmd.Flags().Bool("skip-build", false, "Skip building binary (use existing /tmp/gotoni-linux)")
+	lbDeployCmd.Flags().Int("local-port", 8080, "Port of the local backend service (SGLang)")
 	lbDeployCmd.Flags().Int("listen-port", 8000, "Port for the load balancer to listen on")
 	lbDeployCmd.Flags().Int("max-concurrent", 10, "Max concurrent requests before forwarding")
-	lbDeployCmd.Flags().String("strategy", "least-loaded", "Load balancing strategy")
+	lbDeployCmd.Flags().String("strategy", "gorgo", "Load balancing strategy (gorgo, least-loaded, prefix-tree)")
 	lbDeployCmd.Flags().String("gotoni-path", "/home/ubuntu/gotoni", "Path to gotoni binary on remote")
 	lbDeployCmd.Flags().String("session-name", "gotoni-lb", "Tmux session name for load balancer")
 
@@ -93,7 +90,7 @@ func init() {
 
 func runLBDeploy(cmd *cobra.Command, args []string) {
 	deployAll, _ := cmd.Flags().GetBool("all")
-	clusterMode, _ := cmd.Flags().GetBool("cluster-mode")
+	skipBuild, _ := cmd.Flags().GetBool("skip-build")
 	localPort, _ := cmd.Flags().GetInt("local-port")
 	listenPort, _ := cmd.Flags().GetInt("listen-port")
 	maxConcurrent, _ := cmd.Flags().GetInt("max-concurrent")
@@ -144,44 +141,114 @@ func runLBDeploy(cmd *cobra.Command, args []string) {
 
 	fmt.Printf("Deploying load balancer to %d instance(s)...\n\n", len(targetInstances))
 
+	// Step 1: Build binary (unless skipped)
+	binaryPath := "/tmp/gotoni-linux"
+	if !skipBuild {
+		fmt.Println("Step 1: Building gotoni for Linux...")
+		buildCmd := exec.Command("go", "build", "-o", binaryPath, ".")
+		buildCmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS=linux", "GOARCH=amd64")
+		if output, err := buildCmd.CombinedOutput(); err != nil {
+			log.Fatalf("Build failed: %v\n%s", err, output)
+		}
+		info, _ := os.Stat(binaryPath)
+		fmt.Printf("   Built %s (%d MB)\n\n", binaryPath, info.Size()/1024/1024)
+	} else {
+		fmt.Println("Step 1: Skipping build (--skip-build)")
+		if _, err := os.Stat(binaryPath); os.IsNotExist(err) {
+			log.Fatalf("Binary not found at %s. Run without --skip-build first.", binaryPath)
+		}
+		fmt.Println()
+	}
+
 	// Create SSH manager
 	sshMgr := remote.NewSSHClientManager()
 
-	// Connect to all instances
+	// Connect to all instances first
+	fmt.Println("Step 2: Connecting to instances...")
+	var connectedInstances []remote.RunningInstance
 	for _, inst := range targetInstances {
-		// Get SSH key using Lambda API key names + local file lookup
 		sshKeyPath, err := remote.GetSSHKeyFileForInstance(&inst)
 		if err != nil {
-			log.Printf("Warning: Could not find SSH key for instance %s: %v", inst.IP, err)
+			fmt.Printf("   %s: ❌ no SSH key: %v\n", inst.Name, err)
 			continue
 		}
 
 		if err := sshMgr.ConnectToInstance(inst.IP, sshKeyPath); err != nil {
-			log.Printf("Warning: Failed to connect to instance %s: %v", inst.IP, err)
+			fmt.Printf("   %s: ❌ connection failed: %v\n", inst.Name, err)
 			continue
 		}
 
-		fmt.Printf("✅ Connected to %s (%s)\n", inst.Name, inst.IP)
+		fmt.Printf("   %s: ✅ connected\n", inst.Name)
+		connectedInstances = append(connectedInstances, inst)
 	}
 
-	// Build peer list if cluster mode is enabled
+	if len(connectedInstances) == 0 {
+		log.Fatal("Failed to connect to any instances")
+	}
+	fmt.Println()
+
+	// Step 3: Stop running LBs and upload new binary
+	fmt.Println("Step 3: Stopping LBs and uploading binary...")
+	var wg sync.WaitGroup
+	for _, inst := range connectedInstances {
+		wg.Add(1)
+		go func(instance remote.RunningInstance) {
+			defer wg.Done()
+
+			// Stop running LB and remove old binary
+			// Use pgrep + kill instead of pkill -f to avoid killing SSH session
+			cleanupScript := fmt.Sprintf(`
+tmux kill-session -t %s 2>/dev/null || true
+tmux kill-session -t gotoni-start_gotoni_load_balancer 2>/dev/null || true
+PIDS=$(pgrep -f "gotoni lb" 2>/dev/null | head -5)
+if [ -n "$PIDS" ]; then kill $PIDS 2>/dev/null; fi
+rm -f %s
+`, sessionName, gotoniPath)
+			sshMgr.ExecuteCommand(instance.IP, cleanupScript)
+
+			// Get SSH key for SCP
+			sshKeyPath, _ := remote.GetSSHKeyFileForInstance(&instance)
+
+			// Upload new binary via SCP
+			scpCmd := exec.Command("scp",
+				"-i", sshKeyPath,
+				"-o", "StrictHostKeyChecking=no",
+				"-o", "UserKnownHostsFile=/dev/null",
+				binaryPath,
+				fmt.Sprintf("ubuntu@%s:%s", instance.IP, gotoniPath),
+			)
+			if err := scpCmd.Run(); err != nil {
+				fmt.Printf("   %s: ❌ upload failed: %v\n", instance.Name, err)
+				return
+			}
+
+			// Make executable
+			sshMgr.ExecuteCommand(instance.IP, fmt.Sprintf("chmod +x %s", gotoniPath))
+			fmt.Printf("   %s: ✅ uploaded\n", instance.Name)
+		}(inst)
+	}
+	wg.Wait()
+	fmt.Println()
+
+	// Build peer list (all instances)
 	var peerIPs []string
-	if clusterMode && len(targetInstances) > 1 {
-		for _, inst := range targetInstances {
-			peerIPs = append(peerIPs, inst.IP)
-		}
+	for _, inst := range connectedInstances {
+		peerIPs = append(peerIPs, inst.IP)
 	}
 
-	// Deploy to each instance
-	for _, inst := range targetInstances {
-		fmt.Printf("\nDeploying to %s (%s)...\n", inst.Name, inst.IP)
-
+	// Step 4: Start LB on each instance
+	fmt.Println("Step 4: Starting load balancers...")
+	for _, inst := range connectedInstances {
 		// Build the gotoni lb start command
+		nodeID := inst.Name
+		if nodeID == "" {
+			nodeID = inst.ID[:16]
+		}
 		lbCommand := fmt.Sprintf("%s lb start --local-port %d --listen-port %d --max-concurrent %d --strategy %s --node-id %s",
-			gotoniPath, localPort, listenPort, maxConcurrent, strategy, inst.ID[:16])
+			gotoniPath, localPort, listenPort, maxConcurrent, strategy, nodeID)
 
-		// Add peers (excluding self) if cluster mode
-		if clusterMode && len(peerIPs) > 1 {
+		// Add peers (excluding self)
+		if len(peerIPs) > 1 {
 			var peers []string
 			for _, peerIP := range peerIPs {
 				if peerIP != inst.IP {
@@ -189,20 +256,18 @@ func runLBDeploy(cmd *cobra.Command, args []string) {
 				}
 			}
 			if len(peers) > 0 {
-				lbCommand += fmt.Sprintf(" --peers %s", strings.Join(peers, ","))
+				for _, peer := range peers {
+					lbCommand += fmt.Sprintf(" --peers %s", peer)
+				}
 			}
 		}
-
-		// Kill existing session if it exists
-		killCmd := fmt.Sprintf("tmux kill-session -t %s 2>/dev/null || true", sessionName)
-		sshMgr.ExecuteCommand(inst.IP, killCmd)
 
 		// Start in tmux session
 		tmuxCmd := fmt.Sprintf("tmux new-session -d -s %s '%s'", sessionName, lbCommand)
 
 		output, err := sshMgr.ExecuteCommand(inst.IP, tmuxCmd)
 		if err != nil {
-			log.Printf("❌ Failed to start load balancer on %s: %v\nOutput: %s", inst.Name, err, output)
+			fmt.Printf("   %s: ❌ start failed: %v\nOutput: %s\n", inst.Name, err, output)
 			continue
 		}
 
@@ -212,18 +277,14 @@ func runLBDeploy(cmd *cobra.Command, args []string) {
 		status, _ := sshMgr.ExecuteCommand(inst.IP, checkCmd)
 
 		if strings.Contains(status, "not_running") {
-			log.Printf("⚠️  Load balancer may not have started correctly on %s", inst.Name)
+			fmt.Printf("   %s: ⚠️  may not have started correctly\n", inst.Name)
 		} else {
-			fmt.Printf("✅ Load balancer started on %s\n", inst.Name)
-			fmt.Printf("   Status: %s\n", strings.TrimSpace(status))
+			fmt.Printf("   %s: ✅ LB running with %d peers\n", inst.Name, len(peerIPs)-1)
 		}
 	}
 
 	fmt.Println("\n✅ Deployment complete!")
-
-	if clusterMode && len(targetInstances) > 1 {
-		fmt.Println("\nCluster mode enabled - all instances are configured as peers.")
-	}
+	fmt.Println("\nRun 'gotoni cluster status' to verify all LBs are healthy.")
 }
 
 func runLBRemoteStatus(cmd *cobra.Command, args []string) {

@@ -19,6 +19,7 @@ import (
 	"time"
 
 	serve "github.com/atoniolo76/gotoni/pkg/cluster"
+	"github.com/atoniolo76/gotoni/pkg/remote"
 	"github.com/spf13/cobra"
 )
 
@@ -85,19 +86,22 @@ var lbStatusCmd = &cobra.Command{
 var lbPolicyCmd = &cobra.Command{
 	Use:   "policy [policy-name]",
 	Short: "Get or set load balancer policy",
-	Long: `Get the current policy or switch to a new one.
+	Long: `Get the current policy or switch to a new one on all cluster instances.
 
 Available policies: least-loaded, prefix-tree, gorgo
 
 Examples:
-  # Show current policy
+  # Show current policy on all running instances (recommended)
+  gotoni lb policy --all
+
+  # Switch to gorgo policy on all instances
+  gotoni lb policy gorgo --all
+
+  # Show policy on specific hosts
   gotoni lb policy --host 192.168.1.100
 
-  # Switch to gorgo policy
-  gotoni lb policy gorgo --host 192.168.1.100
-
-  # Switch policy on multiple hosts
-  gotoni lb policy gorgo --host 192.168.1.100,192.168.1.101,192.168.1.102`,
+  # Switch policy on specific hosts
+  gotoni lb policy gorgo --host 192.168.1.100,192.168.1.101`,
 	Run: runLBPolicy,
 }
 
@@ -195,15 +199,18 @@ func init() {
 	lbStopCmd.Flags().String("pid-file", "/tmp/gotoni-lb.pid", "Path to PID file")
 
 	// Flags for lb policy
-	lbPolicyCmd.Flags().StringSlice("host", []string{"localhost"}, "Load balancer host(s) to target (comma-separated)")
+	lbPolicyCmd.Flags().Bool("all", false, "Apply to all running instances in cluster")
+	lbPolicyCmd.Flags().StringSlice("host", []string{}, "Load balancer host(s) to target (comma-separated)")
 	lbPolicyCmd.Flags().Int("port", 8000, "Load balancer port")
 
 	// Flags for lb clear-cache
-	lbClearCacheCmd.Flags().StringSlice("host", []string{"localhost"}, "Load balancer host(s) to target (comma-separated)")
+	lbClearCacheCmd.Flags().Bool("all", false, "Apply to all running instances in cluster")
+	lbClearCacheCmd.Flags().StringSlice("host", []string{}, "Load balancer host(s) to target (comma-separated)")
 	lbClearCacheCmd.Flags().Int("port", 8000, "Load balancer port")
 
 	// Flags for lb peers
-	lbPeersCmd.Flags().StringSlice("host", []string{"localhost"}, "Load balancer host(s) to target (comma-separated)")
+	lbPeersCmd.Flags().Bool("all", false, "Apply to all running instances in cluster")
+	lbPeersCmd.Flags().StringSlice("host", []string{}, "Load balancer host(s) to target (comma-separated)")
 	lbPeersCmd.Flags().Int("port", 8000, "Load balancer port")
 
 	// Flags for lb peers add-mesh
@@ -390,20 +397,44 @@ func runLBStatus(cmd *cobra.Command, args []string) {
 }
 
 func runLBPolicy(cmd *cobra.Command, args []string) {
+	useAll, _ := cmd.Flags().GetBool("all")
 	hosts, _ := cmd.Flags().GetStringSlice("host")
 	port, _ := cmd.Flags().GetInt("port")
 
 	client := &http.Client{Timeout: 5 * time.Second}
 
-	// Expand comma-separated hosts
+	// Get hosts from cluster if --all is specified
 	var allHosts []string
-	for _, h := range hosts {
-		for _, host := range strings.Split(h, ",") {
-			host = strings.TrimSpace(host)
-			if host != "" {
-				allHosts = append(allHosts, host)
+	if useAll {
+		apiToken := remote.GetAPIToken()
+		if apiToken == "" {
+			log.Fatal("LAMBDA_API_KEY not set. Required for --all flag.")
+		}
+		httpClient := remote.NewHTTPClient()
+		instances, err := remote.ListRunningInstances(httpClient, apiToken)
+		if err != nil {
+			log.Fatalf("Failed to list instances: %v", err)
+		}
+		for _, inst := range instances {
+			allHosts = append(allHosts, inst.IP)
+		}
+		if len(allHosts) == 0 {
+			log.Fatal("No running instances found")
+		}
+		fmt.Printf("Targeting %d instances...\n\n", len(allHosts))
+	} else if len(hosts) > 0 {
+		// Expand comma-separated hosts
+		for _, h := range hosts {
+			for _, host := range strings.Split(h, ",") {
+				host = strings.TrimSpace(host)
+				if host != "" {
+					allHosts = append(allHosts, host)
+				}
 			}
 		}
+	} else {
+		// Default to localhost if nothing specified
+		allHosts = []string{"localhost"}
 	}
 
 	for _, host := range allHosts {
@@ -454,20 +485,44 @@ func runLBPolicy(cmd *cobra.Command, args []string) {
 }
 
 func runLBClearCache(cmd *cobra.Command, args []string) {
+	useAll, _ := cmd.Flags().GetBool("all")
 	hosts, _ := cmd.Flags().GetStringSlice("host")
 	port, _ := cmd.Flags().GetInt("port")
 
 	client := &http.Client{Timeout: 5 * time.Second}
 
-	// Expand comma-separated hosts
+	// Get hosts from cluster if --all is specified
 	var allHosts []string
-	for _, h := range hosts {
-		for _, host := range strings.Split(h, ",") {
-			host = strings.TrimSpace(host)
-			if host != "" {
-				allHosts = append(allHosts, host)
+	if useAll {
+		apiToken := remote.GetAPIToken()
+		if apiToken == "" {
+			log.Fatal("LAMBDA_API_KEY not set. Required for --all flag.")
+		}
+		httpClient := remote.NewHTTPClient()
+		instances, err := remote.ListRunningInstances(httpClient, apiToken)
+		if err != nil {
+			log.Fatalf("Failed to list instances: %v", err)
+		}
+		for _, inst := range instances {
+			allHosts = append(allHosts, inst.IP)
+		}
+		if len(allHosts) == 0 {
+			log.Fatal("No running instances found")
+		}
+		fmt.Printf("Clearing cache on %d instances...\n\n", len(allHosts))
+	} else if len(hosts) > 0 {
+		// Expand comma-separated hosts
+		for _, h := range hosts {
+			for _, host := range strings.Split(h, ",") {
+				host = strings.TrimSpace(host)
+				if host != "" {
+					allHosts = append(allHosts, host)
+				}
 			}
 		}
+	} else {
+		// Default to localhost if nothing specified
+		allHosts = []string{"localhost"}
 	}
 
 	for _, host := range allHosts {
@@ -497,20 +552,44 @@ func runLBClearCache(cmd *cobra.Command, args []string) {
 }
 
 func runLBPeers(cmd *cobra.Command, args []string) {
+	useAll, _ := cmd.Flags().GetBool("all")
 	hosts, _ := cmd.Flags().GetStringSlice("host")
 	port, _ := cmd.Flags().GetInt("port")
 
 	client := &http.Client{Timeout: 5 * time.Second}
 
-	// Expand comma-separated hosts
+	// Get hosts from cluster if --all is specified
 	var allHosts []string
-	for _, h := range hosts {
-		for _, host := range strings.Split(h, ",") {
-			host = strings.TrimSpace(host)
-			if host != "" {
-				allHosts = append(allHosts, host)
+	if useAll {
+		apiToken := remote.GetAPIToken()
+		if apiToken == "" {
+			log.Fatal("LAMBDA_API_KEY not set. Required for --all flag.")
+		}
+		httpClient := remote.NewHTTPClient()
+		instances, err := remote.ListRunningInstances(httpClient, apiToken)
+		if err != nil {
+			log.Fatalf("Failed to list instances: %v", err)
+		}
+		for _, inst := range instances {
+			allHosts = append(allHosts, inst.IP)
+		}
+		if len(allHosts) == 0 {
+			log.Fatal("No running instances found")
+		}
+		fmt.Printf("Checking peers on %d instances...\n\n", len(allHosts))
+	} else if len(hosts) > 0 {
+		// Expand comma-separated hosts
+		for _, h := range hosts {
+			for _, host := range strings.Split(h, ",") {
+				host = strings.TrimSpace(host)
+				if host != "" {
+					allHosts = append(allHosts, host)
+				}
 			}
 		}
+	} else {
+		// Default to localhost if nothing specified
+		allHosts = []string{"localhost"}
 	}
 
 	// Determine action
