@@ -139,6 +139,54 @@ func NewPrefixTreePolicy() *PrefixTreePolicy {
 	}
 }
 
+// ClearCache resets the prefix tree to empty
+func (p *PrefixTreePolicy) ClearCache() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	count := countNodes(p.root)
+	p.root = &prefixNode{
+		children: make(map[byte]*prefixNode),
+		peers:    []*PeerNode{},
+		prefix:   "",
+	}
+	return count
+}
+
+// ClearCache resets the GORGO prefix tree to empty
+func (p *GORGOPolicy) ClearCache() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	count := countGORGONodes(p.root)
+	p.root = &GORGONode{
+		children: make(map[byte]*GORGONode),
+		peers:    []*PeerNode{},
+		prefix:   "",
+	}
+	return count
+}
+
+func countNodes(n *prefixNode) int {
+	if n == nil {
+		return 0
+	}
+	count := 1
+	for _, child := range n.children {
+		count += countNodes(child)
+	}
+	return count
+}
+
+func countGORGONodes(n *GORGONode) int {
+	if n == nil {
+		return 0
+	}
+	count := 1
+	for _, child := range n.children {
+		count += countGORGONodes(child)
+	}
+	return count
+}
+
 func (p *GORGOPolicy) Select(peers []*PeerNode, availabilityMap map[*PeerNode]AvailabilityStatus, requestPath string) *PeerNode {
 	if p.root == nil {
 		// No existing prefix trie (first request), fall back to least-loaded
@@ -678,6 +726,12 @@ func (lb *LoadBalancer) Handler() http.Handler {
 		}
 		if r.URL.Path == "/lb/trace/status" {
 			lb.handleTraceStatusEndpoint(w, r)
+			return
+		}
+
+		// Handle cache clear endpoint
+		if r.URL.Path == "/lb/cache/clear" {
+			lb.handleCacheClearEndpoint(w, r)
 			return
 		}
 
@@ -1563,6 +1617,42 @@ func (lb *LoadBalancer) handleTraceStopEndpoint(w http.ResponseWriter, r *http.R
 func (lb *LoadBalancer) handleTraceStatusEndpoint(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(lb.tracer.GetStatus())
+}
+
+// handleCacheClearEndpoint clears the prefix tree cache
+func (lb *LoadBalancer) handleCacheClearEndpoint(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost && r.Method != http.MethodGet {
+		http.Error(w, `{"error": "method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+
+	var cleared int
+	strategyName := lb.getStrategyName()
+
+	switch strategy := lb.strategy.(type) {
+	case *PrefixTreePolicy:
+		cleared = strategy.ClearCache()
+	case *GORGOPolicy:
+		cleared = strategy.ClearCache()
+	default:
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":  false,
+			"strategy": strategyName,
+			"message":  "strategy does not use prefix tree cache",
+		})
+		return
+	}
+
+	log.Printf("[LB] Cleared prefix tree cache: %d nodes removed", cleared)
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":       true,
+		"strategy":      strategyName,
+		"nodes_cleared": cleared,
+		"message":       "prefix tree cache cleared",
+	})
 }
 
 // CurrentLoad returns the current load from real SGLang metrics (running + waiting)

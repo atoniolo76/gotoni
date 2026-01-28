@@ -101,12 +101,31 @@ Examples:
 	Run: runLBPolicy,
 }
 
+// lbClearCacheCmd clears the prefix tree cache
+var lbClearCacheCmd = &cobra.Command{
+	Use:   "clear-cache",
+	Short: "Clear the prefix tree cache on load balancer(s)",
+	Long: `Clear the KV cache routing prefix tree on load balancer(s).
+
+This resets the prefix tree used by prefix-tree and gorgo policies,
+causing all requests to be routed fresh without historical prefix matching.
+
+Examples:
+  # Clear cache on a single host
+  gotoni lb clear-cache --host 192.168.1.100
+
+  # Clear cache on multiple hosts
+  gotoni lb clear-cache --host 192.168.1.100,192.168.1.101,192.168.1.102`,
+	Run: runLBClearCache,
+}
+
 func init() {
 	rootCmd.AddCommand(lbCmd)
 	lbCmd.AddCommand(lbStartCmd)
 	lbCmd.AddCommand(lbStopCmd)
 	lbCmd.AddCommand(lbStatusCmd)
 	lbCmd.AddCommand(lbPolicyCmd)
+	lbCmd.AddCommand(lbClearCacheCmd)
 
 	// Flags for lb start
 	lbStartCmd.Flags().String("config", "", "Path to JSON config file")
@@ -138,6 +157,10 @@ func init() {
 	// Flags for lb policy
 	lbPolicyCmd.Flags().StringSlice("host", []string{"localhost"}, "Load balancer host(s) to target (comma-separated)")
 	lbPolicyCmd.Flags().Int("port", 8000, "Load balancer port")
+
+	// Flags for lb clear-cache
+	lbClearCacheCmd.Flags().StringSlice("host", []string{"localhost"}, "Load balancer host(s) to target (comma-separated)")
+	lbClearCacheCmd.Flags().Int("port", 8000, "Load balancer port")
 }
 
 func runLBStart(cmd *cobra.Command, args []string) {
@@ -378,6 +401,49 @@ func runLBPolicy(cmd *cobra.Command, args []string) {
 			} else {
 				fmt.Printf("❌ %s: %v\n", host, result["error"])
 			}
+		}
+	}
+}
+
+func runLBClearCache(cmd *cobra.Command, args []string) {
+	hosts, _ := cmd.Flags().GetStringSlice("host")
+	port, _ := cmd.Flags().GetInt("port")
+
+	client := &http.Client{Timeout: 5 * time.Second}
+
+	// Expand comma-separated hosts
+	var allHosts []string
+	for _, h := range hosts {
+		for _, host := range strings.Split(h, ",") {
+			host = strings.TrimSpace(host)
+			if host != "" {
+				allHosts = append(allHosts, host)
+			}
+		}
+	}
+
+	for _, host := range allHosts {
+		clearURL := fmt.Sprintf("http://%s:%d/lb/cache/clear", host, port)
+
+		resp, err := client.Post(clearURL, "application/json", nil)
+		if err != nil {
+			fmt.Printf("❌ %s: failed to connect - %v\n", host, err)
+			continue
+		}
+		defer resp.Body.Close()
+
+		var result map[string]interface{}
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			fmt.Printf("❌ %s: failed to parse response - %v\n", host, err)
+			continue
+		}
+
+		if result["success"] == true {
+			nodesCleared := result["nodes_cleared"]
+			strategy := result["strategy"]
+			fmt.Printf("✅ %s: cleared %v nodes (strategy: %s)\n", host, nodesCleared, strategy)
+		} else {
+			fmt.Printf("⚠️  %s: %v (strategy: %v)\n", host, result["message"], result["strategy"])
 		}
 	}
 }
