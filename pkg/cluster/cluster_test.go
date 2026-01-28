@@ -1972,21 +1972,7 @@ func deployLBStrategy(cluster *Cluster, strategy string) error {
 	if failCount == len(cluster.Instances) {
 		return fmt.Errorf("failed to start load balancer on all instances")
 	}
-	// 9. Verify local tokenizer (for GORGO policy) - SKIPPED, will test on remote after deploy
-	fmt.Println("9. Skipping local tokenizer test (will verify on remote instances after deploy)...")
 
-	// 10. Start load balancing processes with GORGO policy
-	fmt.Println("10. Setting up load balancers with GORGO policy...")
-
-	// First, stop any existing load balancers to ensure we run the new code
-	fmt.Println("Stopping any existing load balancers...")
-	stopOldLoadBalancers(cluster)
-
-	tasks := setupGotoniBinaryOnInstanceWithStrategy(cluster, "gorgo")
-	if tasks == nil {
-		fmt.Println("❌ Failed to setup gotoni binary on instances")
-		return
-	}
 	// Wait for LB to start accepting connections
 	time.Sleep(3 * time.Second)
 
