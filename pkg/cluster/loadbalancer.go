@@ -610,6 +610,33 @@ func (lb *LoadBalancer) AddPeersFromCluster(cluster *Cluster) {
 	}
 }
 
+// AddPeerByIP adds a peer by IP address and port (for standalone/CLI usage)
+func (lb *LoadBalancer) AddPeerByIP(ip string, port int) {
+	lb.peersMu.Lock()
+	defer lb.peersMu.Unlock()
+
+	// Check if already exists
+	for peerNode := range lb.peers {
+		if peerNode.Instance != nil && peerNode.Instance.IP == ip && peerNode.Port == port {
+			log.Printf("[LB] Peer %s:%d already registered", ip, port)
+			return
+		}
+	}
+
+	// Create minimal instance for the peer
+	peerNode := &PeerNode{
+		Instance: &remote.RunningInstance{IP: ip},
+		Port:     port,
+		MaxLoad:  lb.config.MaxConcurrentRequests,
+	}
+
+	lb.peers[peerNode] = AvailabilityStatus{
+		Available: true,
+		Healthy:   true,
+	}
+	log.Printf("[LB] Added peer: %s:%d", ip, port)
+}
+
 // Start starts the load balancer
 func (lb *LoadBalancer) Start() error {
 	if lb.running.Load() {
@@ -707,6 +734,12 @@ func (lb *LoadBalancer) Handler() http.Handler {
 		// Handle logs endpoint (recent request traces)
 		if r.URL.Path == "/lb/logs" {
 			lb.handleLogsEndpoint(w, r)
+			return
+		}
+
+		// Handle peers endpoint (GET/POST to manage peer nodes)
+		if r.URL.Path == "/lb/peers" {
+			lb.handlePeersEndpoint(w, r)
 			return
 		}
 
@@ -1600,6 +1633,129 @@ func (lb *LoadBalancer) handleLogsEndpoint(w http.ResponseWriter, r *http.Reques
 		"count":  len(result),
 		"traces": result,
 	})
+}
+
+// handlePeersEndpoint manages peer registration
+// GET /lb/peers - list all peers
+// POST /lb/peers - add a new peer {"ip": "1.2.3.4", "port": 8000}
+// DELETE /lb/peers - remove a peer {"ip": "1.2.3.4", "port": 8000}
+func (lb *LoadBalancer) handlePeersEndpoint(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	switch r.Method {
+	case http.MethodGet:
+		// List all peers
+		lb.peersMu.RLock()
+		peers := make([]map[string]interface{}, 0, len(lb.peers))
+		for peer, status := range lb.peers {
+			ip := ""
+			if peer.Instance != nil {
+				ip = peer.Instance.IP
+			}
+			peerInfo := map[string]interface{}{
+				"ip":           ip,
+				"port":         peer.Port,
+				"available":    status.Available,
+				"healthy":      status.Healthy,
+				"running_reqs": status.RunningRequests,
+				"waiting_reqs": status.WaitingRequests,
+				"total_reqs":   status.TotalRequests,
+				"gpu_cache":    status.GPUCacheUsage,
+				"max_load":     peer.MaxLoad,
+			}
+			peers = append(peers, peerInfo)
+		}
+		lb.peersMu.RUnlock()
+
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"count": len(peers),
+			"peers": peers,
+		})
+
+	case http.MethodPost:
+		// Add a new peer
+		var req struct {
+			IP   string `json:"ip"`
+			Port int    `json:"port"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, `{"error": "invalid JSON"}`, http.StatusBadRequest)
+			return
+		}
+		if req.IP == "" || req.Port == 0 {
+			http.Error(w, `{"error": "ip and port are required"}`, http.StatusBadRequest)
+			return
+		}
+
+		// Check if peer already exists
+		lb.peersMu.Lock()
+		for peer := range lb.peers {
+			if peer.Instance != nil && peer.Instance.IP == req.IP && peer.Port == req.Port {
+				lb.peersMu.Unlock()
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"status":  "exists",
+					"message": fmt.Sprintf("peer %s:%d already registered", req.IP, req.Port),
+				})
+				return
+			}
+		}
+
+		// Create a minimal peer instance
+		peer := &PeerNode{
+			Instance: &remote.RunningInstance{IP: req.IP},
+			Port:     req.Port,
+			MaxLoad:  10, // Default max load
+		}
+		lb.peers[peer] = AvailabilityStatus{Available: true, Healthy: true}
+		lb.peersMu.Unlock()
+
+		log.Printf("[LB] Added peer: %s:%d", req.IP, req.Port)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":  "added",
+			"message": fmt.Sprintf("peer %s:%d added successfully", req.IP, req.Port),
+			"peers":   len(lb.peers),
+		})
+
+	case http.MethodDelete:
+		// Remove a peer
+		var req struct {
+			IP   string `json:"ip"`
+			Port int    `json:"port"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, `{"error": "invalid JSON"}`, http.StatusBadRequest)
+			return
+		}
+
+		lb.peersMu.Lock()
+		var toDelete *PeerNode
+		for peer := range lb.peers {
+			if peer.Instance != nil && peer.Instance.IP == req.IP && (req.Port == 0 || peer.Port == req.Port) {
+				toDelete = peer
+				break
+			}
+		}
+		if toDelete != nil {
+			delete(lb.peers, toDelete)
+		}
+		lb.peersMu.Unlock()
+
+		if toDelete != nil {
+			log.Printf("[LB] Removed peer: %s:%d", req.IP, req.Port)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"status":  "removed",
+				"message": fmt.Sprintf("peer %s:%d removed", req.IP, req.Port),
+			})
+		} else {
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"status":  "not_found",
+				"message": fmt.Sprintf("peer %s:%d not found", req.IP, req.Port),
+			})
+		}
+
+	default:
+		http.Error(w, `{"error": "method not allowed"}`, http.StatusMethodNotAllowed)
+	}
 }
 
 // CurrentLoad returns the current load from real SGLang metrics (running + waiting)

@@ -1942,6 +1942,7 @@ type LBDeployConfig struct {
 	Strategy             string
 	ObservabilityEnabled bool
 	LokiEndpoint         string
+	ClusterName          string
 }
 
 // deployLBStrategy stops any existing load balancer and starts a new one with the given strategy
@@ -1975,28 +1976,52 @@ func deployLBStrategyWithConfig(cluster *Cluster, config LBDeployConfig) error {
 	// Brief pause to let processes clean up
 	time.Sleep(2 * time.Second)
 
-	// Build the command with optional observability flags
-	lbCommand := fmt.Sprintf("/home/ubuntu/gotoni lb start --listen-port 8000 --local-port 8080 --strategy %s", config.Strategy)
-	if config.ObservabilityEnabled && config.LokiEndpoint != "" {
-		lbCommand += fmt.Sprintf(" --observability --loki-endpoint %s", config.LokiEndpoint)
-	}
-
-	// Start load balancer with new strategy on each instance
-	lbTask := remote.Task{
-		Name:       "start gotoni load balancer",
-		Command:    lbCommand,
-		Background: true,
-		WorkingDir: "/home/ubuntu",
+	// Collect all peer IPs for mesh configuration
+	var allIPs []string
+	for _, inst := range cluster.Instances {
+		allIPs = append(allIPs, inst.IP)
 	}
 
 	failCount := 0
-	for _, inst := range cluster.Instances {
+	for i, inst := range cluster.Instances {
+		// Build peer list (all other nodes)
+		var peers []string
+		for j, peerIP := range allIPs {
+			if i != j {
+				peers = append(peers, fmt.Sprintf("%s:8000", peerIP))
+			}
+		}
+
+		// Build the command with optional observability and peer flags
+		lbCommand := fmt.Sprintf("/home/ubuntu/gotoni lb start --listen-port 8000 --local-port 8080 --strategy %s", config.Strategy)
+		if config.ObservabilityEnabled && config.LokiEndpoint != "" {
+			nodeID := fmt.Sprintf("node-%d", i)
+			if inst.Name != "" {
+				nodeID = inst.Name
+			}
+			lbCommand += fmt.Sprintf(" --observability --loki-endpoint %s --node-id %s --cluster-name %s",
+				config.LokiEndpoint, nodeID, config.ClusterName)
+		}
+
+		// Add peers
+		for _, peer := range peers {
+			lbCommand += fmt.Sprintf(" --peers %s", peer)
+		}
+
+		// Start load balancer with new strategy on this instance
+		lbTask := remote.Task{
+			Name:       "start gotoni load balancer",
+			Command:    lbCommand,
+			Background: true,
+			WorkingDir: "/home/ubuntu",
+		}
+
 		err := remote.ExecuteTask(cluster.sshMgr, inst.IP, lbTask, make(map[string]bool))
 		if err != nil {
 			fmt.Printf("Failed to start LB on %s: %v\n", inst.IP, err)
 			failCount++
 		} else {
-			fmt.Printf("LB (%s) started on %s\n", config.Strategy, inst.IP)
+			fmt.Printf("LB (%s) started on %s with %d peers\n", config.Strategy, inst.IP, len(peers))
 		}
 	}
 

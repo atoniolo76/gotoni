@@ -13,6 +13,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -191,8 +193,15 @@ func runLBStart(cmd *cobra.Command, args []string) {
 	peers, _ := cmd.Flags().GetStringSlice("peers")
 	for _, peer := range peers {
 		// Parse peer address (format: ip:port or just ip)
-		// For now, we'd need instance info - skip for basic implementation
-		fmt.Printf("Peer specified: %s (manual peer addition not yet implemented)\n", peer)
+		parts := strings.Split(peer, ":")
+		peerIP := parts[0]
+		peerPort := 8000 // default
+		if len(parts) > 1 {
+			if p, err := strconv.Atoi(parts[1]); err == nil {
+				peerPort = p
+			}
+		}
+		lb.AddPeerByIP(peerIP, peerPort)
 	}
 
 	// Setup signal handling for graceful shutdown
