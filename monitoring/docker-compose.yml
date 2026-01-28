@@ -1,0 +1,70 @@
+version: '3.8'
+
+# Gotoni Monitoring Stack
+# Run with: docker compose up -d
+# Access Grafana at: http://localhost:3000 (admin/admin)
+
+services:
+  # Prometheus - Scrapes SGLang metrics from all nodes
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: gotoni-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.enable-lifecycle'
+      - '--storage.tsdb.retention.time=7d'
+    restart: unless-stopped
+    networks:
+      - monitoring
+
+  # Loki - Log aggregation for LB events
+  loki:
+    image: grafana/loki:2.9.0
+    container_name: gotoni-loki
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./loki/loki-config.yml:/etc/loki/local-config.yaml:ro
+      - loki_data:/loki
+    command: -config.file=/etc/loki/local-config.yaml
+    restart: unless-stopped
+    networks:
+      - monitoring
+
+  # Grafana - Visualization dashboard
+  grafana:
+    image: grafana/grafana:latest
+    container_name: gotoni-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+      - loki
+    restart: unless-stopped
+    networks:
+      - monitoring
+
+volumes:
+  prometheus_data:
+  loki_data:
+  grafana_data:
+
+networks:
+  monitoring:
+    driver: bridge

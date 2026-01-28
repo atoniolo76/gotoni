@@ -73,7 +73,7 @@ func getClusterInstanceIPs(t *testing.T) []string {
 		t.Fatalf("Failed to initialize database: %v", err)
 	}
 
-	clusterName := "llama-test-cluster"
+	clusterName := "sglang-auto-cluster"
 	dbCluster, err := database.GetCluster(clusterName)
 	if err != nil {
 		t.Fatalf("Failed to find cluster %q in database: %v (run TestClusterSGLang first)", clusterName, err)

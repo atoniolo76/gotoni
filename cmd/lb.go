@@ -98,6 +98,11 @@ func init() {
 	lbStartCmd.Flags().String("strategy", "least-loaded", "Load balancing strategy (least-loaded, prefix-tree, gorgo)")
 	lbStartCmd.Flags().String("node-id", "", "Unique identifier for this node in the cluster")
 
+	// Observability flags
+	lbStartCmd.Flags().Bool("observability", false, "Enable observability (push logs to Loki)")
+	lbStartCmd.Flags().String("loki-endpoint", "http://localhost:3100/loki/api/v1/push", "Loki push endpoint")
+	lbStartCmd.Flags().String("cluster-name", "default", "Cluster name for log labels")
+
 	// Flags for lb status
 	lbStatusCmd.Flags().Int("port", 8000, "Load balancer port to check")
 	lbStatusCmd.Flags().String("host", "localhost", "Load balancer host to check")
@@ -145,6 +150,17 @@ func runLBStart(cmd *cobra.Command, args []string) {
 	// Get strategy and node-id (used for cluster mode, logged for debugging)
 	strategy, _ := cmd.Flags().GetString("strategy")
 	nodeID, _ := cmd.Flags().GetString("node-id")
+
+	// Get observability settings
+	observabilityEnabled, _ := cmd.Flags().GetBool("observability")
+	lokiEndpoint, _ := cmd.Flags().GetString("loki-endpoint")
+	clusterName, _ := cmd.Flags().GetString("cluster-name")
+
+	// Set observability config
+	config.ObservabilityEnabled = observabilityEnabled
+	config.LokiEndpoint = lokiEndpoint
+	config.NodeID = nodeID
+	config.ClusterName = clusterName
 
 	// Set strategy based on flag
 	switch strategy {

@@ -1,0 +1,72 @@
+# Prometheus configuration for Gotoni monitoring
+global:
+  scrape_interval: 5s      # How often to scrape targets
+  evaluation_interval: 5s  # How often to evaluate rules
+  external_labels:
+    cluster: 'sglang-auto-cluster'
+
+# Alerting (optional - uncomment to enable)
+# alerting:
+#   alertmanagers:
+#     - static_configs:
+#         - targets: []
+
+# Rule files (optional)
+# rule_files:
+#   - "rules/*.yml"
+
+scrape_configs:
+  # Prometheus self-monitoring
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # SGLang metrics from all cluster nodes
+  # Each node exposes Prometheus metrics at :8080/metrics
+  - job_name: 'sglang'
+    scrape_interval: 2s  # More frequent for real-time monitoring
+    static_configs:
+      - targets:
+          - '129.213.93.186:8080'  # llama-east (us-east-1)
+          - '151.145.83.16:8080'   # gpu-2 (me-west-1)
+          - '130.61.109.93:8080'   # gotoni-1769464777 (europe-central-1)
+        labels:
+          service: 'sglang'
+    relabel_configs:
+      - source_labels: [__address__]
+        regex: '129\.213\.93\.186:.*'
+        target_label: instance_name
+        replacement: 'llama-east'
+      - source_labels: [__address__]
+        regex: '151\.145\.83\.16:.*'
+        target_label: instance_name
+        replacement: 'gpu-2'
+      - source_labels: [__address__]
+        regex: '130\.61\.109\.93:.*'
+        target_label: instance_name
+        replacement: 'gotoni-1769464777'
+
+  # Load balancer status endpoints
+  - job_name: 'gotoni-lb'
+    scrape_interval: 5s
+    metrics_path: /lb/status
+    static_configs:
+      - targets:
+          - '129.213.93.186:8000'  # LB on llama-east
+          - '151.145.83.16:8000'   # LB on gpu-2
+          - '130.61.109.93:8000'   # LB on gotoni-1769464777
+        labels:
+          service: 'gotoni-lb'
+    relabel_configs:
+      - source_labels: [__address__]
+        regex: '129\.213\.93\.186:.*'
+        target_label: instance_name
+        replacement: 'llama-east'
+      - source_labels: [__address__]
+        regex: '151\.145\.83\.16:.*'
+        target_label: instance_name
+        replacement: 'gpu-2'
+      - source_labels: [__address__]
+        regex: '130\.61\.109\.93:.*'
+        target_label: instance_name
+        replacement: 'gotoni-1769464777'

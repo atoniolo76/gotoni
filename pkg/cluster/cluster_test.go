@@ -2048,7 +2048,7 @@ func TestClusterSGLang(t *testing.T) {
 	}
 
 	// Setup cluster with SGLang running (one-time)
-	cluster, err := setupSGLangCluster(httpClient, apiToken, "llama-test-cluster", os.Getenv("HF_TOKEN"))
+	cluster, err := setupSGLangCluster(httpClient, apiToken, "sglang-auto-cluster", os.Getenv("HF_TOKEN"))
 	if err != nil {
 		t.Fatalf("Failed to setup SGLang cluster: %v", err)
 	}

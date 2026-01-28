@@ -283,7 +283,7 @@ func waitForInstances(httpClient *http.Client, apiToken string, launchedInstance
 func LaunchCluster(httpClient *http.Client, apiToken string) *Cluster {
 	// Create a default cluster spec for backward compatibility
 	spec := &ClusterSpec{
-		Name: "gotoni-cluster",
+		Name: "sglang-auto-cluster",
 		Replicas: []ClusterReplicaSpec{
 			{InstanceType: "", Region: "us-west-1", Quantity: 1}, // Will be filled with first available
 			{InstanceType: "", Region: "us-east-1", Quantity: 1},
