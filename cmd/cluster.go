@@ -245,8 +245,17 @@ func runClusterRestartLB(cmd *cobra.Command, args []string) {
 			}
 
 			restartCmd := fmt.Sprintf(`
+# Kill existing LB
 pkill -f 'gotoni lb' 2>/dev/null || true
 sleep 1
+
+# Check binary exists
+if [ ! -f /home/ubuntu/gotoni ]; then
+  echo "ERROR: /home/ubuntu/gotoni not found"
+  exit 1
+fi
+
+# Start LB
 nohup /home/ubuntu/gotoni lb start \
   --listen-port 8000 \
   --local-port 8080 \
@@ -256,15 +265,26 @@ nohup /home/ubuntu/gotoni lb start \
   --node-id %s \
   %s %s \
   > /home/ubuntu/lb.log 2>&1 &
-sleep 2
-curl -s http://localhost:8000/lb/health || echo 'FAILED'
+
+# Wait for startup
+sleep 3
+
+# Check health
+if curl -s http://localhost:8000/lb/health | grep -q healthy; then
+  echo "OK"
+else
+  echo "FAILED - log output:"
+  tail -20 /home/ubuntu/lb.log 2>/dev/null || echo "no log"
+fi
 `, strategy, maxConcurrent, instance.Name, thresholdArg, peersArg)
 
 			output, err := sshMgr.ExecuteCommandWithTimeout(instance.IP, restartCmd, 30*time.Second)
-			if err != nil || !strings.Contains(output, "healthy") {
-				fmt.Printf("%-20s: ❌ restart failed\n", instance.Name)
-			} else {
+			if err != nil {
+				fmt.Printf("%-20s: ❌ SSH error: %v\n", instance.Name, err)
+			} else if strings.Contains(output, "OK") {
 				fmt.Printf("%-20s: ✅ restarted\n", instance.Name)
+			} else {
+				fmt.Printf("%-20s: ❌ restart failed\n%s\n", instance.Name, output)
 			}
 		}(inst, i)
 	}
@@ -294,6 +314,7 @@ func runClusterUpload(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
+	sshMgr := remote.NewSSHClientManager()
 	fmt.Println("Uploading to nodes...")
 
 	var wg sync.WaitGroup
@@ -309,7 +330,16 @@ func runClusterUpload(cmd *cobra.Command, args []string) {
 				return
 			}
 
-			// SCP upload
+			// Connect via SSH manager
+			if err := sshMgr.ConnectToInstance(instance.IP, sshKeyPath); err != nil {
+				fmt.Printf("%-20s: ❌ SSH failed: %v\n", instance.Name, err)
+				return
+			}
+
+			// Delete existing binary first using SSH manager
+			sshMgr.ExecuteCommand(instance.IP, "rm -f /home/ubuntu/gotoni")
+
+			// SCP upload (still need exec for file transfer)
 			scpCmd := exec.Command("scp",
 				"-i", sshKeyPath,
 				"-o", "StrictHostKeyChecking=no",
@@ -321,6 +351,14 @@ func runClusterUpload(cmd *cobra.Command, args []string) {
 				fmt.Printf("%-20s: ❌ upload failed: %v\n", instance.Name, err)
 				return
 			}
+
+			// Verify upload
+			output, err := sshMgr.ExecuteCommand(instance.IP, "ls -la /home/ubuntu/gotoni && chmod +x /home/ubuntu/gotoni")
+			if err != nil {
+				fmt.Printf("%-20s: ❌ verify failed: %v\n", instance.Name, err)
+				return
+			}
+			_ = output
 
 			fmt.Printf("%-20s: ✅ uploaded\n", instance.Name)
 		}(inst)
