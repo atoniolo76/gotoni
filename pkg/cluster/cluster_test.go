@@ -2024,13 +2024,15 @@ func TestClusterSGLang(t *testing.T) {
 	defer cluster.Disconnect()
 
 	// Verify local tokenizer (for GORGO policy)
-	testTokenCount := GetTokenCount("Hello, world!")
-	if testTokenCount > 0 {
-		fmt.Printf("Local tokenizer working: 'Hello, world!' = %d tokens\n", testTokenCount)
-	} else {
-		fmt.Println("Local tokenizer not available, GORGO will use character-based fallback")
-	}
+	// testTokenCount := GetTokenCount("Hello, world!")
+	// if testTokenCount > 0 {
+	// 	fmt.Printf("Local tokenizer working: 'Hello, world!' = %d tokens\n", testTokenCount)
+	// } else {
+	// 	fmt.Println("Local tokenizer not available, GORGO will use character-based fallback")
+	// }
 
+	fmt.Println("9. Skipping local tokenizer test (will verify on remote instances after deploy)...")
+	
 	// Build gotoni binary on all instances (one-time)
 	if err := buildGotoniOnCluster(cluster); err != nil {
 		t.Fatalf("Failed to build gotoni on cluster: %v", err)
