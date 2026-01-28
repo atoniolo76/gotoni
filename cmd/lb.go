@@ -78,8 +78,18 @@ var lbStopCmd = &cobra.Command{
 var lbStatusCmd = &cobra.Command{
 	Use:   "status",
 	Short: "Check if load balancer is responding",
-	Long:  `Check if the load balancer is running and responding to requests.`,
-	Run:   runLBStatus,
+	Long: `Check if the load balancer is running and responding to requests.
+
+Examples:
+  # Check status on all cluster instances (recommended)
+  gotoni lb status --all
+
+  # Check status on localhost
+  gotoni lb status
+
+  # Check specific host
+  gotoni lb status --host 192.168.1.100`,
+	Run: runLBStatus,
 }
 
 // lbPolicyCmd switches or shows load balancer policy
@@ -178,6 +188,7 @@ func init() {
 	lbStartCmd.Flags().Int("max-concurrent", 10, "Max concurrent requests before forwarding to peers")
 	lbStartCmd.Flags().Bool("queue-enabled", true, "Enable request queuing when all nodes at capacity")
 	lbStartCmd.Flags().Duration("queue-timeout", 30*time.Second, "Queue timeout")
+	lbStartCmd.Flags().Int("max-queue", 1000, "Max requests in queue before rejecting (0=unlimited)")
 	lbStartCmd.Flags().Duration("request-timeout", 30*time.Second, "Request timeout for forwarded requests")
 	lbStartCmd.Flags().StringSlice("peers", []string{}, "Peer addresses in format ip:port (can specify multiple)")
 	lbStartCmd.Flags().String("pid-file", "/tmp/gotoni-lb.pid", "Path to PID file")
@@ -192,8 +203,9 @@ func init() {
 	lbStartCmd.Flags().String("cluster-name", "default", "Cluster name for tracing")
 
 	// Flags for lb status
+	lbStatusCmd.Flags().Bool("all", false, "Check all running instances in cluster")
 	lbStatusCmd.Flags().Int("port", 8000, "Load balancer port to check")
-	lbStatusCmd.Flags().String("host", "localhost", "Load balancer host to check")
+	lbStatusCmd.Flags().StringSlice("host", []string{}, "Load balancer host(s) to check (comma-separated)")
 
 	// Flags for lb stop
 	lbStopCmd.Flags().String("pid-file", "/tmp/gotoni-lb.pid", "Path to PID file")
@@ -249,6 +261,9 @@ func runLBStart(cmd *cobra.Command, args []string) {
 	}
 	if cmd.Flags().Changed("queue-timeout") {
 		config.QueueTimeout, _ = cmd.Flags().GetDuration("queue-timeout")
+	}
+	if cmd.Flags().Changed("max-queue") {
+		config.MaxQueueSize, _ = cmd.Flags().GetInt("max-queue")
 	}
 	if cmd.Flags().Changed("request-timeout") {
 		config.RequestTimeout, _ = cmd.Flags().GetDuration("request-timeout")
@@ -370,30 +385,91 @@ func runLBStop(cmd *cobra.Command, args []string) {
 }
 
 func runLBStatus(cmd *cobra.Command, args []string) {
-	host, _ := cmd.Flags().GetString("host")
+	useAll, _ := cmd.Flags().GetBool("all")
+	hosts, _ := cmd.Flags().GetStringSlice("host")
 	port, _ := cmd.Flags().GetInt("port")
 
-	// Try to connect to the load balancer
-	testURL := fmt.Sprintf("http://%s:%d/", host, port)
 	client := &http.Client{Timeout: 5 * time.Second}
 
-	fmt.Printf("Checking load balancer at %s:%d...\n\n", host, port)
-
-	// Basic connectivity check
-	resp, err := client.Get(testURL)
-	if err != nil {
-		fmt.Printf("❌ Load balancer is NOT running or unreachable: %v\n", err)
-		fmt.Printf("   Make sure the load balancer is started with 'gotoni lb start'\n")
-		os.Exit(1)
+	// Get hosts from cluster if --all is specified
+	var allHosts []string
+	if useAll {
+		apiToken := remote.GetAPIToken()
+		if apiToken == "" {
+			log.Fatal("LAMBDA_API_KEY not set. Required for --all flag.")
+		}
+		httpClient := remote.NewHTTPClient()
+		instances, err := remote.ListRunningInstances(httpClient, apiToken)
+		if err != nil {
+			log.Fatalf("Failed to list instances: %v", err)
+		}
+		for _, inst := range instances {
+			allHosts = append(allHosts, inst.IP)
+		}
+		if len(allHosts) == 0 {
+			log.Fatal("No running instances found")
+		}
+		fmt.Printf("Checking LB status on %d instances...\n\n", len(allHosts))
+	} else if len(hosts) > 0 {
+		// Expand comma-separated hosts
+		for _, h := range hosts {
+			for _, host := range strings.Split(h, ",") {
+				host = strings.TrimSpace(host)
+				if host != "" {
+					allHosts = append(allHosts, host)
+				}
+			}
+		}
+	} else {
+		// Default to localhost if nothing specified
+		allHosts = []string{"localhost"}
 	}
-	defer resp.Body.Close()
 
-	fmt.Printf("✅ Load balancer is responding (HTTP %d)\n", resp.StatusCode)
+	healthyCount := 0
+	for _, host := range allHosts {
+		// Try to get LB status endpoint
+		statusURL := fmt.Sprintf("http://%s:%d/lb/status", host, port)
+		resp, err := client.Get(statusURL)
+		if err != nil {
+			fmt.Printf("❌ %s: NOT running or unreachable\n", host)
+			continue
+		}
+		defer resp.Body.Close()
 
-	// Since the new load balancer doesn't have status endpoints,
-	// we can only confirm it's responding to requests
-	fmt.Printf("\nNote: Detailed status/metrics not available in new SGLang-integrated version\n")
-	fmt.Printf("The load balancer is running and can handle requests.\n")
+		var status map[string]interface{}
+		if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
+			fmt.Printf("⚠️  %s: running but invalid response\n", host)
+			healthyCount++
+			continue
+		}
+
+		// Extract useful info from status
+		running := int64(0)
+		waiting := int64(0)
+		peers := 0
+		healthy := status["healthy"] == true
+
+		if r, ok := status["running_reqs"].(float64); ok {
+			running = int64(r)
+		}
+		if w, ok := status["waiting_reqs"].(float64); ok {
+			waiting = int64(w)
+		}
+		if p, ok := status["peer_count"].(float64); ok {
+			peers = int(p)
+		}
+
+		statusIcon := "✅"
+		if !healthy {
+			statusIcon = "⚠️"
+		}
+		fmt.Printf("%s %s: running=%d, waiting=%d, peers=%d\n", statusIcon, host, running, waiting, peers)
+		healthyCount++
+	}
+
+	if len(allHosts) > 1 {
+		fmt.Printf("\nSummary: %d/%d LBs responding\n", healthyCount, len(allHosts))
+	}
 }
 
 func runLBPolicy(cmd *cobra.Command, args []string) {

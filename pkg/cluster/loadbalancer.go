@@ -41,7 +41,8 @@ type LoadBalancerConfig struct {
 	RequestTimeout        time.Duration         `json:"request_timeout"`
 	QueueEnabled          bool                  `json:"queue_enabled"`
 	QueueTimeout          time.Duration         `json:"queue_timeout"`
-	Strategy              LoadBalancingStrategy `json:"-"` // Not serializable
+	MaxQueueSize          int                   `json:"max_queue_size"` // Max requests in queue before rejecting (0 = unlimited)
+	Strategy              LoadBalancingStrategy `json:"-"`              // Not serializable
 
 	// SGLang metrics polling (see sglang_metrics.go for polling logic)
 	MetricsEnabled      bool          `json:"metrics_enabled"`
@@ -74,6 +75,7 @@ func DefaultLoadBalancerConfig() *LoadBalancerConfig {
 		RequestTimeout:        30 * time.Second,
 		QueueEnabled:          true,
 		QueueTimeout:          30 * time.Second,
+		MaxQueueSize:          1000, // Safety limit - should rarely be hit if peers are configured
 		Strategy:              &LeastLoadedPolicy{},
 
 		// SGLang metrics config
@@ -639,6 +641,14 @@ func (lb *LoadBalancer) Start() error {
 
 	lb.running.Store(true)
 
+	// Warn if no peers configured - this is likely a misconfiguration
+	lb.peersMu.RLock()
+	peerCount := len(lb.peers)
+	lb.peersMu.RUnlock()
+	if peerCount == 0 {
+		log.Printf("[LB] ⚠️  WARNING: No peers configured! When at capacity, requests will queue locally instead of being forwarded. This can cause resource exhaustion under heavy load.")
+	}
+
 	// Start queue processor if enabled
 	if lb.config.QueueEnabled {
 		lb.wg.Add(1)
@@ -651,8 +661,8 @@ func (lb *LoadBalancer) Start() error {
 		go lb.pollMetricsLoop()
 	}
 
-	log.Printf("[LB] Load balancer started (max concurrent: %d, metrics polling: %v)",
-		lb.config.MaxConcurrentRequests, lb.config.MetricsEnabled)
+	log.Printf("[LB] Load balancer started (max concurrent: %d, peers: %d, max queue: %d, metrics polling: %v)",
+		lb.config.MaxConcurrentRequests, peerCount, lb.config.MaxQueueSize, lb.config.MetricsEnabled)
 
 	return nil
 }
@@ -784,8 +794,11 @@ func (lb *LoadBalancer) Handler() http.Handler {
 			lb.queueMu.Unlock()
 			lb.tracer.TraceQueueEnter(requestID, queueDepth)
 
-			lb.enqueueRequest(wrappedWriter, r)
-			lb.tracer.TraceRequestComplete(requestID, wrappedWriter.statusCode, "queue")
+			if lb.enqueueRequest(wrappedWriter, r) {
+				lb.tracer.TraceRequestComplete(requestID, wrappedWriter.statusCode, "queue")
+			} else {
+				lb.tracer.TraceRequestComplete(requestID, 503, "queue_full")
+			}
 			return
 		}
 
@@ -978,7 +991,18 @@ func (lb *LoadBalancer) selectPeer(requestPath string) *PeerNode {
 }
 
 // enqueueRequest adds a request to the queue
-func (lb *LoadBalancer) enqueueRequest(w http.ResponseWriter, r *http.Request) {
+// Returns false if the queue is full (all cluster capacity exhausted)
+func (lb *LoadBalancer) enqueueRequest(w http.ResponseWriter, r *http.Request) bool {
+	// Check max queue size before adding
+	lb.queueMu.Lock()
+	if lb.config.MaxQueueSize > 0 && len(lb.queue) >= lb.config.MaxQueueSize {
+		lb.queueMu.Unlock()
+		log.Printf("[LB] Queue full (%d/%d) - all cluster capacity exhausted, rejecting request",
+			len(lb.queue), lb.config.MaxQueueSize)
+		http.Error(w, "Cluster at capacity - queue full", http.StatusServiceUnavailable)
+		return false
+	}
+
 	qr := &queuedRequest{
 		w:          w,
 		r:          r,
@@ -986,12 +1010,11 @@ func (lb *LoadBalancer) enqueueRequest(w http.ResponseWriter, r *http.Request) {
 		enqueuedAt: time.Now(),
 	}
 
-	// Add to unbounded queue
-	lb.queueMu.Lock()
 	lb.queue = append(lb.queue, qr)
+	queueSize := len(lb.queue)
 	lb.queueMu.Unlock()
 
-	log.Printf("[LB] Request queued (queue size: %d)", len(lb.queue))
+	log.Printf("[LB] Request queued (queue size: %d/%d)", queueSize, lb.config.MaxQueueSize)
 
 	// Wait for processing or timeout
 	select {
@@ -1004,6 +1027,7 @@ func (lb *LoadBalancer) enqueueRequest(w http.ResponseWriter, r *http.Request) {
 	case <-r.Context().Done():
 		http.Error(w, "Request cancelled", http.StatusRequestTimeout)
 	}
+	return true
 }
 
 // processQueue processes queued requests when local SGLang has capacity

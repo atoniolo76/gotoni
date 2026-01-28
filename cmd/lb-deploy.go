@@ -262,8 +262,9 @@ rm -f %s
 			}
 		}
 
-		// Start in tmux session
-		tmuxCmd := fmt.Sprintf("tmux new-session -d -s %s '%s'", sessionName, lbCommand)
+		// Start in tmux session with increased file descriptor limit
+		// ulimit -n 65535 ensures we can handle many concurrent connections
+		tmuxCmd := fmt.Sprintf("tmux new-session -d -s %s 'ulimit -n 65535; %s'", sessionName, lbCommand)
 
 		output, err := sshMgr.ExecuteCommand(inst.IP, tmuxCmd)
 		if err != nil {
