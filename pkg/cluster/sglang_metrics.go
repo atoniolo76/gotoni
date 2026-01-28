@@ -146,11 +146,13 @@ func (lb *LoadBalancer) pollAllPeers() {
 }
 
 // pollPeerMetrics fetches metrics from a single SGLang peer
+// Note: We poll the SGLang backend directly (ApplicationPort), not through the peer's LB
 func (lb *LoadBalancer) pollPeerMetrics(peer *PeerNode) {
 	ctx, cancel := context.WithTimeout(lb.ctx, lb.config.MetricsTimeout)
 	defer cancel()
 
-	metricsURL := fmt.Sprintf("http://%s:%d%s", peer.Instance.IP, peer.Port, lb.config.MetricsEndpoint)
+	// Poll SGLang directly at ApplicationPort (8080), not through peer's LB (peer.Port)
+	metricsURL := fmt.Sprintf("http://%s:%d%s", peer.Instance.IP, lb.config.ApplicationPort, lb.config.MetricsEndpoint)
 
 	// timestamp the start of the poll
 	start := time.Now()
@@ -180,7 +182,7 @@ func (lb *LoadBalancer) pollPeerMetrics(peer *PeerNode) {
 	// timestamp the end of the poll
 	end := time.Now()
 	elapsed := end.Sub(start)
-	log.Printf("[LB] Poll peer metrics for %s took %s", peer.Instance.ID, elapsed)
+	log.Printf("[LB] Poll peer metrics for %s took %s", peer.Instance.IP, elapsed)
 
 	// Check if peer was previously unhealthy (recovered)
 	wasUnhealthy := !peer.Metrics.Healthy && peer.Metrics.ConsecutiveFails > 0
@@ -192,10 +194,16 @@ func (lb *LoadBalancer) pollPeerMetrics(peer *PeerNode) {
 	lb.peersMu.Lock()
 	peer.Metrics = *metrics
 
+	// Determine max capacity: use SGLang's max if available, otherwise use LB config
+	maxCapacity := metrics.MaxRunningReqs
+	if maxCapacity == 0 {
+		maxCapacity = lb.config.MaxConcurrentRequests
+	}
+
 	// Determine availability based on real metrics
 	available := metrics.Healthy &&
 		metrics.GPUCacheUsage < lb.config.GPUCacheThreshold &&
-		metrics.NumTotalReqs < metrics.MaxRunningReqs
+		metrics.NumTotalReqs < maxCapacity
 
 	lb.peers[peer] = AvailabilityStatus{
 		Available:       available,
