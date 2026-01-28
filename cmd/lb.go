@@ -119,6 +119,44 @@ Examples:
 	Run: runLBClearCache,
 }
 
+// lbPeersCmd manages peers on load balancer(s)
+var lbPeersCmd = &cobra.Command{
+	Use:   "peers [add|remove] [peer-addresses...]",
+	Short: "List, add, or remove peers on load balancer(s)",
+	Long: `Manage peer nodes on running load balancer(s).
+
+With no arguments, lists current peers. Use 'add' or 'remove' subcommands
+to modify the peer list.
+
+Examples:
+  # List peers on a host
+  gotoni lb peers --host 192.168.1.100
+
+  # Add peers to a single LB
+  gotoni lb peers add 192.168.1.101:8000 192.168.1.102:8000 --host 192.168.1.100
+
+  # Add peers to all LBs (mesh configuration)
+  gotoni lb peers add-mesh --host 192.168.1.100,192.168.1.101,192.168.1.102
+
+  # Remove a peer
+  gotoni lb peers remove 192.168.1.101:8000 --host 192.168.1.100`,
+	Run: runLBPeers,
+}
+
+// lbPeersAddMeshCmd configures all LBs as a mesh (each knows about all others)
+var lbPeersAddMeshCmd = &cobra.Command{
+	Use:   "add-mesh",
+	Short: "Configure all LBs as a full mesh (each knows about all others)",
+	Long: `Add all other hosts as peers to each load balancer.
+
+This is useful for setting up a cluster where each LB should know about
+all other LBs for load balancing.
+
+Example:
+  gotoni lb peers add-mesh --host 192.168.1.100,192.168.1.101,192.168.1.102`,
+	Run: runLBPeersAddMesh,
+}
+
 func init() {
 	rootCmd.AddCommand(lbCmd)
 	lbCmd.AddCommand(lbStartCmd)
@@ -126,6 +164,8 @@ func init() {
 	lbCmd.AddCommand(lbStatusCmd)
 	lbCmd.AddCommand(lbPolicyCmd)
 	lbCmd.AddCommand(lbClearCacheCmd)
+	lbCmd.AddCommand(lbPeersCmd)
+	lbPeersCmd.AddCommand(lbPeersAddMeshCmd)
 
 	// Flags for lb start
 	lbStartCmd.Flags().String("config", "", "Path to JSON config file")
@@ -161,6 +201,14 @@ func init() {
 	// Flags for lb clear-cache
 	lbClearCacheCmd.Flags().StringSlice("host", []string{"localhost"}, "Load balancer host(s) to target (comma-separated)")
 	lbClearCacheCmd.Flags().Int("port", 8000, "Load balancer port")
+
+	// Flags for lb peers
+	lbPeersCmd.Flags().StringSlice("host", []string{"localhost"}, "Load balancer host(s) to target (comma-separated)")
+	lbPeersCmd.Flags().Int("port", 8000, "Load balancer port")
+
+	// Flags for lb peers add-mesh
+	lbPeersAddMeshCmd.Flags().StringSlice("host", []string{}, "All LB hosts to configure as mesh (comma-separated)")
+	lbPeersAddMeshCmd.Flags().Int("port", 8000, "Load balancer port")
 }
 
 func runLBStart(cmd *cobra.Command, args []string) {
@@ -446,4 +494,169 @@ func runLBClearCache(cmd *cobra.Command, args []string) {
 			fmt.Printf("⚠️  %s: %v (strategy: %v)\n", host, result["message"], result["strategy"])
 		}
 	}
+}
+
+func runLBPeers(cmd *cobra.Command, args []string) {
+	hosts, _ := cmd.Flags().GetStringSlice("host")
+	port, _ := cmd.Flags().GetInt("port")
+
+	client := &http.Client{Timeout: 5 * time.Second}
+
+	// Expand comma-separated hosts
+	var allHosts []string
+	for _, h := range hosts {
+		for _, host := range strings.Split(h, ",") {
+			host = strings.TrimSpace(host)
+			if host != "" {
+				allHosts = append(allHosts, host)
+			}
+		}
+	}
+
+	// Determine action
+	action := "list"
+	var peerAddrs []string
+	if len(args) > 0 {
+		if args[0] == "add" || args[0] == "remove" {
+			action = args[0]
+			peerAddrs = args[1:]
+		} else {
+			// Assume adding peers if first arg looks like an address
+			action = "add"
+			peerAddrs = args
+		}
+	}
+
+	for _, host := range allHosts {
+		peersURL := fmt.Sprintf("http://%s:%d/lb/peers", host, port)
+
+		switch action {
+		case "list":
+			resp, err := client.Get(peersURL)
+			if err != nil {
+				fmt.Printf("❌ %s: failed to connect - %v\n", host, err)
+				continue
+			}
+			defer resp.Body.Close()
+
+			var result map[string]interface{}
+			if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+				fmt.Printf("❌ %s: failed to parse response - %v\n", host, err)
+				continue
+			}
+
+			peers := result["peers"].([]interface{})
+			fmt.Printf("📍 %s: %d peers\n", host, len(peers))
+			for _, p := range peers {
+				peer := p.(map[string]interface{})
+				status := "✅"
+				if peer["healthy"] != true {
+					status = "❌"
+				}
+				fmt.Printf("   %s %s:%v (running=%v, waiting=%v)\n",
+					status, peer["ip"], peer["port"], peer["running_reqs"], peer["waiting_reqs"])
+			}
+
+		case "add":
+			for _, peerAddr := range peerAddrs {
+				parts := strings.Split(peerAddr, ":")
+				peerIP := parts[0]
+				peerPort := port // default to same port
+				if len(parts) > 1 {
+					if p, err := strconv.Atoi(parts[1]); err == nil {
+						peerPort = p
+					}
+				}
+
+				body := fmt.Sprintf(`{"ip": "%s", "port": %d}`, peerIP, peerPort)
+				resp, err := client.Post(peersURL, "application/json", strings.NewReader(body))
+				if err != nil {
+					fmt.Printf("❌ %s: failed to add peer %s - %v\n", host, peerAddr, err)
+					continue
+				}
+				defer resp.Body.Close()
+
+				var result map[string]interface{}
+				json.NewDecoder(resp.Body).Decode(&result)
+				fmt.Printf("✅ %s: added peer %s:%d (status: %v)\n", host, peerIP, peerPort, result["status"])
+			}
+
+		case "remove":
+			for _, peerAddr := range peerAddrs {
+				parts := strings.Split(peerAddr, ":")
+				peerIP := parts[0]
+				peerPort := port
+				if len(parts) > 1 {
+					if p, err := strconv.Atoi(parts[1]); err == nil {
+						peerPort = p
+					}
+				}
+
+				body := fmt.Sprintf(`{"ip": "%s", "port": %d}`, peerIP, peerPort)
+				req, _ := http.NewRequest(http.MethodDelete, peersURL, strings.NewReader(body))
+				req.Header.Set("Content-Type", "application/json")
+				resp, err := client.Do(req)
+				if err != nil {
+					fmt.Printf("❌ %s: failed to remove peer %s - %v\n", host, peerAddr, err)
+					continue
+				}
+				defer resp.Body.Close()
+
+				var result map[string]interface{}
+				json.NewDecoder(resp.Body).Decode(&result)
+				fmt.Printf("✅ %s: removed peer %s (status: %v)\n", host, peerAddr, result["status"])
+			}
+		}
+	}
+}
+
+func runLBPeersAddMesh(cmd *cobra.Command, args []string) {
+	hosts, _ := cmd.Flags().GetStringSlice("host")
+	port, _ := cmd.Flags().GetInt("port")
+
+	client := &http.Client{Timeout: 5 * time.Second}
+
+	// Expand comma-separated hosts
+	var allHosts []string
+	for _, h := range hosts {
+		for _, host := range strings.Split(h, ",") {
+			host = strings.TrimSpace(host)
+			if host != "" {
+				allHosts = append(allHosts, host)
+			}
+		}
+	}
+
+	if len(allHosts) < 2 {
+		fmt.Println("❌ Need at least 2 hosts for mesh configuration")
+		fmt.Println("   Usage: gotoni lb peers add-mesh --host ip1,ip2,ip3")
+		return
+	}
+
+	fmt.Printf("🔗 Configuring %d LBs as full mesh...\n", len(allHosts))
+
+	// For each host, add all other hosts as peers
+	for _, host := range allHosts {
+		peersURL := fmt.Sprintf("http://%s:%d/lb/peers", host, port)
+		addedCount := 0
+
+		for _, peerHost := range allHosts {
+			if peerHost == host {
+				continue // Skip self
+			}
+
+			body := fmt.Sprintf(`{"ip": "%s", "port": %d}`, peerHost, port)
+			resp, err := client.Post(peersURL, "application/json", strings.NewReader(body))
+			if err != nil {
+				fmt.Printf("  ❌ %s: failed to add peer %s - %v\n", host, peerHost, err)
+				continue
+			}
+			resp.Body.Close()
+			addedCount++
+		}
+
+		fmt.Printf("  ✅ %s: added %d peers\n", host, addedCount)
+	}
+
+	fmt.Println("🔗 Mesh configuration complete!")
 }
