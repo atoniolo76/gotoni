@@ -12,6 +12,10 @@
 *.test
 *.out
 
+# Target
+target/
+Cargo.lock
+
 # Output of the go coverage tool
 *.coverprofile
 
@@ -68,6 +72,21 @@ config.yaml
 *.png
 *.gif
 !docs/*.gif
+
+# Trace files
+*.trace.json
+*.trace.json.gz
+
+# Metrics files
+*.metrics.json
+*.metrics.json.gz
+
+# Summary files
+*.summary.json
+*.summary.json.gz
+
+# jsonl files
+*.jsonl
 
 # Data files
 *.csv

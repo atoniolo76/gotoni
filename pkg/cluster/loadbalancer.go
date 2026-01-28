@@ -51,17 +51,22 @@ type LoadBalancerConfig struct {
 	UnhealthyThreshold  int           `json:"unhealthy_threshold"`
 	GPUCacheThreshold   float64       `json:"gpu_cache_threshold"`
 
-	// Observability - Loki/Grafana integration
-	ObservabilityEnabled bool   `json:"observability_enabled"`
-	LokiEndpoint         string `json:"loki_endpoint"`
-	NodeID               string `json:"node_id"`
-	ClusterName          string `json:"cluster_name"`
+	// SkyServe-style inference engine queue indicator
+	// When true: forward requests when SGLang's internal queue > 0
+	// When false: forward when total requests >= MaxConcurrentRequests
+	UseIEQueueIndicator bool `json:"use_ie_queue_indicator"`
+
+	// If > 0: forward when running_reqs exceeds this (overrides IE queue)
+	RunningReqsThreshold int `json:"running_reqs_threshold"`
+
+	// Node identity for tracing
+	NodeID      string `json:"node_id"`
+	ClusterName string `json:"cluster_name"`
 }
 
 // DefaultLoadBalancerConfig returns sensible defaults
 func DefaultLoadBalancerConfig() *LoadBalancerConfig {
 	metricsConfig := DefaultMetricsConfig()
-	obsConfig := DefaultObservabilityConfig()
 	return &LoadBalancerConfig{
 		MaxConcurrentRequests: 10,
 		ApplicationPort:       8080,
@@ -79,11 +84,8 @@ func DefaultLoadBalancerConfig() *LoadBalancerConfig {
 		UnhealthyThreshold:  metricsConfig.UnhealthyThreshold,
 		GPUCacheThreshold:   metricsConfig.GPUCacheThreshold,
 
-		// Observability config
-		ObservabilityEnabled: obsConfig.Enabled,
-		LokiEndpoint:         obsConfig.LokiEndpoint,
-		NodeID:               obsConfig.NodeID,
-		ClusterName:          obsConfig.ClusterName,
+		// SkyServe-style IE queue indicator (enabled by default)
+		UseIEQueueIndicator: true,
 	}
 }
 
@@ -138,11 +140,6 @@ func NewPrefixTreePolicy() *PrefixTreePolicy {
 }
 
 func (p *GORGOPolicy) Select(peers []*PeerNode, availabilityMap map[*PeerNode]AvailabilityStatus, requestPath string) *PeerNode {
-	return p.SelectWithTrace(peers, availabilityMap, requestPath, nil, nil)
-}
-
-// SelectWithTrace selects a peer and records trace data for waterfall diagrams
-func (p *GORGOPolicy) SelectWithTrace(peers []*PeerNode, availabilityMap map[*PeerNode]AvailabilityStatus, requestPath string, tc *TraceContext, obs *LBObservability) *PeerNode {
 	if p.root == nil {
 		// No existing prefix trie (first request), fall back to least-loaded
 		return (&LeastLoadedPolicy{}).Select(peers, availabilityMap, requestPath)
@@ -152,10 +149,11 @@ func (p *GORGOPolicy) SelectWithTrace(peers []*PeerNode, availabilityMap map[*Pe
 		return nil
 	}
 
+	// Find all prefix matches
 	matches := []MatchedPrefixNodes{}
 	currentNode := p.root
-
 	i := 0
+
 	for i < len(requestPath) {
 		currentChar := requestPath[i]
 		remainingText := requestPath[i:]
@@ -178,86 +176,42 @@ func (p *GORGOPolicy) SelectWithTrace(peers []*PeerNode, availabilityMap map[*Pe
 
 		if len(availablePeers) > 0 {
 			matchRate := float64(i) / float64(len(requestPath))
-			node := prefixNode{
-				prefix: lookup.prefix,
-				peers:  availablePeers,
-			}
 			matches = append(matches, MatchedPrefixNodes{
-				node:      node,
+				node:      prefixNode{prefix: lookup.prefix, peers: availablePeers},
 				matchRate: matchRate,
 			})
 		}
 
 		if sharedLen < len(lookup.prefix) {
-			// partial match, no need to search further
-			break
+			break // partial match
 		}
 	}
+
+	// Sort by match rate descending
 	sort.Slice(matches, func(i2, j int) bool {
 		return matches[i2].matchRate > matches[j].matchRate
 	})
 
-	// Core logic for GORGO: best match may not always be the best choice considering geographic proximity
-	// Cost = network latency + prefill time for unmatched tokens
+	// GORGO cost calculation: Cost = network latency + prefill time for unmatched tokens
 	lowestCost := int(^uint(0) >> 1)
-	var bestMatchedPeer *PeerNode = nil
-	var bestMatchRate float64 = 0.0
+	var bestPeer *PeerNode
 
-	for _, matchedPrefixNode := range matches {
-		// Start tokenizer span for timing measurement
-		var tokenizerSpanID string
-		if tc != nil {
-			tokenizerSpanID = tc.StartSpan(EventTokenizerStart, map[string]interface{}{
-				"text_length": len(requestPath) - len(matchedPrefixNode.node.prefix),
-			})
-		}
-
-		// Calculate unmatched portion that needs fresh prefill
-		unmatchedText := requestPath[len(matchedPrefixNode.node.prefix):]
+	for _, match := range matches {
+		unmatchedText := requestPath[len(match.node.prefix):]
 		unmatchedTokens := GetTokenCount(unmatchedText)
 
-		// End tokenizer span
-		if tc != nil {
-			tc.EndSpan(tokenizerSpanID, EventTokenizerEnd, map[string]interface{}{
-				"token_count": unmatchedTokens,
-			})
-		}
-
-		for _, peer := range matchedPrefixNode.node.peers {
-			// Total cost = network latency (ms) + prefill cost (tokens × ms/token)
+		for _, peer := range match.node.peers {
 			prefillCost := float64(unmatchedTokens) * GORGO_MS_PER_TOKEN
 			totalCost := int(peer.Metrics.Latency) + int(prefillCost)
 
-			// Record GORGO cost calculation for observability
-			if obs != nil {
-				obs.RecordGORGODecision(tc, peer.Instance.ID,
-					peer.Metrics.Latency,
-					unmatchedTokens,
-					prefillCost,
-					float64(totalCost),
-					matchedPrefixNode.matchRate,
-				)
-			}
-
 			if totalCost < lowestCost {
 				lowestCost = totalCost
-				bestMatchedPeer = peer
-				bestMatchRate = matchedPrefixNode.matchRate
+				bestPeer = peer
 			}
 		}
 	}
 
-	// Record final selection
-	if tc != nil && bestMatchedPeer != nil {
-		tc.AddEvent(EventGORGOCostCalc, map[string]interface{}{
-			"final_selection":    bestMatchedPeer.Instance.ID,
-			"final_cost_ms":      lowestCost,
-			"final_match_rate":   bestMatchRate,
-			"candidates_checked": len(matches),
-		})
-	}
-
-	return bestMatchedPeer
+	return bestPeer
 }
 
 func (p *PrefixTreePolicy) Select(peers []*PeerNode, availabilityMap map[*PeerNode]AvailabilityStatus, requestPath string) *PeerNode {
@@ -487,8 +441,8 @@ type LoadBalancer struct {
 	httpClient *http.Client
 	localProxy *httputil.ReverseProxy
 
-	// Observability - Loki/Grafana integration
-	observability *LBObservability
+	// Event-driven tracing (Perfetto output)
+	tracer *Tracer
 
 	// Control
 	ctx     context.Context
@@ -520,20 +474,12 @@ func NewLoadBalancer(config *LoadBalancerConfig, self *remote.RunningInstance) *
 		config.Strategy = &LeastLoadedPolicy{}
 	}
 
-	// Initialize observability
+	// Initialize tracer for event-driven tracing
 	nodeID := config.NodeID
 	if nodeID == "" && self != nil {
-		nodeID = self.ID[:16] // Use truncated instance ID
+		nodeID = self.ID[:16]
 	}
-	obsConfig := LBObservabilityConfig{
-		LokiEndpoint:  config.LokiEndpoint,
-		NodeID:        nodeID,
-		ClusterName:   config.ClusterName,
-		PushInterval:  5 * time.Second,
-		MaxBufferSize: 100,
-		Enabled:       config.ObservabilityEnabled,
-	}
-	observability := NewLBObservability(obsConfig)
+	tracer := NewTracer(nodeID)
 
 	lb := &LoadBalancer{
 		config:   config,
@@ -547,10 +493,10 @@ func NewLoadBalancer(config *LoadBalancerConfig, self *remote.RunningInstance) *
 				IdleConnTimeout:     90 * time.Second,
 			},
 		},
-		localProxy:    localProxy,
-		observability: observability,
-		ctx:           ctx,
-		cancel:        cancel,
+		localProxy: localProxy,
+		tracer:     tracer,
+		ctx:        ctx,
+		cancel:     cancel,
 	}
 
 	if config.QueueEnabled {
@@ -657,13 +603,8 @@ func (lb *LoadBalancer) Start() error {
 		go lb.pollMetricsLoop()
 	}
 
-	// Start observability pusher if enabled
-	if lb.observability != nil {
-		lb.observability.Start()
-	}
-
-	log.Printf("[LB] Load balancer started (max concurrent: %d, metrics polling: %v, observability: %v)",
-		lb.config.MaxConcurrentRequests, lb.config.MetricsEnabled, lb.config.ObservabilityEnabled)
+	log.Printf("[LB] Load balancer started (max concurrent: %d, metrics polling: %v)",
+		lb.config.MaxConcurrentRequests, lb.config.MetricsEnabled)
 
 	return nil
 }
@@ -677,11 +618,6 @@ func (lb *LoadBalancer) Stop() {
 	lb.running.Store(false)
 	lb.cancel()
 	lb.wg.Wait()
-
-	// Stop observability pusher
-	if lb.observability != nil {
-		lb.observability.Stop()
-	}
 
 	log.Printf("[LB] Load balancer stopped")
 }
@@ -725,105 +661,82 @@ func (lb *LoadBalancer) Handler() http.Handler {
 			return
 		}
 
-		// Handle observability config endpoint
-		if r.URL.Path == "/lb/observability" {
-			lb.handleObservabilityEndpoint(w, r)
-			return
-		}
-
-		// Handle logs endpoint (recent request traces)
-		if r.URL.Path == "/lb/logs" {
-			lb.handleLogsEndpoint(w, r)
-			return
-		}
-
-		// Handle peers endpoint (GET/POST to manage peer nodes)
+		// Handle peers endpoint
 		if r.URL.Path == "/lb/peers" {
 			lb.handlePeersEndpoint(w, r)
 			return
 		}
 
-		// Create trace context for this request (for waterfall diagrams)
-		tc := NewTraceContext()
-		requestStart := time.Now()
+		// Handle trace endpoints (Perfetto-compatible)
+		if r.URL.Path == "/lb/trace/start" {
+			lb.handleTraceStartEndpoint(w, r)
+			return
+		}
+		if r.URL.Path == "/lb/trace/stop" {
+			lb.handleTraceStopEndpoint(w, r)
+			return
+		}
+		if r.URL.Path == "/lb/trace/status" {
+			lb.handleTraceStatusEndpoint(w, r)
+			return
+		}
 
-		// Record request received
-		tc.AddEvent(EventRequestReceived, map[string]interface{}{
-			"path":   r.URL.Path,
-			"method": r.Method,
-			"remote": r.RemoteAddr,
-		})
-
-		// Wrap response writer to capture status code
+		// Generate request ID
+		requestID := fmt.Sprintf("%d", time.Now().UnixNano())
 		wrappedWriter := &responseWriterWrapper{ResponseWriter: w, statusCode: 200}
 
-		// Check if LOCAL SGLang has capacity using real metrics
-		if lb.localHasCapacity() {
-			// Process locally - user is routed here, KV cache is warm
-			log.Printf("[LB] Request received: %s %s from %s -> processing locally", r.Method, r.URL.Path, r.RemoteAddr)
-			spanID := tc.StartSpan(EventLocalProxyStart, map[string]interface{}{"decision": "local_capacity"})
+		// === TRACE HOOK: Request received ===
+		lb.tracer.TraceRequestReceived(requestID, r.Method, r.URL.Path, r.RemoteAddr)
+
+		// === TRACE HOOK: Capacity check ===
+		lb.localMetricsMu.RLock()
+		runningReqs := lb.localMetrics.NumRunningReqs
+		waitingReqs := lb.localMetrics.NumWaitingReqs
+		lb.localMetricsMu.RUnlock()
+		hasCapacity := lb.localHasCapacity()
+		lb.tracer.TraceCapacityCheck(requestID, hasCapacity, runningReqs, waitingReqs)
+
+		// Process locally if we have capacity
+		if hasCapacity {
+			log.Printf("[LB] Request %s: %s %s -> processing locally", requestID, r.Method, r.URL.Path)
+			lb.tracer.TraceLocalProcessStart(requestID)
+
 			proxyStart := time.Now()
 			lb.localProxy.ServeHTTP(wrappedWriter, r)
 			proxyDuration := time.Since(proxyStart)
-			tc.EndSpan(spanID, EventLocalProxyEnd, map[string]interface{}{
-				"status_code": wrappedWriter.statusCode,
-			})
-			log.Printf("[LB] Request completed: %s %s -> local (status=%d, duration=%s)",
-				r.Method, r.URL.Path, wrappedWriter.statusCode, proxyDuration)
 
-			// Record request completion
-			tc.AddEvent(EventRequestCompleted, map[string]interface{}{
-				"total_duration_ms": float64(time.Since(requestStart).Microseconds()) / 1000.0,
-				"status_code":       wrappedWriter.statusCode,
-				"served_by":         "local",
-			})
+			lb.tracer.TraceLocalProcessEnd(requestID, wrappedWriter.statusCode)
+			lb.tracer.TraceRequestComplete(requestID, wrappedWriter.statusCode, "local")
 
-			// Send trace to observability
-			lb.observability.RecordTrace(tc)
+			log.Printf("[LB] Request %s completed: local (status=%d, duration=%.1fms)",
+				requestID, wrappedWriter.statusCode, float64(proxyDuration.Milliseconds()))
 			return
 		}
 
-		// Local is at capacity - try to forward to a peer
-		lb.localMetricsMu.RLock()
-		localLoad := lb.localMetrics.NumTotalReqs
-		lb.localMetricsMu.RUnlock()
-		log.Printf("[LB] Local at capacity (running=%d, waiting=%d, total=%d), forwarding",
-			lb.localMetrics.NumRunningReqs, lb.localMetrics.NumWaitingReqs, localLoad)
+		// Local at capacity - try to forward to a peer
+		log.Printf("[LB] Request %s: local at capacity (running=%d, waiting=%d), trying peers",
+			requestID, runningReqs, waitingReqs)
 
-		if lb.forwardToPeerWithTrace(wrappedWriter, r, tc) {
-			// Record request completion
-			tc.AddEvent(EventRequestCompleted, map[string]interface{}{
-				"total_duration_ms": float64(time.Since(requestStart).Microseconds()) / 1000.0,
-				"status_code":       wrappedWriter.statusCode,
-				"served_by":         "peer",
-			})
-			lb.observability.RecordTrace(tc)
+		if lb.forwardToPeer(wrappedWriter, r, requestID) {
+			lb.tracer.TraceRequestComplete(requestID, wrappedWriter.statusCode, "peer")
 			return
 		}
 
-		// No healthy peers available - try queue locally or reject
+		// No healthy peers - queue or reject
 		if lb.config.QueueEnabled {
-			log.Printf("[LB] Request received: %s %s from %s -> queueing (no capacity, no healthy peers)", r.Method, r.URL.Path, r.RemoteAddr)
-			tc.AddEvent(EventRequestQueued, map[string]interface{}{
-				"reason": "no_capacity_no_peers",
-			})
-			lb.enqueueRequest(wrappedWriter, r)
+			log.Printf("[LB] Request %s: queueing (no capacity, no healthy peers)", requestID)
+			lb.queueMu.Lock()
+			queueDepth := len(lb.queue)
+			lb.queueMu.Unlock()
+			lb.tracer.TraceQueueEnter(requestID, queueDepth)
 
-			tc.AddEvent(EventRequestCompleted, map[string]interface{}{
-				"total_duration_ms": float64(time.Since(requestStart).Microseconds()) / 1000.0,
-				"served_by":         "queue",
-			})
-			lb.observability.RecordTrace(tc)
+			lb.enqueueRequest(wrappedWriter, r)
+			lb.tracer.TraceRequestComplete(requestID, wrappedWriter.statusCode, "queue")
 			return
 		}
 
 		// All options exhausted
-		tc.AddEvent(EventRequestCompleted, map[string]interface{}{
-			"total_duration_ms": float64(time.Since(requestStart).Microseconds()) / 1000.0,
-			"status_code":       503,
-			"served_by":         "rejected",
-		})
-		lb.observability.RecordTrace(tc)
+		lb.tracer.TraceRequestComplete(requestID, 503, "rejected")
 		http.Error(w, "Service at capacity", http.StatusServiceUnavailable)
 	})
 }
@@ -831,16 +744,25 @@ func (lb *LoadBalancer) Handler() http.Handler {
 // responseWriterWrapper wraps http.ResponseWriter to capture status code
 type responseWriterWrapper struct {
 	http.ResponseWriter
-	statusCode int
+	statusCode    int
+	headerWritten bool
 }
 
 func (w *responseWriterWrapper) WriteHeader(code int) {
+	if w.headerWritten {
+		return // Prevent duplicate WriteHeader calls
+	}
+	w.headerWritten = true
 	w.statusCode = code
 	w.ResponseWriter.WriteHeader(code)
 }
 
 // localHasCapacity checks if the local SGLang backend has capacity
-// Returns true if we should process locally (queue depth < max)
+// Returns true if we should process locally
+//
+// Uses SkyServe-style inference engine queue indicator:
+// - If UseIEQueueIndicator is true: forward when SGLang's internal queue > 0
+// - Otherwise: forward when total requests >= max concurrent
 func (lb *LoadBalancer) localHasCapacity() bool {
 	lb.localMetricsMu.RLock()
 	defer lb.localMetricsMu.RUnlock()
@@ -850,58 +772,75 @@ func (lb *LoadBalancer) localHasCapacity() bool {
 		return true
 	}
 
-	// Check if local SGLang queue is below threshold
-	// "Capacity" means: total requests (running + waiting) < max running
+	// Must be healthy
+	if !lb.localMetrics.Healthy {
+		return false
+	}
+
+	// Check GPU cache threshold
+	if lb.localMetrics.GPUCacheUsage >= lb.config.GPUCacheThreshold {
+		return false
+	}
+
+	// Check running requests threshold first (if set)
+	// This allows forcing forwarding when running_reqs exceeds a limit
+	if lb.config.RunningReqsThreshold > 0 {
+		hasCapacity := lb.localMetrics.NumRunningReqs < lb.config.RunningReqsThreshold
+		if !hasCapacity {
+			log.Printf("[LB] Running threshold: %d >= %d, forwarding",
+				lb.localMetrics.NumRunningReqs, lb.config.RunningReqsThreshold)
+		}
+		return hasCapacity
+	}
+
+	// SkyServe-style: use inference engine queue as indicator
+	// If SGLang has ANY waiting requests, local is "at capacity"
+	// This is more responsive than counting concurrent requests
+	if lb.config.UseIEQueueIndicator {
+		// Forward if SGLang's internal queue has waiting requests
+		hasCapacity := lb.localMetrics.NumWaitingReqs == 0
+		if !hasCapacity {
+			log.Printf("[LB] IE queue indicator: SGLang has %d waiting requests, forwarding",
+				lb.localMetrics.NumWaitingReqs)
+		}
+		return hasCapacity
+	}
+
+	// Fallback: traditional max concurrent check
 	maxLoad := lb.config.MaxConcurrentRequests
 	if lb.localMetrics.MaxRunningReqs > 0 {
 		maxLoad = lb.localMetrics.MaxRunningReqs
 	}
 
-	hasCapacity := lb.localMetrics.NumTotalReqs < maxLoad &&
-		lb.localMetrics.GPUCacheUsage < lb.config.GPUCacheThreshold &&
-		lb.localMetrics.Healthy
-
-	return hasCapacity
+	return lb.localMetrics.NumTotalReqs < maxLoad
 }
 
-func (lb *LoadBalancer) forwardToPeer(w http.ResponseWriter, r *http.Request) bool {
-	return lb.forwardToPeerWithTrace(w, r, nil)
-}
-
-func (lb *LoadBalancer) forwardToPeerWithTrace(w http.ResponseWriter, r *http.Request, tc *TraceContext) bool {
-	// Start policy selection span
-	var policySpanID string
-	if tc != nil {
-		policySpanID = tc.StartSpan(EventPolicySelect, map[string]interface{}{
-			"policy": lb.getStrategyName(),
-			"path":   r.URL.Path,
-		})
-	}
-
-	peer := lb.selectPeerWithTrace(r.URL.Path, tc)
-
-	if peer != nil {
-		log.Printf("[LB] Request received: %s %s from %s -> forwarding to peer %s (%s:%d)",
-			r.Method, r.URL.Path, r.RemoteAddr, peer.Instance.ID, peer.Instance.IP, peer.Port)
-	}
-
-	// End policy selection span
-	if tc != nil {
-		tc.EndSpan(policySpanID, EventPolicySelect, map[string]interface{}{
-			"peer_selected": peer != nil,
-			"peer_id": func() string {
-				if peer != nil {
-					return peer.Instance.ID
-				} else {
-					return ""
-				}
-			}(),
-		})
-	}
+func (lb *LoadBalancer) forwardToPeer(w http.ResponseWriter, r *http.Request, requestID string) bool {
+	// === TRACE: measure policy selection time (includes tokenization for GORGO) ===
+	selectStart := time.Now()
+	peer := lb.selectPeer(r.URL.Path)
+	selectDuration := time.Since(selectStart)
 
 	if peer == nil {
+		lb.tracer.TraceGORGODecision(requestID, "no_peer", map[string]interface{}{
+			"policy":           lb.config.Strategy,
+			"select_time_us":   selectDuration.Microseconds(),
+			"request_path_len": len(r.URL.Path),
+		})
 		return false
 	}
+
+	// Record policy decision with timing
+	lb.tracer.TraceGORGODecision(requestID, "forward", map[string]interface{}{
+		"policy":           lb.config.Strategy,
+		"select_time_us":   selectDuration.Microseconds(),
+		"target_peer":      peer.Instance.ID,
+		"target_ip":        peer.Instance.IP,
+		"request_path_len": len(r.URL.Path),
+	})
+
+	log.Printf("[LB] Request %s: %s %s -> forwarding to %s (%s:%d) [select took %v]",
+		requestID, r.Method, r.URL.Path, peer.Instance.ID, peer.Instance.IP, peer.Port, selectDuration)
 
 	// Build forward URL
 	targetURL := fmt.Sprintf("http://%s:%d%s", peer.Instance.IP, peer.Port, r.URL.Path)
@@ -913,7 +852,6 @@ func (lb *LoadBalancer) forwardToPeerWithTrace(w http.ResponseWriter, r *http.Re
 	ctx, cancel := context.WithTimeout(r.Context(), lb.config.RequestTimeout)
 	defer cancel()
 
-	// Read and buffer the body so we can forward it
 	var bodyBytes []byte
 	if r.Body != nil {
 		bodyBytes, _ = io.ReadAll(r.Body)
@@ -932,57 +870,25 @@ func (lb *LoadBalancer) forwardToPeerWithTrace(w http.ResponseWriter, r *http.Re
 			forwardReq.Header.Add(key, value)
 		}
 	}
-
-	// Add forwarding headers
 	forwardReq.Header.Set("X-Forwarded-For", r.RemoteAddr)
 	forwardReq.Header.Set("X-LB-Hop", "1")
-	if tc != nil {
-		forwardReq.Header.Set("X-Trace-ID", tc.TraceID)
-	}
+	forwardReq.Header.Set("X-Request-ID", requestID)
 
-	// Pre-execute, add the requestPath to the prefix tree if doing PrefixTreePolicy
+	// Update prefix tree for future routing
 	if prefixPolicy, ok := lb.strategy.(*PrefixTreePolicy); ok && prefixPolicy != nil {
 		prefixPolicy.Insert(r.URL.Path, peer)
 	}
 
-	// Record forward event
-	if tc != nil {
-		lb.observability.RecordForward(tc, peer.Instance.ID, peer.Instance.IP, peer.Port, lb.getStrategyName(), map[string]interface{}{
-			"target_url":     targetURL,
-			"body_size":      len(bodyBytes),
-			"peer_load":      peer.Metrics.NumTotalReqs,
-			"peer_gpu_cache": peer.Metrics.GPUCacheUsage,
-		})
-	}
+	// === TRACE HOOK ===
+	lb.tracer.TraceForwardStart(requestID, peer.Instance.ID, peer.Instance.IP)
 
-	// Start HTTP forward span
-	var forwardSpanID string
-	if tc != nil {
-		forwardSpanID = tc.StartSpan(EventHTTPForwardStart, map[string]interface{}{
-			"target_peer": peer.Instance.ID,
-			"target_ip":   peer.Instance.IP,
-			"target_port": peer.Port,
-		})
-	}
-
-	// Execute forward
+	forwardStart := time.Now()
 	resp, err := lb.httpClient.Do(forwardReq)
-
-	// End HTTP forward span
-	if tc != nil {
-		metadata := map[string]interface{}{
-			"target_peer": peer.Instance.ID,
-		}
-		if err != nil {
-			metadata["error"] = err.Error()
-		} else {
-			metadata["status_code"] = resp.StatusCode
-		}
-		tc.EndSpan(forwardSpanID, EventHTTPForwardEnd, metadata)
-	}
+	forwardDuration := time.Since(forwardStart)
 
 	if err != nil {
 		log.Printf("[LB] Forward to %s failed: %v", peer.Instance.ID, err)
+		lb.tracer.TraceForwardEnd(requestID, 0, float64(forwardDuration.Microseconds())/1000.0)
 		return false
 	}
 	defer resp.Body.Close()
@@ -997,30 +903,21 @@ func (lb *LoadBalancer) forwardToPeerWithTrace(w http.ResponseWriter, r *http.Re
 	w.WriteHeader(resp.StatusCode)
 	io.Copy(w, resp.Body)
 
-	log.Printf("[LB] Request completed: forwarded to peer %s (%s:%d) -> status=%d",
-		peer.Instance.ID, peer.Instance.IP, peer.Port, resp.StatusCode)
+	lb.tracer.TraceForwardEnd(requestID, resp.StatusCode, float64(forwardDuration.Microseconds())/1000.0)
+
+	log.Printf("[LB] Request %s completed: forwarded to %s -> status=%d in %.1fms",
+		requestID, peer.Instance.ID, resp.StatusCode, float64(forwardDuration.Milliseconds()))
 	return true
 }
 
 // selectPeer selects a peer using the configured strategy
 func (lb *LoadBalancer) selectPeer(requestPath string) *PeerNode {
-	return lb.selectPeerWithTrace(requestPath, nil)
-}
-
-// selectPeerWithTrace selects a peer and records trace data for GORGO policy
-func (lb *LoadBalancer) selectPeerWithTrace(requestPath string, tc *TraceContext) *PeerNode {
 	lb.peersMu.RLock()
 	defer lb.peersMu.RUnlock()
 
-	// Extract peer slice from the map keys
 	peers := make([]*PeerNode, 0, len(lb.peers))
 	for peer := range lb.peers {
 		peers = append(peers, peer)
-	}
-
-	// For GORGO policy, we need to pass observability context
-	if gorgoPolicy, ok := lb.strategy.(*GORGOPolicy); ok {
-		return gorgoPolicy.SelectWithTrace(peers, lb.peers, requestPath, tc, lb.observability)
 	}
 
 	return lb.strategy.Select(peers, lb.peers, requestPath)
@@ -1495,146 +1392,6 @@ func (lb *LoadBalancer) handleTokenizerEndpoint(w http.ResponseWriter, r *http.R
 	json.NewEncoder(w).Encode(response)
 }
 
-// handleObservabilityEndpoint manages observability settings
-// GET: returns current observability status
-// POST: updates settings (enable/disable, change Loki endpoint)
-func (lb *LoadBalancer) handleObservabilityEndpoint(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-
-	if r.Method == http.MethodGet {
-		// Return current status
-		status := map[string]interface{}{
-			"enabled":       lb.config.ObservabilityEnabled,
-			"loki_endpoint": lb.config.LokiEndpoint,
-			"node_id":       lb.config.NodeID,
-			"cluster_name":  lb.config.ClusterName,
-			"buffer_size":   0,
-		}
-		if lb.observability != nil {
-			status["buffer_size"] = lb.observability.GetBufferSize()
-		}
-		json.NewEncoder(w).Encode(status)
-		return
-	}
-
-	if r.Method == http.MethodPost || r.Method == http.MethodPut {
-		var req struct {
-			Enabled      *bool   `json:"enabled"`
-			LokiEndpoint *string `json:"loki_endpoint"`
-		}
-
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, fmt.Sprintf(`{"error": "invalid JSON: %v"}`, err), http.StatusBadRequest)
-			return
-		}
-
-		changes := []string{}
-
-		if req.Enabled != nil {
-			old := lb.config.ObservabilityEnabled
-			lb.config.ObservabilityEnabled = *req.Enabled
-			if lb.observability != nil {
-				lb.observability.SetEnabled(*req.Enabled)
-			}
-			changes = append(changes, fmt.Sprintf("enabled: %v -> %v", old, *req.Enabled))
-		}
-
-		if req.LokiEndpoint != nil {
-			old := lb.config.LokiEndpoint
-			lb.config.LokiEndpoint = *req.LokiEndpoint
-			if lb.observability != nil {
-				lb.observability.SetLokiEndpoint(*req.LokiEndpoint)
-			}
-			changes = append(changes, fmt.Sprintf("loki_endpoint: %s -> %s", old, *req.LokiEndpoint))
-		}
-
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success": true,
-			"changes": changes,
-		})
-		return
-	}
-
-	http.Error(w, `{"error": "method not allowed"}`, http.StatusMethodNotAllowed)
-}
-
-// handleLogsEndpoint returns recent request traces for viewing LB activity
-// GET /lb/logs - returns last 20 traces
-// GET /lb/logs?limit=50 - returns last 50 traces
-// GET /lb/logs?format=text - returns human-readable text format
-func (lb *LoadBalancer) handleLogsEndpoint(w http.ResponseWriter, r *http.Request) {
-	// Parse query params
-	limit := 20
-	if l := r.URL.Query().Get("limit"); l != "" {
-		fmt.Sscanf(l, "%d", &limit)
-	}
-	format := r.URL.Query().Get("format")
-
-	if lb.observability == nil {
-		http.Error(w, `{"error": "observability not initialized"}`, http.StatusInternalServerError)
-		return
-	}
-
-	traces := lb.observability.GetRecentTraces(limit)
-
-	if format == "text" {
-		// Human-readable text format
-		w.Header().Set("Content-Type", "text/plain")
-		for i, tc := range traces {
-			if tc == nil {
-				continue
-			}
-			fmt.Fprintf(w, "=== Request %d [%s] ===\n", i+1, tc.TraceID[:8])
-			for _, event := range tc.Events {
-				fmt.Fprintf(w, "  [%s] %s\n", event.Timestamp.Format("15:04:05.000"), event.EventType)
-				for k, v := range event.Metadata {
-					fmt.Fprintf(w, "    %s: %v\n", k, v)
-				}
-			}
-			fmt.Fprintln(w)
-		}
-		return
-	}
-
-	// JSON format (default)
-	w.Header().Set("Content-Type", "application/json")
-
-	// Convert traces to a simpler format for JSON
-	type SimpleEvent struct {
-		Time      string                 `json:"time"`
-		EventType string                 `json:"event_type"`
-		Metadata  map[string]interface{} `json:"metadata,omitempty"`
-	}
-	type SimpleTrace struct {
-		TraceID string        `json:"trace_id"`
-		Events  []SimpleEvent `json:"events"`
-	}
-
-	result := make([]SimpleTrace, 0, len(traces))
-	for _, tc := range traces {
-		if tc == nil {
-			continue
-		}
-		st := SimpleTrace{
-			TraceID: tc.TraceID,
-			Events:  make([]SimpleEvent, 0),
-		}
-		for _, event := range tc.Events {
-			st.Events = append(st.Events, SimpleEvent{
-				Time:      event.Timestamp.Format("15:04:05.000"),
-				EventType: string(event.EventType),
-				Metadata:  event.Metadata,
-			})
-		}
-		result = append(result, st)
-	}
-
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"count":  len(result),
-		"traces": result,
-	})
-}
-
 // handlePeersEndpoint manages peer registration
 // GET /lb/peers - list all peers
 // POST /lb/peers - add a new peer {"ip": "1.2.3.4", "port": 8000}
@@ -1756,6 +1513,56 @@ func (lb *LoadBalancer) handlePeersEndpoint(w http.ResponseWriter, r *http.Reque
 	default:
 		http.Error(w, `{"error": "method not allowed"}`, http.StatusMethodNotAllowed)
 	}
+}
+
+// =====================================================
+// TRACE ENDPOINTS - Perfetto-compatible tracing
+// =====================================================
+
+// handleTraceStartEndpoint starts a new tracing session
+func (lb *LoadBalancer) handleTraceStartEndpoint(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost && r.Method != http.MethodGet {
+		http.Error(w, `{"error": "method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	sessionID := lb.tracer.Start()
+	log.Printf("[LB] Trace session started: %s", sessionID)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":     "started",
+		"session_id": sessionID,
+		"node_id":    lb.config.NodeID,
+		"hint":       "Run your workload, then call /lb/trace/stop to get the Perfetto trace",
+	})
+}
+
+// handleTraceStopEndpoint stops tracing and returns the Perfetto JSON
+func (lb *LoadBalancer) handleTraceStopEndpoint(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost && r.Method != http.MethodGet {
+		http.Error(w, `{"error": "method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	traceData, err := lb.tracer.Stop()
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error": "%s"}`, err.Error()), http.StatusBadRequest)
+		return
+	}
+
+	log.Printf("[LB] Trace session stopped, returning %d bytes", len(traceData))
+
+	// Return as downloadable JSON file
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Disposition", "attachment; filename=trace.json")
+	w.Write(traceData)
+}
+
+// handleTraceStatusEndpoint returns current trace status
+func (lb *LoadBalancer) handleTraceStatusEndpoint(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(lb.tracer.GetStatus())
 }
 
 // CurrentLoad returns the current load from real SGLang metrics (running + waiting)

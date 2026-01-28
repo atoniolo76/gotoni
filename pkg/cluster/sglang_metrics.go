@@ -99,18 +99,7 @@ func (lb *LoadBalancer) pollLocalMetrics() {
 
 	if err != nil {
 		lb.markLocalUnhealthy()
-		// Record unhealthy event
-		if lb.observability != nil {
-			lb.observability.RecordEvent(LBEvent{
-				Timestamp: time.Now(),
-				EventType: EventLocalUnhealthy,
-				Metadata: map[string]interface{}{
-					"error":       err.Error(),
-					"poll_ms":     float64(pollDuration.Microseconds()) / 1000.0,
-					"metrics_url": metricsURL,
-				},
-			})
-		}
+		log.Printf("[LB] Failed to poll local metrics: %v (took %.1fms)", err, float64(pollDuration.Microseconds())/1000.0)
 		return
 	}
 
@@ -118,11 +107,6 @@ func (lb *LoadBalancer) pollLocalMetrics() {
 	lb.localMetricsMu.Lock()
 	lb.localMetrics = *metrics
 	lb.localMetricsMu.Unlock()
-
-	// Push metrics to observability (for Grafana dashboard)
-	if lb.observability != nil {
-		lb.observability.RecordMetrics(*metrics, "local", true)
-	}
 }
 
 // pollAllPeers polls metrics from all peers concurrently
@@ -160,22 +144,8 @@ func (lb *LoadBalancer) pollPeerMetrics(peer *PeerNode) {
 	metrics, err := lb.fetchSGLangMetrics(ctx, metricsURL)
 	if err != nil {
 		lb.markPeerUnhealthy(peer)
-
-		// Record peer unhealthy event
-		if lb.observability != nil {
-			elapsed := time.Since(start)
-			lb.observability.RecordEvent(LBEvent{
-				Timestamp: time.Now(),
-				EventType: EventPeerUnhealthy,
-				Metadata: map[string]interface{}{
-					"peer_id":     peer.Instance.ID,
-					"peer_ip":     peer.Instance.IP,
-					"error":       err.Error(),
-					"poll_ms":     float64(elapsed.Microseconds()) / 1000.0,
-					"metrics_url": metricsURL,
-				},
-			})
-		}
+		elapsed := time.Since(start)
+		log.Printf("[LB] Failed to poll peer %s metrics: %v (took %.1fms)", peer.Instance.IP, err, float64(elapsed.Microseconds())/1000.0)
 		return
 	}
 
@@ -215,22 +185,8 @@ func (lb *LoadBalancer) pollPeerMetrics(peer *PeerNode) {
 	}
 	lb.peersMu.Unlock()
 
-	// Push metrics to observability (for Grafana dashboard)
-	if lb.observability != nil {
-		lb.observability.RecordMetrics(*metrics, peer.Instance.ID, false)
-
-		// Record recovery event if peer was previously unhealthy
-		if wasUnhealthy {
-			lb.observability.RecordEvent(LBEvent{
-				Timestamp: time.Now(),
-				EventType: EventPeerRecovered,
-				Metadata: map[string]interface{}{
-					"peer_id": peer.Instance.ID,
-					"peer_ip": peer.Instance.IP,
-					"poll_ms": float64(elapsed.Microseconds()) / 1000.0,
-				},
-			})
-		}
+	if wasUnhealthy {
+		log.Printf("[LB] Peer %s recovered", peer.Instance.IP)
 	}
 }
 

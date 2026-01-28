@@ -28,9 +28,9 @@ DATASET_NAME = 'allenai/WildChat-1M'
 # Cluster node definitions with coordinates
 # Format: (name, ip, port, latitude, longitude)
 CLUSTER_NODES = [
-    ("llama-east", "129.213.93.186", 8000, 39.0438, -77.4874),      # Ashburn, VA, USA
     ("gpu-2", "151.145.83.16", 8000, 31.0461, 34.8516),              # Israel (Tel Aviv area)
     ("gotoni-germany", "130.61.109.93", 8000, 50.1109, 8.6821),      # Frankfurt, Germany
+    ("west_coast", "192.9.140.201", 8000, 37.7749, -122.4194),       # San Francisco, CA, USA
 ]
 
 # Country/State to approximate coordinates (lat, lon)
@@ -237,14 +237,14 @@ async def init_node_clients() -> None:
             url = f"http://{ip}:{port}"
             try:
                 async with session.get(f'{url}/v1/models', timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                data = await resp.json()
-            model = data['data'][0]['id']
+                    data = await resp.json()
+                    model = data['data'][0]['id']
                     node_models[name] = model
                     node_clients[name] = openai.AsyncOpenAI(
-        base_url=f'{url}/v1',
-        api_key='placeholder',
-        max_retries=0
-    )
+                        base_url=f'{url}/v1',
+                        api_key='placeholder',
+                        max_retries=0
+                    )
                     print(f"✓ Connected to {name} ({ip}:{port}) - model: {model}")
             except Exception as e:
                 print(f"✗ Failed to connect to {name} ({ip}:{port}): {e}")
@@ -303,7 +303,7 @@ async def send_request(
             t_now = time.time()
             
             if chunk.choices and len(chunk.choices) > 0:
-            choice = chunk.choices[0]
+                choice = chunk.choices[0]
             
                 if metric.ttft is None and choice.delta and choice.delta.content:
                     metric.ttft = t_now - st
@@ -318,7 +318,7 @@ async def send_request(
             
             # Usage comes in final chunk
             if chunk.usage:
-                        metric.input_tokens = chunk.usage.prompt_tokens
+                metric.input_tokens = chunk.usage.prompt_tokens
                 metric.output_tokens = chunk.usage.completion_tokens
         
         # Fallback token count if usage wasn't provided
@@ -352,25 +352,25 @@ def load_dataset_with_coords(start_index: int, max_convs: int = 1000) -> List[Di
     for d in chunk_data:
         # Need at least 2 turns
         if d['turn'] < 2 or not isinstance(d['conversation'], list) or len(d['conversation']) < 4:
-                continue
-        
+            continue
+
         country = d.get('country', 'Unknown')
         state = d.get('state', None)
-        
+
         # Get user coordinates
         lat, lon = get_location_coords(country, state)
-        
+
         # Find nearest node
         node_name, node_ip, node_port = find_nearest_node(lat, lon)
-        
+
         # Calculate distance
         node_info = next((n for n in CLUSTER_NODES if n[0] == node_name), None)
         if node_info:
             distance = haversine_distance(lat, lon, node_info[3], node_info[4])
         else:
             distance = 0
-        
-            conv = {
+
+        conv = {
                 'turn': d['turn'],
                 'conv': d['conversation'],
             'country': country,
@@ -429,7 +429,7 @@ async def run_constant_rate_benchmark(
         for i, msg in enumerate(conv['conv'][:2]):  # Just first exchange
             messages.append({'role': msg['role'], 'content': msg['content']})
             if msg['role'] == 'assistant':
-            break
+                break
 
         if not messages or messages[-1]['role'] != 'user':
             # Need to end with user message

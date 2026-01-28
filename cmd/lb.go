@@ -100,10 +100,12 @@ func init() {
 	lbStartCmd.Flags().String("strategy", "least-loaded", "Load balancing strategy (least-loaded, prefix-tree, gorgo)")
 	lbStartCmd.Flags().String("node-id", "", "Unique identifier for this node in the cluster")
 
-	// Observability flags
-	lbStartCmd.Flags().Bool("observability", false, "Enable observability (push logs to Loki)")
-	lbStartCmd.Flags().String("loki-endpoint", "http://localhost:3100/loki/api/v1/push", "Loki push endpoint")
-	lbStartCmd.Flags().String("cluster-name", "default", "Cluster name for log labels")
+	// Selective pushing flags
+	lbStartCmd.Flags().Bool("ie-queue-indicator", true, "Use SGLang's internal queue as capacity indicator")
+	lbStartCmd.Flags().Int("running-threshold", 0, "Forward when running_reqs >= this (0=disabled, overrides ie-queue)")
+
+	// Cluster identity
+	lbStartCmd.Flags().String("cluster-name", "default", "Cluster name for tracing")
 
 	// Flags for lb status
 	lbStatusCmd.Flags().Int("port", 8000, "Load balancer port to check")
@@ -153,14 +155,16 @@ func runLBStart(cmd *cobra.Command, args []string) {
 	strategy, _ := cmd.Flags().GetString("strategy")
 	nodeID, _ := cmd.Flags().GetString("node-id")
 
-	// Get observability settings
-	observabilityEnabled, _ := cmd.Flags().GetBool("observability")
-	lokiEndpoint, _ := cmd.Flags().GetString("loki-endpoint")
-	clusterName, _ := cmd.Flags().GetString("cluster-name")
+	// Get IE queue indicator setting
+	ieQueueIndicator, _ := cmd.Flags().GetBool("ie-queue-indicator")
+	config.UseIEQueueIndicator = ieQueueIndicator
 
-	// Set observability config
-	config.ObservabilityEnabled = observabilityEnabled
-	config.LokiEndpoint = lokiEndpoint
+	// Get running threshold (overrides IE queue if > 0)
+	runningThreshold, _ := cmd.Flags().GetInt("running-threshold")
+	config.RunningReqsThreshold = runningThreshold
+
+	// Set node/cluster identity for tracing
+	clusterName, _ := cmd.Flags().GetString("cluster-name")
 	config.NodeID = nodeID
 	config.ClusterName = clusterName
 
@@ -223,6 +227,7 @@ func runLBStart(cmd *cobra.Command, args []string) {
 	fmt.Printf("  Max concurrent:   %d\n", config.MaxConcurrentRequests)
 	fmt.Printf("  Queue enabled:    %v\n", config.QueueEnabled)
 	fmt.Printf("  Strategy:         %s\n", strategy)
+	fmt.Printf("  IE queue mode:    %v (forward when SGLang queue > 0)\n", config.UseIEQueueIndicator)
 	fmt.Printf("  Metrics polling:  %v\n", config.MetricsEnabled)
 	fmt.Printf("  PID file:         %s\n", pidFile)
 	fmt.Println()

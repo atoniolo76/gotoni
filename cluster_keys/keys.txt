@@ -1,0 +1,5 @@
+The SSH keys for the running instances are stored in `/Users/alessiotoniolo/.ssh/` and are named as follows:
+
+- **llama-west** (Instance ID: 62065dd59c21489c824ca3d8c16cd1db): `lambda-key-1767821900.pem`
+- **west_coast** (Instance ID: 3d1a9c9600ae40318dc01c971d9079c4): `lambda-key-1769610887.pem`
+- **gpu-2** (Instance ID: 63f9d34db5754269a8ebaf78167c3274): `lambda-key-1769204654.pem`
