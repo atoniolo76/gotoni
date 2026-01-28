@@ -66,6 +66,16 @@ func DeployGotoniToCluster(cluster *Cluster, binaryPath string) error {
 				return
 			}
 
+			// Delete old binary first
+			rmCmd := exec.Command("ssh",
+				"-i", sshKeyPath,
+				"-o", "StrictHostKeyChecking=no",
+				"-o", "UserKnownHostsFile=/dev/null",
+				fmt.Sprintf("ubuntu@%s", instance.IP),
+				"rm -f /home/ubuntu/gotoni",
+			)
+			rmCmd.Run() // Ignore errors
+
 			// SCP upload
 			scpCmd := exec.Command("scp",
 				"-i", sshKeyPath,
@@ -115,8 +125,8 @@ func DeployLBStrategy(cluster *Cluster, strategy string) error {
 func DeployLBStrategyWithConfig(cluster *Cluster, config LBDeployConfig) error {
 	fmt.Printf("Deploying LB strategy: %s\n", config.Strategy)
 
-	// Stop existing load balancers
-	cluster.ExecuteOnCluster("pkill -f 'gotoni lb' 2>/dev/null || true")
+	// Stop existing load balancers (silently)
+	cluster.ExecuteOnCluster("tmux kill-session -t gotoni-start_gotoni_load_balancer 2>/dev/null; pkill -f 'gotoni lb' 2>/dev/null; exit 0")
 	time.Sleep(2 * time.Second)
 
 	// Collect all peer IPs
