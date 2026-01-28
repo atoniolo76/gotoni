@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/atoniolo76/gotoni/pkg/config"
 	"github.com/atoniolo76/gotoni/pkg/remote"
 	"github.com/spf13/cobra"
 )
@@ -69,23 +70,24 @@ func init() {
 	rootCmd.AddCommand(lbRemoteStatusCmd)
 	rootCmd.AddCommand(lbRemoteStopCmd)
 
-	// Flags for lb-deploy
+	// Flags for lb-deploy - defaults from pkg/config/constants.go
 	lbDeployCmd.Flags().Bool("all", false, "Deploy to all running instances")
 	lbDeployCmd.Flags().Bool("skip-build", false, "Skip building binary (use existing /tmp/gotoni-linux)")
-	lbDeployCmd.Flags().Int("local-port", 8080, "Port of the local backend service (SGLang)")
-	lbDeployCmd.Flags().Int("listen-port", 8000, "Port for the load balancer to listen on")
-	lbDeployCmd.Flags().Int("max-concurrent", 10, "Max concurrent requests before forwarding")
-	lbDeployCmd.Flags().String("strategy", "gorgo", "Load balancing strategy (gorgo, least-loaded, prefix-tree)")
-	lbDeployCmd.Flags().String("gotoni-path", "/home/ubuntu/gotoni", "Path to gotoni binary on remote")
-	lbDeployCmd.Flags().String("session-name", "gotoni-lb", "Tmux session name for load balancer")
+	lbDeployCmd.Flags().Int("local-port", config.DefaultApplicationPort, "Port of the local backend service (SGLang)")
+	lbDeployCmd.Flags().Int("listen-port", config.DefaultLoadBalancerPort, "Port for the load balancer to listen on")
+	lbDeployCmd.Flags().Int("max-concurrent", config.DefaultMaxConcurrentRequests, "Max concurrent requests before forwarding")
+	lbDeployCmd.Flags().String("strategy", config.DefaultStrategy, "Load balancing strategy (gorgo, least-loaded, prefix-tree)")
+	lbDeployCmd.Flags().Int("running-threshold", config.DefaultRunningReqsThreshold, "Forward when running_reqs >= this (forces load distribution)")
+	lbDeployCmd.Flags().String("gotoni-path", config.DefaultGotoniRemotePath, "Path to gotoni binary on remote")
+	lbDeployCmd.Flags().String("session-name", config.DefaultTmuxSessionName, "Tmux session name for load balancer")
 
 	// Flags for lb-remote-status
 	lbRemoteStatusCmd.Flags().Bool("all", false, "Check all running instances")
-	lbRemoteStatusCmd.Flags().Int("port", 8000, "Load balancer port to check")
+	lbRemoteStatusCmd.Flags().Int("port", config.DefaultLoadBalancerPort, "Load balancer port to check")
 
 	// Flags for lb-remote-stop
 	lbRemoteStopCmd.Flags().Bool("all", false, "Stop on all running instances")
-	lbRemoteStopCmd.Flags().String("session-name", "gotoni-lb", "Tmux session name to kill")
+	lbRemoteStopCmd.Flags().String("session-name", config.DefaultTmuxSessionName, "Tmux session name to kill")
 }
 
 func runLBDeploy(cmd *cobra.Command, args []string) {
@@ -95,6 +97,7 @@ func runLBDeploy(cmd *cobra.Command, args []string) {
 	listenPort, _ := cmd.Flags().GetInt("listen-port")
 	maxConcurrent, _ := cmd.Flags().GetInt("max-concurrent")
 	strategy, _ := cmd.Flags().GetString("strategy")
+	runningThreshold, _ := cmd.Flags().GetInt("running-threshold")
 	gotoniPath, _ := cmd.Flags().GetString("gotoni-path")
 	sessionName, _ := cmd.Flags().GetString("session-name")
 
@@ -244,8 +247,8 @@ rm -f %s
 		if nodeID == "" {
 			nodeID = inst.ID[:16]
 		}
-		lbCommand := fmt.Sprintf("%s lb start --local-port %d --listen-port %d --max-concurrent %d --strategy %s --node-id %s",
-			gotoniPath, localPort, listenPort, maxConcurrent, strategy, nodeID)
+		lbCommand := fmt.Sprintf("%s lb start --local-port %d --listen-port %d --max-concurrent %d --strategy %s --node-id %s --running-threshold %d",
+			gotoniPath, localPort, listenPort, maxConcurrent, strategy, nodeID, runningThreshold)
 
 		// Add peers (excluding self)
 		if len(peerIPs) > 1 {
@@ -280,7 +283,7 @@ rm -f %s
 		if strings.Contains(status, "not_running") {
 			fmt.Printf("   %s: ⚠️  may not have started correctly\n", inst.Name)
 		} else {
-			fmt.Printf("   %s: ✅ LB running with %d peers\n", inst.Name, len(peerIPs)-1)
+			fmt.Printf("   %s: ✅ LB running with %d peers (threshold=%d)\n", inst.Name, len(peerIPs)-1, runningThreshold)
 		}
 	}
 

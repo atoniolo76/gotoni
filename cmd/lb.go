@@ -19,6 +19,7 @@ import (
 	"time"
 
 	serve "github.com/atoniolo76/gotoni/pkg/cluster"
+	"github.com/atoniolo76/gotoni/pkg/config"
 	"github.com/atoniolo76/gotoni/pkg/remote"
 	"github.com/spf13/cobra"
 )
@@ -181,30 +182,30 @@ func init() {
 	lbCmd.AddCommand(lbPeersCmd)
 	lbPeersCmd.AddCommand(lbPeersAddMeshCmd)
 
-	// Flags for lb start
+	// Flags for lb start - defaults from pkg/config/constants.go
 	lbStartCmd.Flags().String("config", "", "Path to JSON config file")
-	lbStartCmd.Flags().Int("local-port", 8080, "Port of the local SGLang backend service")
-	lbStartCmd.Flags().Int("listen-port", 8000, "Port for the load balancer to listen on")
-	lbStartCmd.Flags().Int("max-concurrent", 10, "Max concurrent requests before forwarding to peers")
-	lbStartCmd.Flags().Bool("queue-enabled", true, "Enable request queuing when all nodes at capacity")
-	lbStartCmd.Flags().Duration("queue-timeout", 30*time.Second, "Queue timeout")
-	lbStartCmd.Flags().Int("max-queue", 1000, "Max requests in queue before rejecting (0=unlimited)")
-	lbStartCmd.Flags().Duration("request-timeout", 30*time.Second, "Request timeout for forwarded requests")
+	lbStartCmd.Flags().Int("local-port", config.DefaultApplicationPort, "Port of the local SGLang backend service")
+	lbStartCmd.Flags().Int("listen-port", config.DefaultLoadBalancerPort, "Port for the load balancer to listen on")
+	lbStartCmd.Flags().Int("max-concurrent", config.DefaultMaxConcurrentRequests, "Max concurrent requests before forwarding to peers")
+	lbStartCmd.Flags().Bool("queue-enabled", config.DefaultQueueEnabled, "Enable request queuing when all nodes at capacity")
+	lbStartCmd.Flags().Duration("queue-timeout", config.DefaultQueueTimeout, "Queue timeout")
+	lbStartCmd.Flags().Int("max-queue", config.DefaultMaxQueueSize, "Max requests in queue before rejecting (0=unlimited)")
+	lbStartCmd.Flags().Duration("request-timeout", config.DefaultRequestTimeout, "Request timeout for forwarded requests")
 	lbStartCmd.Flags().StringSlice("peers", []string{}, "Peer addresses in format ip:port (can specify multiple)")
 	lbStartCmd.Flags().String("pid-file", "/tmp/gotoni-lb.pid", "Path to PID file")
-	lbStartCmd.Flags().String("strategy", "least-loaded", "Load balancing strategy (least-loaded, prefix-tree, gorgo)")
+	lbStartCmd.Flags().String("strategy", config.DefaultStrategy, "Load balancing strategy (least-loaded, prefix-tree, gorgo)")
 	lbStartCmd.Flags().String("node-id", "", "Unique identifier for this node in the cluster")
 
 	// Selective pushing flags
-	lbStartCmd.Flags().Bool("ie-queue-indicator", true, "Use SGLang's internal queue as capacity indicator")
-	lbStartCmd.Flags().Int("running-threshold", 0, "Forward when running_reqs >= this (0=disabled, overrides ie-queue)")
+	lbStartCmd.Flags().Bool("ie-queue-indicator", config.DefaultUseIEQueueIndicator, "Use SGLang's internal queue as capacity indicator")
+	lbStartCmd.Flags().Int("running-threshold", config.DefaultRunningReqsThreshold, "Forward when running_reqs >= this (0=disabled, overrides ie-queue)")
 
 	// Cluster identity
 	lbStartCmd.Flags().String("cluster-name", "default", "Cluster name for tracing")
 
 	// Flags for lb status
 	lbStatusCmd.Flags().Bool("all", false, "Check all running instances in cluster")
-	lbStatusCmd.Flags().Int("port", 8000, "Load balancer port to check")
+	lbStatusCmd.Flags().Int("port", config.DefaultLoadBalancerPort, "Load balancer port to check")
 	lbStatusCmd.Flags().StringSlice("host", []string{}, "Load balancer host(s) to check (comma-separated)")
 
 	// Flags for lb stop
@@ -213,21 +214,21 @@ func init() {
 	// Flags for lb policy
 	lbPolicyCmd.Flags().Bool("all", false, "Apply to all running instances in cluster")
 	lbPolicyCmd.Flags().StringSlice("host", []string{}, "Load balancer host(s) to target (comma-separated)")
-	lbPolicyCmd.Flags().Int("port", 8000, "Load balancer port")
+	lbPolicyCmd.Flags().Int("port", config.DefaultLoadBalancerPort, "Load balancer port")
 
 	// Flags for lb clear-cache
 	lbClearCacheCmd.Flags().Bool("all", false, "Apply to all running instances in cluster")
 	lbClearCacheCmd.Flags().StringSlice("host", []string{}, "Load balancer host(s) to target (comma-separated)")
-	lbClearCacheCmd.Flags().Int("port", 8000, "Load balancer port")
+	lbClearCacheCmd.Flags().Int("port", config.DefaultLoadBalancerPort, "Load balancer port")
 
 	// Flags for lb peers
 	lbPeersCmd.Flags().Bool("all", false, "Apply to all running instances in cluster")
 	lbPeersCmd.Flags().StringSlice("host", []string{}, "Load balancer host(s) to target (comma-separated)")
-	lbPeersCmd.Flags().Int("port", 8000, "Load balancer port")
+	lbPeersCmd.Flags().Int("port", config.DefaultLoadBalancerPort, "Load balancer port")
 
 	// Flags for lb peers add-mesh
 	lbPeersAddMeshCmd.Flags().StringSlice("host", []string{}, "All LB hosts to configure as mesh (comma-separated)")
-	lbPeersAddMeshCmd.Flags().Int("port", 8000, "Load balancer port")
+	lbPeersAddMeshCmd.Flags().Int("port", config.DefaultLoadBalancerPort, "Load balancer port")
 }
 
 func runLBStart(cmd *cobra.Command, args []string) {
@@ -345,7 +346,11 @@ func runLBStart(cmd *cobra.Command, args []string) {
 	fmt.Printf("  Max concurrent:   %d\n", config.MaxConcurrentRequests)
 	fmt.Printf("  Queue enabled:    %v\n", config.QueueEnabled)
 	fmt.Printf("  Strategy:         %s\n", strategy)
-	fmt.Printf("  IE queue mode:    %v (forward when SGLang queue > 0)\n", config.UseIEQueueIndicator)
+	if config.RunningReqsThreshold > 0 {
+		fmt.Printf("  Running threshold: %d (forward when running_reqs >= %d)\n", config.RunningReqsThreshold, config.RunningReqsThreshold)
+	} else {
+		fmt.Printf("  IE queue mode:    %v (forward when SGLang queue > 0)\n", config.UseIEQueueIndicator)
+	}
 	fmt.Printf("  Metrics polling:  %v\n", config.MetricsEnabled)
 	fmt.Printf("  PID file:         %s\n", pidFile)
 	fmt.Println()

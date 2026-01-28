@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/atoniolo76/gotoni/pkg/config"
 	"github.com/atoniolo76/gotoni/pkg/remote"
 )
 
@@ -452,17 +453,15 @@ func SetupSGLangCluster(httpClient *http.Client, apiToken, clusterName, hfToken 
 	fmt.Println("3. Setting up SGLang Docker...")
 	SetupSGLangDockerOnCluster(cl, hfToken)
 
-	// 5. Deploy SGLang server
+	// 5. Deploy SGLang server with configuration from pkg/config/constants.go
 	fmt.Println("4. Deploying SGLang servers...")
-	sglangServerTask := remote.Task{
-		Name: "sglang-server-docker",
-		Command: `#!/bin/bash
-if sudo docker ps --filter name=sglang-server --filter status=running | grep -q sglang-server; then
-    if curl -s --connect-timeout 5 http://localhost:8080/health > /dev/null 2>&1; then
+	sglangCmd := fmt.Sprintf(`#!/bin/bash
+if sudo docker ps --filter name=%s --filter status=running | grep -q %s; then
+    if curl -s --connect-timeout 5 http://localhost:%d/health > /dev/null 2>&1; then
         echo "Container already running and healthy"
         exit 0
     fi
-    sudo docker rm -f sglang-server 2>/dev/null || true
+    sudo docker rm -f %s 2>/dev/null || true
 fi
 
 HF_TOKEN_FILE="/home/ubuntu/.cache/huggingface/token"
@@ -476,19 +475,31 @@ fi
 
 sudo docker run --gpus all \
     -v /home/ubuntu/.cache/huggingface:/root/.cache/huggingface \
-    -p 8080:8080 \
+    -p %d:%d \
     $HF_TOKEN_ENV \
-    --name sglang-server \
+    --name %s \
     --restart unless-stopped \
-    -d lmsysorg/sglang:latest \
+    -d %s \
     python -m sglang.launch_server \
-    --model-path mistralai/Mistral-7B-Instruct-v0.3 \
-    --port 8080 \
+    --model-path %s \
+    --port %d \
     --host 0.0.0.0 \
     --enable-metrics \
-    --max-running-requests 10 \
+    --max-running-requests %d
 
 `,
+		config.DefaultSGLangContainerName, config.DefaultSGLangContainerName, config.DefaultSGLangPort,
+		config.DefaultSGLangContainerName,
+		config.DefaultSGLangPort, config.DefaultSGLangPort,
+		config.DefaultSGLangContainerName,
+		config.DefaultSGLangDockerImage,
+		config.DefaultSGLangModel,
+		config.DefaultSGLangPort,
+		config.DefaultSGLangMaxRunningRequests)
+
+	sglangServerTask := remote.Task{
+		Name:       "sglang-server-docker",
+		Command:    sglangCmd,
 		Background: true,
 		WorkingDir: "/home/ubuntu",
 	}

@@ -18,6 +18,7 @@ import (
 	"time"
 
 	serve "github.com/atoniolo76/gotoni/pkg/cluster"
+	"github.com/atoniolo76/gotoni/pkg/config"
 	"github.com/atoniolo76/gotoni/pkg/remote"
 	"github.com/atoniolo76/gotoni/pkg/tokenizer"
 	"github.com/spf13/cobra"
@@ -431,7 +432,8 @@ func runClusterStopTrace(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
-	client := &http.Client{Timeout: 30 * time.Second}
+	// Use longer timeout for trace collection - traces can be large with many events
+	client := &http.Client{Timeout: config.DefaultTraceCollectionTimeout}
 
 	fmt.Printf("Collecting traces to %s/\n\n", traceDir)
 	for _, inst := range instances {

@@ -18,6 +18,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/atoniolo76/gotoni/pkg/config"
 )
 
 // SGLangMetrics represents the server metrics from SGLang's /get_server_info endpoint
@@ -54,15 +56,15 @@ type MetricsConfig struct {
 	GPUCacheThreshold  float64       `json:"gpu_cache_threshold"` // Mark unavailable if cache usage above this
 }
 
-// DefaultMetricsConfig returns sensible defaults for metrics polling
+// DefaultMetricsConfig returns sensible defaults for metrics polling from pkg/config/constants.go
 func DefaultMetricsConfig() MetricsConfig {
 	return MetricsConfig{
-		Enabled:            true,
-		PollInterval:       1 * time.Second,
-		Endpoint:           "/metrics", // Prometheus metrics endpoint (requires --enable-metrics flag in SGLang)
-		Timeout:            500 * time.Millisecond,
-		UnhealthyThreshold: 3,
-		GPUCacheThreshold:  0.95,
+		Enabled:            config.DefaultMetricsEnabled,
+		PollInterval:       config.DefaultMetricsPollInterval,
+		Endpoint:           config.DefaultMetricsEndpoint,
+		Timeout:            config.DefaultMetricsTimeout,
+		UnhealthyThreshold: config.DefaultUnhealthyThreshold,
+		GPUCacheThreshold:  config.DefaultGPUCacheThreshold,
 	}
 }
 
