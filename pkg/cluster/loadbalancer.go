@@ -704,6 +704,12 @@ func (lb *LoadBalancer) Handler() http.Handler {
 			return
 		}
 
+		// Handle logs endpoint (recent request traces)
+		if r.URL.Path == "/lb/logs" {
+			lb.handleLogsEndpoint(w, r)
+			return
+		}
+
 		// Create trace context for this request (for waterfall diagrams)
 		tc := NewTraceContext()
 		requestStart := time.Now()
@@ -721,11 +727,16 @@ func (lb *LoadBalancer) Handler() http.Handler {
 		// Check if LOCAL SGLang has capacity using real metrics
 		if lb.localHasCapacity() {
 			// Process locally - user is routed here, KV cache is warm
+			log.Printf("[LB] Request received: %s %s from %s -> processing locally", r.Method, r.URL.Path, r.RemoteAddr)
 			spanID := tc.StartSpan(EventLocalProxyStart, map[string]interface{}{"decision": "local_capacity"})
+			proxyStart := time.Now()
 			lb.localProxy.ServeHTTP(wrappedWriter, r)
+			proxyDuration := time.Since(proxyStart)
 			tc.EndSpan(spanID, EventLocalProxyEnd, map[string]interface{}{
 				"status_code": wrappedWriter.statusCode,
 			})
+			log.Printf("[LB] Request completed: %s %s -> local (status=%d, duration=%s)",
+				r.Method, r.URL.Path, wrappedWriter.statusCode, proxyDuration)
 
 			// Record request completion
 			tc.AddEvent(EventRequestCompleted, map[string]interface{}{
@@ -759,6 +770,7 @@ func (lb *LoadBalancer) Handler() http.Handler {
 
 		// No healthy peers available - try queue locally or reject
 		if lb.config.QueueEnabled {
+			log.Printf("[LB] Request received: %s %s from %s -> queueing (no capacity, no healthy peers)", r.Method, r.URL.Path, r.RemoteAddr)
 			tc.AddEvent(EventRequestQueued, map[string]interface{}{
 				"reason": "no_capacity_no_peers",
 			})
@@ -834,6 +846,11 @@ func (lb *LoadBalancer) forwardToPeerWithTrace(w http.ResponseWriter, r *http.Re
 	}
 
 	peer := lb.selectPeerWithTrace(r.URL.Path, tc)
+
+	if peer != nil {
+		log.Printf("[LB] Request received: %s %s from %s -> forwarding to peer %s (%s:%d)",
+			r.Method, r.URL.Path, r.RemoteAddr, peer.Instance.ID, peer.Instance.IP, peer.Port)
+	}
 
 	// End policy selection span
 	if tc != nil {
@@ -947,7 +964,8 @@ func (lb *LoadBalancer) forwardToPeerWithTrace(w http.ResponseWriter, r *http.Re
 	w.WriteHeader(resp.StatusCode)
 	io.Copy(w, resp.Body)
 
-	log.Printf("[LB] Forwarded request to %s", peer.Instance.ID)
+	log.Printf("[LB] Request completed: forwarded to peer %s (%s:%d) -> status=%d",
+		peer.Instance.ID, peer.Instance.IP, peer.Port, resp.StatusCode)
 	return true
 }
 
@@ -1505,6 +1523,83 @@ func (lb *LoadBalancer) handleObservabilityEndpoint(w http.ResponseWriter, r *ht
 	}
 
 	http.Error(w, `{"error": "method not allowed"}`, http.StatusMethodNotAllowed)
+}
+
+// handleLogsEndpoint returns recent request traces for viewing LB activity
+// GET /lb/logs - returns last 20 traces
+// GET /lb/logs?limit=50 - returns last 50 traces
+// GET /lb/logs?format=text - returns human-readable text format
+func (lb *LoadBalancer) handleLogsEndpoint(w http.ResponseWriter, r *http.Request) {
+	// Parse query params
+	limit := 20
+	if l := r.URL.Query().Get("limit"); l != "" {
+		fmt.Sscanf(l, "%d", &limit)
+	}
+	format := r.URL.Query().Get("format")
+
+	if lb.observability == nil {
+		http.Error(w, `{"error": "observability not initialized"}`, http.StatusInternalServerError)
+		return
+	}
+
+	traces := lb.observability.GetRecentTraces(limit)
+
+	if format == "text" {
+		// Human-readable text format
+		w.Header().Set("Content-Type", "text/plain")
+		for i, tc := range traces {
+			if tc == nil {
+				continue
+			}
+			fmt.Fprintf(w, "=== Request %d [%s] ===\n", i+1, tc.TraceID[:8])
+			for _, event := range tc.Events {
+				fmt.Fprintf(w, "  [%s] %s\n", event.Timestamp.Format("15:04:05.000"), event.EventType)
+				for k, v := range event.Metadata {
+					fmt.Fprintf(w, "    %s: %v\n", k, v)
+				}
+			}
+			fmt.Fprintln(w)
+		}
+		return
+	}
+
+	// JSON format (default)
+	w.Header().Set("Content-Type", "application/json")
+
+	// Convert traces to a simpler format for JSON
+	type SimpleEvent struct {
+		Time      string                 `json:"time"`
+		EventType string                 `json:"event_type"`
+		Metadata  map[string]interface{} `json:"metadata,omitempty"`
+	}
+	type SimpleTrace struct {
+		TraceID string        `json:"trace_id"`
+		Events  []SimpleEvent `json:"events"`
+	}
+
+	result := make([]SimpleTrace, 0, len(traces))
+	for _, tc := range traces {
+		if tc == nil {
+			continue
+		}
+		st := SimpleTrace{
+			TraceID: tc.TraceID,
+			Events:  make([]SimpleEvent, 0),
+		}
+		for _, event := range tc.Events {
+			st.Events = append(st.Events, SimpleEvent{
+				Time:      event.Timestamp.Format("15:04:05.000"),
+				EventType: string(event.EventType),
+				Metadata:  event.Metadata,
+			})
+		}
+		result = append(result, st)
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"count":  len(result),
+		"traces": result,
+	})
 }
 
 // CurrentLoad returns the current load from real SGLang metrics (running + waiting)

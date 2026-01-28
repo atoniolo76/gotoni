@@ -186,6 +186,11 @@ type LBObservability struct {
 	buffer   []LBEvent
 	bufferMu sync.Mutex
 
+	// Trace history for /lb/logs endpoint
+	traceHistory    []*TraceContext
+	traceHistoryMu  sync.RWMutex
+	maxTraceHistory int
+
 	// Configuration
 	pushInterval  time.Duration
 	maxBufferSize int
@@ -224,16 +229,18 @@ func NewLBObservability(config LBObservabilityConfig) *LBObservability {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	return &LBObservability{
-		lokiEndpoint:  config.LokiEndpoint,
-		nodeID:        config.NodeID,
-		clusterName:   config.ClusterName,
-		httpClient:    &http.Client{Timeout: 5 * time.Second},
-		buffer:        make([]LBEvent, 0, config.MaxBufferSize),
-		pushInterval:  config.PushInterval,
-		maxBufferSize: config.MaxBufferSize,
-		enabled:       config.Enabled,
-		ctx:           ctx,
-		cancel:        cancel,
+		lokiEndpoint:    config.LokiEndpoint,
+		nodeID:          config.NodeID,
+		clusterName:     config.ClusterName,
+		httpClient:      &http.Client{Timeout: 5 * time.Second},
+		buffer:          make([]LBEvent, 0, config.MaxBufferSize),
+		traceHistory:    make([]*TraceContext, 0, 100),
+		maxTraceHistory: 100, // Keep last 100 request traces
+		pushInterval:    config.PushInterval,
+		maxBufferSize:   config.MaxBufferSize,
+		enabled:         config.Enabled,
+		ctx:             ctx,
+		cancel:          cancel,
 	}
 }
 
@@ -284,19 +291,59 @@ func (o *LBObservability) RecordEvent(event LBEvent) {
 
 // RecordTrace records all events from a trace context
 func (o *LBObservability) RecordTrace(tc *TraceContext) {
-	if !o.enabled || tc == nil {
+	if tc == nil {
 		return
 	}
 
+	// Always save to trace history (even if Loki push is disabled)
+	// Make a copy of the events to avoid race conditions
 	tc.mu.Lock()
-	events := make([]LBEvent, len(tc.Events))
-	copy(events, tc.Events)
+	eventsCopy := make([]LBEvent, len(tc.Events))
+	copy(eventsCopy, tc.Events)
 	tc.mu.Unlock()
 
-	for _, event := range events {
+	traceCopy := &TraceContext{
+		TraceID: tc.TraceID,
+		Events:  eventsCopy,
+	}
+
+	o.traceHistoryMu.Lock()
+	o.traceHistory = append(o.traceHistory, traceCopy)
+	// Keep only last N traces
+	if len(o.traceHistory) > o.maxTraceHistory {
+		o.traceHistory = o.traceHistory[len(o.traceHistory)-o.maxTraceHistory:]
+	}
+	o.traceHistoryMu.Unlock()
+
+	// Push to Loki if enabled
+	if !o.enabled {
+		return
+	}
+
+	for _, event := range eventsCopy {
 		event.NodeID = o.nodeID
 		o.RecordEvent(event)
 	}
+}
+
+// GetRecentTraces returns recent request traces for the /lb/logs endpoint
+func (o *LBObservability) GetRecentTraces(limit int) []*TraceContext {
+	o.traceHistoryMu.RLock()
+	defer o.traceHistoryMu.RUnlock()
+
+	if limit <= 0 || limit > len(o.traceHistory) {
+		limit = len(o.traceHistory)
+	}
+
+	// Return most recent traces
+	start := len(o.traceHistory) - limit
+	if start < 0 {
+		start = 0
+	}
+
+	result := make([]*TraceContext, limit)
+	copy(result, o.traceHistory[start:])
+	return result
 }
 
 // RecordMetrics records SGLang metrics as an event
