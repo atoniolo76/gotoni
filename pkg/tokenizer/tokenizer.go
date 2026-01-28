@@ -26,17 +26,27 @@ const (
 )
 
 // SetupTokenizerSidecar uploads the Rust source and builds it on all cluster instances.
+// It stops any running tokenizer and removes old binaries before building.
 func SetupTokenizerSidecar(cl *cluster.Cluster) error {
 	fmt.Println("=== Setting up Tokenizer Sidecar on Cluster ===")
 
+	// First, stop any running tokenizer processes
+	fmt.Println("Stopping running tokenizers and cleaning up...")
+	_ = StopTokenizerSidecar(cl)
+
 	// Build script that:
-	// 1. Creates project directory
-	// 2. Installs Rust if needed
-	// 3. Builds the sidecar
+	// 1. Cleans up old binaries
+	// 2. Creates project directory
+	// 3. Installs Rust if needed
+	// 4. Builds the sidecar
 	buildScript := fmt.Sprintf(`#!/bin/bash
 set -e
 
 echo "=== Tokenizer Sidecar Setup ==="
+
+# Clean up old binary and socket
+rm -f %s/target/release/tokenizer-sidecar 2>/dev/null || true
+rm -f %s 2>/dev/null || true
 
 # Create project directory
 mkdir -p %s/src
@@ -76,7 +86,7 @@ else
     echo "FAILED"
     exit 1
 fi
-`, RemoteProjectDir, RemoteProjectDir, CargoToml, RemoteProjectDir, MainRS, RemoteProjectDir)
+`, RemoteProjectDir, SocketPath, RemoteProjectDir, RemoteProjectDir, CargoToml, RemoteProjectDir, MainRS, RemoteProjectDir)
 
 	fmt.Printf("Building tokenizer sidecar on %d instances...\n", len(cl.Instances))
 
@@ -144,10 +154,16 @@ func StartTokenizerSidecar(cl *cluster.Cluster) error {
 	startScript := fmt.Sprintf(`#!/bin/bash
 set +e
 
-# Kill any existing tokenizer process (ignore errors)
-pkill -f tokenizer-sidecar 2>/dev/null
+# Kill any existing tokenizer process by finding PIDs that match the binary path
+# Note: We can't use pkill -f here because it would match this script's command line
+EXISTING_PIDS=$(pgrep -f "tokenizer-sidecar$" 2>/dev/null | head -5)
+if [ -n "$EXISTING_PIDS" ]; then
+    for pid in $EXISTING_PIDS; do
+        kill $pid 2>/dev/null
+    done
+    sleep 1
+fi
 rm -f %s 2>/dev/null
-sleep 1
 
 # Check if binary exists
 if [ ! -f %s ]; then
@@ -155,8 +171,10 @@ if [ ! -f %s ]; then
     exit 0
 fi
 
-# Start tokenizer sidecar in background
+# Start tokenizer sidecar in background with proper detachment
 nohup %s > /home/ubuntu/tokenizer.log 2>&1 &
+TOKENIZER_PID=$!
+disown $TOKENIZER_PID
 sleep 5
 
 # Verify it's running
@@ -221,7 +239,7 @@ exit 0
 func StopTokenizerSidecar(cl *cluster.Cluster) error {
 	fmt.Println("Stopping tokenizer sidecar on all instances...")
 
-	stopScript := `pkill -f tokenizer-sidecar 2>/dev/null && echo "OK" || echo "NOT_RUNNING"`
+	stopScript := `PIDS=$(pgrep -f "tokenizer-sidecar$" 2>/dev/null); if [ -n "$PIDS" ]; then kill $PIDS 2>/dev/null && echo "OK"; else echo "NOT_RUNNING"; fi`
 
 	var wg sync.WaitGroup
 
@@ -289,11 +307,20 @@ fi
 			if strings.Contains(output, `"status":"ok"`) {
 				results[instance.ID] = "running"
 				// Extract model info if present
-				if strings.Contains(output, "model") {
-					fmt.Printf("%-20s %-12s %-40s\n", instance.Name, "✅", "running (Mistral tokenizer)")
-				} else {
-					fmt.Printf("%-20s %-12s %-40s\n", instance.Name, "✅", "running")
+				info := "running"
+				if strings.Contains(output, `"model"`) {
+					// Try to extract model name from JSON
+					start := strings.Index(output, `"model":"`)
+					if start != -1 {
+						start += 9
+						end := strings.Index(output[start:], `"`)
+						if end != -1 {
+							modelName := output[start : start+end]
+							info = modelName
+						}
+					}
 				}
+				fmt.Printf("%-20s %-12s %-40s\n", instance.Name, "✅", info)
 			} else if strings.Contains(output, "socket_exists") {
 				results[instance.ID] = "socket_only"
 				fmt.Printf("%-20s %-12s %-40s\n", instance.Name, "⚠️", "socket exists but no response")

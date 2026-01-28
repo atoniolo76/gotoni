@@ -17,7 +17,9 @@ import (
 	"sync"
 	"time"
 
+	serve "github.com/atoniolo76/gotoni/pkg/cluster"
 	"github.com/atoniolo76/gotoni/pkg/remote"
+	"github.com/atoniolo76/gotoni/pkg/tokenizer"
 	"github.com/spf13/cobra"
 )
 
@@ -27,11 +29,15 @@ var clusterCmd = &cobra.Command{
 	Long: `Cluster management commands for operating on all nodes.
 
 Examples:
-  gotoni cluster status          # Check all nodes
+  gotoni cluster status          # Check all nodes (LB, SGLang, peers)
   gotoni cluster restart-lb      # Restart LBs on all nodes  
   gotoni cluster upload          # Build and upload gotoni binary
   gotoni cluster start-trace     # Start tracing on all nodes
-  gotoni cluster stop-trace      # Stop tracing and collect results`,
+  gotoni cluster stop-trace      # Stop tracing and collect results
+
+Tokenizer shortcuts (see 'gotoni tokenizer' for full commands):
+  gotoni cluster start-tokenizer   # Same as 'gotoni tokenizer start'
+  gotoni cluster tokenizer-status  # Same as 'gotoni tokenizer status'`,
 }
 
 var clusterStatusCmd = &cobra.Command{
@@ -336,8 +342,15 @@ func runClusterUpload(cmd *cobra.Command, args []string) {
 				return
 			}
 
-			// Delete existing binary first using SSH manager
-			sshMgr.ExecuteCommand(instance.IP, "rm -f /home/ubuntu/gotoni")
+			// Stop running gotoni processes and delete old binary before uploading
+			// This ensures clean deployment without stale processes
+			cleanupScript := `
+tmux kill-session -t gotoni-start_gotoni_load_balancer 2>/dev/null || true
+PIDS=$(pgrep -f "gotoni lb" 2>/dev/null | head -5)
+if [ -n "$PIDS" ]; then kill $PIDS 2>/dev/null; fi
+rm -f /home/ubuntu/gotoni
+`
+			sshMgr.ExecuteCommand(instance.IP, cleanupScript)
 
 			// SCP upload (still need exec for file transfer)
 			scpCmd := exec.Command("scp",
@@ -489,133 +502,70 @@ func runClusterFlushCache(cmd *cobra.Command, args []string) {
 }
 
 func runClusterStartTokenizer(cmd *cobra.Command, args []string) {
-	instances, err := getClusterNodes()
-	if err != nil {
-		fmt.Printf("Failed to get instances: %v\n", err)
+	// Delegate to the tokenizer package for consistency
+	// This is equivalent to 'gotoni tokenizer start'
+	httpClient := remote.NewHTTPClient()
+	apiToken := remote.GetAPIToken()
+	if apiToken == "" {
+		fmt.Println("Error: LAMBDA_API_KEY not set")
 		os.Exit(1)
 	}
 
-	sshMgr := remote.NewSSHClientManager()
-
-	fmt.Println("Starting tokenizer-sidecar on all nodes...")
-
-	startCmd := `
-pkill -f tokenizer-sidecar 2>/dev/null || true
-rm -f /tmp/tokenizer.sock 2>/dev/null || true
-sleep 1
-nohup /home/ubuntu/tokenizer-sidecar > /home/ubuntu/tokenizer.log 2>&1 &
-sleep 3
-if [ -S /tmp/tokenizer.sock ]; then
-    echo "OK"
-else
-    echo "FAILED"
-    cat /home/ubuntu/tokenizer.log | tail -5
-fi
-`
-
-	var wg sync.WaitGroup
-	for _, inst := range instances {
-		wg.Add(1)
-		go func(instance remote.RunningInstance) {
-			defer wg.Done()
-
-			// Get SSH key using Lambda API key names + local file lookup
-			sshKeyPath, err := remote.GetSSHKeyFileForInstance(&instance)
-			if err != nil {
-				fmt.Printf("%-20s: ❌ no SSH key: %v\n", instance.Name, err)
-				return
-			}
-
-			if err := sshMgr.ConnectToInstance(instance.IP, sshKeyPath); err != nil {
-				fmt.Printf("%-20s: ❌ SSH failed: %v\n", instance.Name, err)
-				return
-			}
-
-			output, err := sshMgr.ExecuteCommandWithTimeout(instance.IP, startCmd, 30*time.Second)
-			if err != nil {
-				fmt.Printf("%-20s: ❌ %v\n", instance.Name, err)
-				return
-			}
-
-			if strings.Contains(output, "OK") {
-				fmt.Printf("%-20s: ✅ tokenizer running\n", instance.Name)
-			} else {
-				fmt.Printf("%-20s: ❌ %s\n", instance.Name, strings.TrimSpace(output))
-			}
-		}(inst)
+	cl, err := serve.GetCluster(httpClient, apiToken, "cluster")
+	if err != nil {
+		fmt.Printf("Failed to get cluster: %v\n", err)
+		os.Exit(1)
 	}
 
-	wg.Wait()
-	fmt.Println("\nDone.")
+	if err := cl.Connect(); err != nil {
+		fmt.Printf("Failed to connect: %v\n", err)
+		os.Exit(1)
+	}
+	defer cl.Disconnect()
+
+	if err := tokenizer.StartTokenizerSidecar(cl); err != nil {
+		fmt.Printf("Start failed: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Println("\n✅ Done! Use 'gotoni tokenizer status' or 'gotoni cluster tokenizer-status' to verify.")
 }
 
 func runClusterTokenizerStatus(cmd *cobra.Command, args []string) {
-	instances, err := getClusterNodes()
-	if err != nil {
-		fmt.Printf("Failed to get instances: %v\n", err)
+	// Delegate to the tokenizer package for consistency
+	// This is equivalent to 'gotoni tokenizer status'
+	httpClient := remote.NewHTTPClient()
+	apiToken := remote.GetAPIToken()
+	if apiToken == "" {
+		fmt.Println("Error: LAMBDA_API_KEY not set")
 		os.Exit(1)
 	}
 
-	sshMgr := remote.NewSSHClientManager()
-
-	fmt.Println("Checking tokenizer-sidecar status...")
-	fmt.Printf("\n%-20s %-12s %-40s\n", "NAME", "STATUS", "INFO")
-	fmt.Println(strings.Repeat("-", 75))
-
-	checkCmd := `
-if [ -S /tmp/tokenizer.sock ]; then
-    # Try to get health
-    curl -s --unix-socket /tmp/tokenizer.sock http://localhost/health 2>/dev/null || echo '{"status":"socket_exists"}'
-else
-    echo '{"status":"not_running"}'
-fi
-`
-
-	var wg sync.WaitGroup
-	for _, inst := range instances {
-		wg.Add(1)
-		go func(instance remote.RunningInstance) {
-			defer wg.Done()
-
-			// Get SSH key using Lambda API key names + local file lookup
-			sshKeyPath, err := remote.GetSSHKeyFileForInstance(&instance)
-			if err != nil {
-				fmt.Printf("%-20s %-12s %-40s\n", instance.Name, "❌", "no SSH key")
-				return
-			}
-
-			if err := sshMgr.ConnectToInstance(instance.IP, sshKeyPath); err != nil {
-				fmt.Printf("%-20s %-12s %-40s\n", instance.Name, "❌", "SSH failed")
-				return
-			}
-
-			output, err := sshMgr.ExecuteCommandWithTimeout(instance.IP, checkCmd, 10*time.Second)
-			if err != nil {
-				fmt.Printf("%-20s %-12s %-40s\n", instance.Name, "❌", err.Error())
-				return
-			}
-
-			var health map[string]interface{}
-			if json.Unmarshal([]byte(strings.TrimSpace(output)), &health) == nil {
-				status := "❌"
-				info := "not running"
-				if s, ok := health["status"].(string); ok {
-					if s == "ok" {
-						status = "✅"
-						if model, ok := health["model"].(string); ok {
-							info = model
-						}
-					} else if s == "socket_exists" {
-						status = "⚠️"
-						info = "socket exists but no response"
-					}
-				}
-				fmt.Printf("%-20s %-12s %-40s\n", instance.Name, status, info)
-			} else {
-				fmt.Printf("%-20s %-12s %-40s\n", instance.Name, "❌", output)
-			}
-		}(inst)
+	cl, err := serve.GetCluster(httpClient, apiToken, "cluster")
+	if err != nil {
+		fmt.Printf("Failed to get cluster: %v\n", err)
+		os.Exit(1)
 	}
 
-	wg.Wait()
+	if err := cl.Connect(); err != nil {
+		fmt.Printf("Failed to connect: %v\n", err)
+		os.Exit(1)
+	}
+	defer cl.Disconnect()
+
+	results, err := tokenizer.TokenizerStatus(cl)
+	if err != nil {
+		fmt.Printf("Status check failed: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Count running
+	runningCount := 0
+	for _, status := range results {
+		if status == "running" {
+			runningCount++
+		}
+	}
+
+	fmt.Printf("\nSummary: %d/%d instances have tokenizer running\n", runningCount, len(results))
 }

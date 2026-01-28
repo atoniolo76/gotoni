@@ -24,67 +24,100 @@ var tokenizerCmd = &cobra.Command{
 
 The tokenizer sidecar is a Rust binary that provides fast, accurate token 
 counting via Unix socket (/tmp/tokenizer.sock). This is used by the GORGO
-policy for routing decisions.
+load balancer policy for accurate routing decisions.
+
+Quick Start:
+  gotoni tokenizer deploy    # Build and start on all instances (recommended)
+
+Commands:
+  deploy  - Build (if needed) and start tokenizer on all instances
+  setup   - Only build the tokenizer binary (does not start)
+  start   - Start already-built tokenizer
+  stop    - Stop running tokenizer
+  status  - Check tokenizer status on all instances
+  restart - Stop and restart tokenizer on all instances
 
 Examples:
-  # Setup (upload and build) tokenizer on all instances
-  gotoni tokenizer setup
+  # Full deployment (build + start) - use this for first time setup
+  gotoni tokenizer deploy
 
-  # Start the tokenizer sidecar
-  gotoni tokenizer start
-
-  # Check status
+  # Just check status
   gotoni tokenizer status
 
-  # Stop the sidecar
-  gotoni tokenizer stop
+  # Restart after issues
+  gotoni tokenizer restart`,
+}
 
-  # Setup and start in one command
-  gotoni tokenizer setup --start`,
+var tokenizerDeployCmd = &cobra.Command{
+	Use:   "deploy",
+	Short: "Build and start tokenizer on all cluster instances (recommended)",
+	Long: `Full deployment: builds the Rust tokenizer binary and starts it on all instances.
+
+This is the recommended command for first-time setup or updates. It will:
+1. Upload the Rust source code to each instance
+2. Install Rust toolchain if needed
+3. Build the tokenizer-sidecar binary
+4. Start the tokenizer service
+
+The tokenizer listens on /tmp/tokenizer.sock for token counting requests.`,
+	Run: runTokenizerDeploy,
 }
 
 var tokenizerSetupCmd = &cobra.Command{
 	Use:   "setup",
-	Short: "Upload and build tokenizer sidecar on cluster instances",
+	Short: "Build tokenizer binary only (use 'deploy' to also start)",
 	Long: `Upload the Rust tokenizer source code and build it on all cluster instances.
 
-This installs Rust (if needed), uploads main.rs and Cargo.toml, and runs
-cargo build --release to create the tokenizer-sidecar binary.`,
+This only builds the binary - use 'gotoni tokenizer deploy' to build AND start,
+or run 'gotoni tokenizer start' after setup to start the service.`,
 	Run: runTokenizerSetup,
 }
 
 var tokenizerStartCmd = &cobra.Command{
 	Use:   "start",
-	Short: "Start tokenizer sidecar on cluster instances",
-	Run:   runTokenizerStart,
+	Short: "Start tokenizer sidecar (binary must be built first)",
+	Long: `Start the tokenizer sidecar on all cluster instances.
+
+The binary must already be built with 'gotoni tokenizer setup' or 'gotoni tokenizer deploy'.
+If you get "binary not found" errors, run 'gotoni tokenizer deploy' instead.`,
+	Run: runTokenizerStart,
 }
 
 var tokenizerStopCmd = &cobra.Command{
 	Use:   "stop",
-	Short: "Stop tokenizer sidecar on cluster instances",
+	Short: "Stop tokenizer sidecar on all instances",
 	Run:   runTokenizerStop,
+}
+
+var tokenizerRestartCmd = &cobra.Command{
+	Use:   "restart",
+	Short: "Restart tokenizer sidecar on all instances",
+	Run:   runTokenizerRestart,
 }
 
 var tokenizerStatusCmd = &cobra.Command{
 	Use:   "status",
-	Short: "Check tokenizer sidecar status on cluster instances",
+	Short: "Check tokenizer sidecar status on all instances",
 	Run:   runTokenizerStatus,
 }
 
 func init() {
 	rootCmd.AddCommand(tokenizerCmd)
 
+	tokenizerCmd.AddCommand(tokenizerDeployCmd)
 	tokenizerCmd.AddCommand(tokenizerSetupCmd)
 	tokenizerCmd.AddCommand(tokenizerStartCmd)
 	tokenizerCmd.AddCommand(tokenizerStopCmd)
+	tokenizerCmd.AddCommand(tokenizerRestartCmd)
 	tokenizerCmd.AddCommand(tokenizerStatusCmd)
 
-	// Flags
+	// Flags - cluster name is optional, defaults to all running instances
+	tokenizerDeployCmd.Flags().String("cluster", "sglang-auto-cluster", "Cluster name")
 	tokenizerSetupCmd.Flags().String("cluster", "sglang-auto-cluster", "Cluster name")
-	tokenizerSetupCmd.Flags().Bool("start", false, "Start the sidecar after building")
-
+	tokenizerSetupCmd.Flags().Bool("start", false, "Start the sidecar after building (deprecated, use 'deploy' instead)")
 	tokenizerStartCmd.Flags().String("cluster", "sglang-auto-cluster", "Cluster name")
 	tokenizerStopCmd.Flags().String("cluster", "sglang-auto-cluster", "Cluster name")
+	tokenizerRestartCmd.Flags().String("cluster", "sglang-auto-cluster", "Cluster name")
 	tokenizerStatusCmd.Flags().String("cluster", "sglang-auto-cluster", "Cluster name")
 }
 
@@ -114,6 +147,31 @@ func getClusterForTokenizer(cmd *cobra.Command) (*cluster.Cluster, error) {
 	return cl, nil
 }
 
+func runTokenizerDeploy(cmd *cobra.Command, args []string) {
+	cl, err := getClusterForTokenizer(cmd)
+	if err != nil {
+		log.Fatalf("Error: %v", err)
+	}
+	defer cl.Disconnect()
+
+	fmt.Println("🚀 Deploying tokenizer to cluster...")
+	fmt.Println()
+
+	// Build the tokenizer
+	if err := tokenizer.SetupTokenizerSidecar(cl); err != nil {
+		log.Fatalf("Build failed: %v", err)
+	}
+
+	fmt.Println()
+
+	// Start the tokenizer
+	if err := tokenizer.StartTokenizerSidecar(cl); err != nil {
+		log.Fatalf("Start failed: %v", err)
+	}
+
+	fmt.Println("\n✅ Tokenizer deployed and running!")
+}
+
 func runTokenizerSetup(cmd *cobra.Command, args []string) {
 	cl, err := getClusterForTokenizer(cmd)
 	if err != nil {
@@ -125,7 +183,7 @@ func runTokenizerSetup(cmd *cobra.Command, args []string) {
 		log.Fatalf("Setup failed: %v", err)
 	}
 
-	// Optionally start the sidecar
+	// Optionally start the sidecar (deprecated, kept for backwards compatibility)
 	startAfter, _ := cmd.Flags().GetBool("start")
 	if startAfter {
 		fmt.Println()
@@ -135,6 +193,9 @@ func runTokenizerSetup(cmd *cobra.Command, args []string) {
 	}
 
 	fmt.Println("\n✅ Tokenizer setup complete!")
+	if !startAfter {
+		fmt.Println("💡 Run 'gotoni tokenizer start' to start the sidecar, or use 'gotoni tokenizer deploy' next time.")
+	}
 }
 
 func runTokenizerStart(cmd *cobra.Command, args []string) {
@@ -163,6 +224,29 @@ func runTokenizerStop(cmd *cobra.Command, args []string) {
 	}
 
 	fmt.Println("\n✅ Tokenizer sidecar stopped!")
+}
+
+func runTokenizerRestart(cmd *cobra.Command, args []string) {
+	cl, err := getClusterForTokenizer(cmd)
+	if err != nil {
+		log.Fatalf("Error: %v", err)
+	}
+	defer cl.Disconnect()
+
+	fmt.Println("🔄 Restarting tokenizer sidecar...")
+	fmt.Println()
+
+	// Stop first (ignore errors - might not be running)
+	_ = tokenizer.StopTokenizerSidecar(cl)
+
+	fmt.Println()
+
+	// Start
+	if err := tokenizer.StartTokenizerSidecar(cl); err != nil {
+		log.Fatalf("Start failed: %v", err)
+	}
+
+	fmt.Println("\n✅ Tokenizer sidecar restarted!")
 }
 
 func runTokenizerStatus(cmd *cobra.Command, args []string) {
