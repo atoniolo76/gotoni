@@ -90,9 +90,24 @@ func (lb *LoadBalancer) pollLocalMetrics() {
 
 	metricsURL := fmt.Sprintf("http://127.0.0.1:%d%s", lb.config.ApplicationPort, lb.config.MetricsEndpoint)
 
+	pollStart := time.Now()
 	metrics, err := lb.fetchSGLangMetrics(ctx, metricsURL)
+	pollDuration := time.Since(pollStart)
+
 	if err != nil {
 		lb.markLocalUnhealthy()
+		// Record unhealthy event
+		if lb.observability != nil {
+			lb.observability.RecordEvent(LBEvent{
+				Timestamp: time.Now(),
+				EventType: EventLocalUnhealthy,
+				Metadata: map[string]interface{}{
+					"error":       err.Error(),
+					"poll_ms":     float64(pollDuration.Microseconds()) / 1000.0,
+					"metrics_url": metricsURL,
+				},
+			})
+		}
 		return
 	}
 
@@ -100,6 +115,11 @@ func (lb *LoadBalancer) pollLocalMetrics() {
 	lb.localMetricsMu.Lock()
 	lb.localMetrics = *metrics
 	lb.localMetricsMu.Unlock()
+
+	// Push metrics to observability (for Grafana dashboard)
+	if lb.observability != nil {
+		lb.observability.RecordMetrics(*metrics, "local", true)
+	}
 }
 
 // pollAllPeers polls metrics from all peers concurrently
@@ -135,6 +155,22 @@ func (lb *LoadBalancer) pollPeerMetrics(peer *PeerNode) {
 	metrics, err := lb.fetchSGLangMetrics(ctx, metricsURL)
 	if err != nil {
 		lb.markPeerUnhealthy(peer)
+
+		// Record peer unhealthy event
+		if lb.observability != nil {
+			elapsed := time.Since(start)
+			lb.observability.RecordEvent(LBEvent{
+				Timestamp: time.Now(),
+				EventType: EventPeerUnhealthy,
+				Metadata: map[string]interface{}{
+					"peer_id":     peer.Instance.ID,
+					"peer_ip":     peer.Instance.IP,
+					"error":       err.Error(),
+					"poll_ms":     float64(elapsed.Microseconds()) / 1000.0,
+					"metrics_url": metricsURL,
+				},
+			})
+		}
 		return
 	}
 
@@ -143,8 +179,11 @@ func (lb *LoadBalancer) pollPeerMetrics(peer *PeerNode) {
 	elapsed := end.Sub(start)
 	log.Printf("[LB] Poll peer metrics for %s took %s", peer.Instance.ID, elapsed)
 
+	// Check if peer was previously unhealthy (recovered)
+	wasUnhealthy := !peer.Metrics.Healthy && peer.Metrics.ConsecutiveFails > 0
+
 	// calculate point-to-point latency in miliseconds for policy usage
-	peer.Metrics.Latency = elapsed.Milliseconds()
+	metrics.Latency = elapsed.Milliseconds()
 
 	// Update peer metrics and availability
 	lb.peersMu.Lock()
@@ -164,6 +203,24 @@ func (lb *LoadBalancer) pollPeerMetrics(peer *PeerNode) {
 		Healthy:         true,
 	}
 	lb.peersMu.Unlock()
+
+	// Push metrics to observability (for Grafana dashboard)
+	if lb.observability != nil {
+		lb.observability.RecordMetrics(*metrics, peer.Instance.ID, false)
+
+		// Record recovery event if peer was previously unhealthy
+		if wasUnhealthy {
+			lb.observability.RecordEvent(LBEvent{
+				Timestamp: time.Now(),
+				EventType: EventPeerRecovered,
+				Metadata: map[string]interface{}{
+					"peer_id":  peer.Instance.ID,
+					"peer_ip":  peer.Instance.IP,
+					"poll_ms":  float64(elapsed.Microseconds()) / 1000.0,
+				},
+			})
+		}
+	}
 }
 
 // fetchSGLangMetrics makes an HTTP request to fetch metrics from an SGLang server
