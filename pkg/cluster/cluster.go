@@ -485,7 +485,9 @@ sudo docker run --gpus all \
     --model-path mistralai/Mistral-7B-Instruct-v0.3 \
     --port 8080 \
     --host 0.0.0.0 \
-    --enable-metrics
+    --enable-metrics \
+    --max-running-requests 10 \
+
 `,
 		Background: true,
 		WorkingDir: "/home/ubuntu",
