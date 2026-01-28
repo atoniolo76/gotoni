@@ -14,3 +14,8 @@ admin/vupvif-wobvak-Wespe5
 
 
 if admin/admin works but then it asks to set secure, use vupvif-wobvak-Wespe5
+
+
+To view cluster info
+
+Go to dashboards/gotoni
