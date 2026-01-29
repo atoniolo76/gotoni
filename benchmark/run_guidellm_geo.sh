@@ -141,7 +141,7 @@ GUIDELLM_CMD="guidellm benchmark \
     --output-path $OUTPUT_DIR"
 
 # Add rate for profiles that need it
-if [ "$PROFILE" = "poisson" ] || [ "$PROFILE" = "constant" ] || [ "$PROFILE" = "concurrent" ]; then
+if [ "$PROFILE" = "poisson" ] || [ "$PROFILE" = "constant" ] || [ "$PROFILE" = "concurrent" ] || [ "$PROFILE" = "throughput" ]; then
     GUIDELLM_CMD="$GUIDELLM_CMD --rate $RATE"
 fi
 
