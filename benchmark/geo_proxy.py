@@ -27,6 +27,12 @@ from typing import Any, Dict, List, Optional, Tuple
 from aiohttp import web, ClientSession, ClientTimeout
 
 # =============================================================================
+# Graceful Shutdown Configuration
+# =============================================================================
+
+SHUTDOWN_TIMEOUT = 30  # Max seconds to wait for in-flight requests during shutdown
+
+# =============================================================================
 # Configuration
 # =============================================================================
 
@@ -78,6 +84,18 @@ def hash_prompt(text: str) -> str:
     return hashlib.md5(key.encode()).hexdigest()[:16]
 
 
+def hash_messages(messages: list) -> str:
+    """Create a stable hash for a multi-turn conversation (must match preprocess script)."""
+    last_user_msg = ""
+    for msg in reversed(messages):
+        if msg.get("role") == "user":
+            last_user_msg = msg.get("content", "")
+            break
+
+    key = f"{last_user_msg[:100]}:{len(messages)}:{len(last_user_msg)}"
+    return hashlib.md5(key.encode()).hexdigest()[:16]
+
+
 def haversine_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     """Calculate great-circle distance between two points in km."""
     R = 6371  # Earth radius in km
@@ -125,6 +143,11 @@ class GeoProxy:
         self.request_count = 0
         self.node_stats: Dict[str, int] = {node[0]: 0 for node in CLUSTER_NODES}
 
+        # Graceful shutdown tracking
+        self.active_requests = 0
+        self.shutting_down = False
+        self._shutdown_event = asyncio.Event()
+
         # Load location lookup
         lookup_path = Path(lookup_file)
         if lookup_path.exists():
@@ -135,138 +158,187 @@ class GeoProxy:
             self.logger.warning(f"Lookup file not found: {lookup_file}")
             self.logger.warning("All requests will use default location (US center)")
 
-    def extract_prompt(self, body: Dict[str, Any]) -> str:
-        """Extract user prompt from request body."""
+    def extract_prompt_and_check_multiturn(self, body: Dict[str, Any]) -> Tuple[str, bool, Optional[list]]:
+        """Extract user prompt from request body and detect multi-turn.
+
+        Returns: (prompt_text, is_multi_turn, parsed_messages)
+        """
         messages = body.get("messages", [])
+
         for msg in messages:
             if msg.get("role") == "user":
                 content = msg.get("content", "")
+
                 # Handle multimodal content (list of parts)
                 if isinstance(content, list):
                     for part in content:
                         if isinstance(part, dict) and part.get("type") == "text":
-                            return part.get("text", "")
-                    return ""
-                return content
-        return ""
+                            content = part.get("text", "")
+                            break
+                    else:
+                        return "", False, None
 
-    def lookup_location(self, prompt: str) -> Dict[str, Any]:
+                # Check if content is a JSON array (multi-turn format)
+                if content.startswith("[") and content.endswith("]"):
+                    try:
+                        parsed = json.loads(content)
+                        if isinstance(parsed, list) and len(parsed) > 0:
+                            # Verify it looks like a messages array
+                            if all(isinstance(m, dict) and "role" in m for m in parsed):
+                                return content, True, parsed
+                    except json.JSONDecodeError:
+                        pass
+
+                return content, False, None
+
+        return "", False, None
+
+    def lookup_location(self, prompt: str, is_multi_turn: bool = False, messages: list = None) -> Dict[str, Any]:
         """Lookup location for a prompt hash."""
-        h = hash_prompt(prompt)
+        if is_multi_turn and messages:
+            h = hash_messages(messages)
+        else:
+            h = hash_prompt(prompt)
         return self.lookup.get(h, DEFAULT_LOCATION)
 
     async def handle_chat_completions(self, request: web.Request) -> web.StreamResponse:
         """Handle /v1/chat/completions with geo-routing."""
+        # Reject new requests during shutdown
+        if self.shutting_down:
+            return web.json_response(
+                {"error": {"message": "Server is shutting down", "type": "server_error"}},
+                status=503
+            )
+
         request_id = str(uuid.uuid4())[:8]
         start_time = time.time()
         self.request_count += 1
+        self.active_requests += 1
 
         try:
-            body = await request.json()
-        except Exception as e:
-            self.logger.error(f"[{request_id}] Failed to parse request body: {e}")
-            return web.json_response(
-                {"error": {"message": str(e), "type": "invalid_request_error"}},
-                status=400
+            try:
+                body = await request.json()
+            except Exception as e:
+                self.logger.error(f"[{request_id}] Failed to parse request body: {e}")
+                return web.json_response(
+                    {"error": {"message": str(e), "type": "invalid_request_error"}},
+                    status=400
+                )
+
+            # Extract prompt and check for multi-turn
+            prompt, is_multi_turn, parsed_messages = self.extract_prompt_and_check_multiturn(body)
+
+            # If multi-turn, reconstruct the request body with proper messages
+            if is_multi_turn and parsed_messages:
+                body["messages"] = parsed_messages
+                self.logger.info(f"[{request_id}] Multi-turn detected: {len(parsed_messages)} messages")
+
+            # Lookup location
+            loc = self.lookup_location(prompt, is_multi_turn, parsed_messages)
+
+            # Find nearest node
+            node_name, node_ip, node_port, distance_km = find_nearest_node(
+                loc["lat"], loc["lon"]
+            )
+            target_url = f"http://{node_ip}:{node_port}/v1/chat/completions"
+
+            self.node_stats[node_name] += 1
+
+            # Log routing decision
+            self.logger.info(
+                f"[{request_id}] Routing to {node_name} | "
+                f"loc=({loc['lat']:.2f}, {loc['lon']:.2f}) | "
+                f"dist={distance_km:.0f}km | "
+                f"country={loc.get('country', 'unknown')}"
             )
 
-        # Extract prompt and lookup location
-        prompt = self.extract_prompt(body)
-        loc = self.lookup_location(prompt)
+            # Forward request
+            ttft = None
+            total_tokens = 0
+            status = "success"
+            error_msg = None
 
-        # Find nearest node
-        node_name, node_ip, node_port, distance_km = find_nearest_node(
-            loc["lat"], loc["lon"]
-        )
-        target_url = f"http://{node_ip}:{node_port}/v1/chat/completions"
+            try:
+                timeout = ClientTimeout(total=REQUEST_TIMEOUT)
+                async with ClientSession(timeout=timeout) as session:
+                    async with session.post(target_url, json=body) as resp:
+                        # Prepare streaming response
+                        response = web.StreamResponse(
+                            status=resp.status,
+                            headers={
+                                "Content-Type": resp.content_type or "text/event-stream",
+                                "Cache-Control": "no-cache",
+                            }
+                        )
+                        await response.prepare(request)
 
-        self.node_stats[node_name] += 1
+                        # Stream response chunks
+                        first_chunk = True
+                        async for chunk in resp.content.iter_any():
+                            if first_chunk:
+                                ttft = time.time() - start_time
+                                first_chunk = False
+                            await response.write(chunk)
+                            total_tokens += 1  # Approximate
 
-        # Log routing decision
-        self.logger.info(
-            f"[{request_id}] Routing to {node_name} | "
-            f"loc=({loc['lat']:.2f}, {loc['lon']:.2f}) | "
-            f"dist={distance_km:.0f}km | "
-            f"country={loc.get('country', 'unknown')}"
-        )
+                        await response.write_eof()
 
-        # Forward request
-        ttft = None
-        total_tokens = 0
-        status = "success"
-        error_msg = None
+            except asyncio.TimeoutError:
+                status = "timeout"
+                error_msg = f"Request timed out after {REQUEST_TIMEOUT}s"
+                if not self.shutting_down:
+                    self.logger.error(f"[{request_id}] {error_msg}")
+                return web.json_response(
+                    {"error": {"message": error_msg, "type": "timeout_error"}},
+                    status=504
+                )
 
-        try:
-            timeout = ClientTimeout(total=REQUEST_TIMEOUT)
-            async with ClientSession(timeout=timeout) as session:
-                async with session.post(target_url, json=body) as resp:
-                    # Prepare streaming response
-                    response = web.StreamResponse(
-                        status=resp.status,
-                        headers={
-                            "Content-Type": resp.content_type or "text/event-stream",
-                            "Cache-Control": "no-cache",
-                        }
-                    )
-                    await response.prepare(request)
+            except Exception as e:
+                status = "error"
+                error_msg = str(e)
+                # Suppress error logging during shutdown to avoid noisy "Server disconnected" messages
+                if not self.shutting_down:
+                    self.logger.error(f"[{request_id}] Request failed: {e}")
+                return web.json_response(
+                    {"error": {"message": str(e), "type": "server_error"}},
+                    status=502
+                )
 
-                    # Stream response chunks
-                    first_chunk = True
-                    async for chunk in resp.content.iter_any():
-                        if first_chunk:
-                            ttft = time.time() - start_time
-                            first_chunk = False
-                        await response.write(chunk)
-                        total_tokens += 1  # Approximate
+            # Log detailed metrics (skip during shutdown to avoid polluting benchmark data)
+            if not self.shutting_down:
+                total_latency = time.time() - start_time
+                log_entry = {
+                    "timestamp": start_time,
+                    "request_id": request_id,
+                    "prompt_hash": hash_prompt(prompt),
+                    "prompt_length": len(prompt),
+                    "user_location": {
+                        "lat": loc["lat"],
+                        "lon": loc["lon"],
+                        "country": loc.get("country"),
+                        "state": loc.get("state"),
+                    },
+                    "routed_to": node_name,
+                    "node_ip": node_ip,
+                    "distance_km": round(distance_km, 1),
+                    "ttft_ms": round(ttft * 1000, 1) if ttft else None,
+                    "total_latency_ms": round(total_latency * 1000, 1),
+                    "status": status,
+                    "error": error_msg,
+                }
 
-                    await response.write_eof()
+                # Write to file logger (JSONL format)
+                file_handler = self.logger.handlers[0]  # File handler
+                file_handler.stream.write(json.dumps(log_entry) + "\n")
+                file_handler.stream.flush()
 
-        except asyncio.TimeoutError:
-            status = "timeout"
-            error_msg = f"Request timed out after {REQUEST_TIMEOUT}s"
-            self.logger.error(f"[{request_id}] {error_msg}")
-            return web.json_response(
-                {"error": {"message": error_msg, "type": "timeout_error"}},
-                status=504
-            )
+            return response
 
-        except Exception as e:
-            status = "error"
-            error_msg = str(e)
-            self.logger.error(f"[{request_id}] Request failed: {e}")
-            return web.json_response(
-                {"error": {"message": str(e), "type": "server_error"}},
-                status=502
-            )
-
-        # Log detailed metrics
-        total_latency = time.time() - start_time
-        log_entry = {
-            "timestamp": start_time,
-            "request_id": request_id,
-            "prompt_hash": hash_prompt(prompt),
-            "prompt_length": len(prompt),
-            "user_location": {
-                "lat": loc["lat"],
-                "lon": loc["lon"],
-                "country": loc.get("country"),
-                "state": loc.get("state"),
-            },
-            "routed_to": node_name,
-            "node_ip": node_ip,
-            "distance_km": round(distance_km, 1),
-            "ttft_ms": round(ttft * 1000, 1) if ttft else None,
-            "total_latency_ms": round(total_latency * 1000, 1),
-            "status": status,
-            "error": error_msg,
-        }
-
-        # Write to file logger (JSONL format)
-        file_handler = self.logger.handlers[0]  # File handler
-        file_handler.stream.write(json.dumps(log_entry) + "\n")
-        file_handler.stream.flush()
-
-        return response
+        finally:
+            # Track request completion for graceful shutdown
+            self.active_requests -= 1
+            if self.shutting_down and self.active_requests == 0:
+                self._shutdown_event.set()
 
     async def handle_models(self, request: web.Request) -> web.Response:
         """Handle /v1/models - forward to first available node."""
@@ -289,11 +361,32 @@ class GeoProxy:
     async def handle_health(self, request: web.Request) -> web.Response:
         """Health check endpoint."""
         return web.json_response({
-            "status": "healthy",
+            "status": "shutting_down" if self.shutting_down else "healthy",
             "request_count": self.request_count,
+            "active_requests": self.active_requests,
             "node_stats": self.node_stats,
             "lookup_size": len(self.lookup),
         })
+
+    async def graceful_shutdown(self) -> None:
+        """Wait for in-flight requests to complete before shutdown."""
+        self.shutting_down = True
+        self.logger.info(f"Graceful shutdown initiated, {self.active_requests} requests in-flight")
+
+        if self.active_requests > 0:
+            self.logger.info(f"Waiting up to {SHUTDOWN_TIMEOUT}s for in-flight requests to complete...")
+            try:
+                await asyncio.wait_for(
+                    self._shutdown_event.wait(),
+                    timeout=SHUTDOWN_TIMEOUT
+                )
+                self.logger.info("All in-flight requests completed")
+            except asyncio.TimeoutError:
+                self.logger.warning(
+                    f"Shutdown timeout reached with {self.active_requests} requests still in-flight"
+                )
+        else:
+            self.logger.info("No in-flight requests, shutting down immediately")
 
     def create_app(self) -> web.Application:
         """Create the aiohttp application."""
@@ -301,6 +394,10 @@ class GeoProxy:
         app.router.add_post("/v1/chat/completions", self.handle_chat_completions)
         app.router.add_get("/v1/models", self.handle_models)
         app.router.add_get("/health", self.handle_health)
+
+        # Register graceful shutdown handler
+        app.on_shutdown.append(lambda _: self.graceful_shutdown())
+
         return app
 
 
@@ -309,6 +406,8 @@ class GeoProxy:
 # =============================================================================
 
 def main():
+    global SHUTDOWN_TIMEOUT
+
     parser = argparse.ArgumentParser(
         description="Geo-routing proxy for GuideLLM benchmarks"
     )
@@ -324,7 +423,14 @@ def main():
         "--log-file", type=str, default="geo_proxy_routing.log",
         help="Path to routing log file (JSONL format)"
     )
+    parser.add_argument(
+        "--shutdown-timeout", type=int, default=30,
+        help="Max seconds to wait for in-flight requests during shutdown (default: 30)"
+    )
     args = parser.parse_args()
+
+    # Update global shutdown timeout
+    SHUTDOWN_TIMEOUT = args.shutdown_timeout
 
     print("""
 ╔══════════════════════════════════════════════════════════════╗
@@ -341,12 +447,15 @@ def main():
 
     print(f"Starting proxy on http://localhost:{args.port}")
     print(f"Routing log: {args.log_file}")
+    print(f"Graceful shutdown timeout: {SHUTDOWN_TIMEOUT}s")
     print()
     print("GuideLLM usage:")
     print(f"  guidellm benchmark --target http://localhost:{args.port}/v1 ...")
     print()
 
-    web.run_app(app, port=args.port, print=None)
+    # Run with graceful shutdown support
+    # aiohttp's run_app handles SIGINT/SIGTERM and triggers on_shutdown handlers
+    web.run_app(app, port=args.port, print=None, handle_signals=True)
 
 
 if __name__ == "__main__":
