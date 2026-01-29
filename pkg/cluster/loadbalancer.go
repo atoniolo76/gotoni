@@ -119,6 +119,29 @@ type GORGONode struct {
 
 const GORGO_MS_PER_TOKEN = 0.094 // Cold-start prefill rate on 8xA100 with Mistral-7B
 
+// GORGO2 constants
+const GORGO2_RUNNING_COST_FACTOR = 0.5 // Running requests cost less (already partially processed)
+
+// GORGO2Policy extends GORGO by comparing local queue cost vs peer costs
+type GORGO2Policy struct {
+	mu   sync.RWMutex
+	root *GORGONode        // Reuse GORGONode for prefix tree
+	lb   *LoadBalancer     // Reference to access running/queued request data
+}
+
+// runningRequest tracks a request currently being processed locally
+type runningRequest struct {
+	requestID  string
+	tokenCount int
+	startedAt  time.Time
+}
+
+// prefixMatch represents a matched prefix in the tree with available peers
+type prefixMatch struct {
+	matchedPrefix string
+	peers         []*PeerNode
+}
+
 type AvailabilityStatus struct {
 	Available       bool
 	RunningRequests int     // Actual requests in GPU batch (from SGLang)
@@ -189,6 +212,265 @@ func countGORGONodes(n *GORGONode) int {
 		count += countGORGONodes(child)
 	}
 	return count
+}
+
+// =====================================================
+// GORGO2 HELPER FUNCTIONS
+// =====================================================
+
+// extractPromptFromBody parses the request body to extract the prompt text
+// Supports OpenAI chat completions format and legacy completions format
+func extractPromptFromBody(bodyBytes []byte) string {
+	if len(bodyBytes) == 0 {
+		return ""
+	}
+
+	// Try chat completions format: {"messages": [{"role": "user", "content": "..."}]}
+	var chatReq struct {
+		Messages []struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(bodyBytes, &chatReq); err == nil && len(chatReq.Messages) > 0 {
+		var builder strings.Builder
+		for _, msg := range chatReq.Messages {
+			builder.WriteString(msg.Content)
+			builder.WriteString(" ")
+		}
+		return strings.TrimSpace(builder.String())
+	}
+
+	// Try legacy completions format: {"prompt": "..."}
+	var legacyReq struct {
+		Prompt string `json:"prompt"`
+	}
+	if err := json.Unmarshal(bodyBytes, &legacyReq); err == nil && legacyReq.Prompt != "" {
+		return legacyReq.Prompt
+	}
+
+	// Fallback: return empty (can't parse)
+	return ""
+}
+
+// preCalculateTokenCount extracts prompt and computes token count
+// Returns the token count and the extracted prompt text
+func preCalculateTokenCount(bodyBytes []byte) (int, string) {
+	prompt := extractPromptFromBody(bodyBytes)
+	if prompt == "" {
+		return 0, ""
+	}
+	tokenCount := GetTokenCount(prompt)
+	return tokenCount, prompt
+}
+
+// trackRunningRequest adds a request to running tracking (for GORGO2)
+func (lb *LoadBalancer) trackRunningRequest(requestID string, tokenCount int) {
+	lb.runningRequestsMu.Lock()
+	defer lb.runningRequestsMu.Unlock()
+	if lb.runningRequests == nil {
+		lb.runningRequests = make(map[string]*runningRequest)
+	}
+	lb.runningRequests[requestID] = &runningRequest{
+		requestID:  requestID,
+		tokenCount: tokenCount,
+		startedAt:  time.Now(),
+	}
+}
+
+// untrackRunningRequest removes a request from running tracking (for GORGO2)
+func (lb *LoadBalancer) untrackRunningRequest(requestID string) {
+	lb.runningRequestsMu.Lock()
+	defer lb.runningRequestsMu.Unlock()
+	if lb.runningRequests != nil {
+		delete(lb.runningRequests, requestID)
+	}
+}
+
+// =====================================================
+// GORGO2 POLICY IMPLEMENTATION
+// =====================================================
+
+// NewGORGO2Policy creates a new GORGO2 policy with a reference to the load balancer
+func NewGORGO2Policy(lb *LoadBalancer) *GORGO2Policy {
+	return &GORGO2Policy{
+		root: &GORGONode{
+			children: make(map[byte]*GORGONode),
+			peers:    []*PeerNode{},
+			prefix:   "",
+		},
+		lb: lb,
+	}
+}
+
+// ClearCache resets the GORGO2 prefix tree to empty
+func (p *GORGO2Policy) ClearCache() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	count := countGORGONodes(p.root)
+	p.root = &GORGONode{
+		children: make(map[byte]*GORGONode),
+		peers:    []*PeerNode{},
+		prefix:   "",
+	}
+	return count
+}
+
+// Select implements LoadBalancingStrategy for GORGO2
+// Compares local cost (running + queued requests) vs peer costs
+// Returns nil if local is cheaper (keep locally), otherwise returns best peer
+func (p *GORGO2Policy) Select(peers []*PeerNode, availabilityMap map[*PeerNode]AvailabilityStatus, requestPath string) *PeerNode {
+	if len(requestPath) == 0 {
+		return nil
+	}
+
+	// Calculate total token count for this request
+	totalTokens := GetTokenCount(requestPath)
+
+	// 1. Calculate local node cost
+	localCost := p.calculateLocalCost(requestPath, totalTokens)
+
+	// 2. Calculate peer costs using GORGO logic (latency + unmatched prefill)
+	lowestPeerCost := float64(1<<62) // Large initial value
+	var bestPeer *PeerNode
+
+	// Find prefix matches in the tree
+	matches := p.findPrefixMatches(requestPath, availabilityMap)
+
+	for _, match := range matches {
+		unmatchedText := requestPath[len(match.matchedPrefix):]
+		unmatchedTokens := GetTokenCount(unmatchedText)
+
+		for _, peer := range match.peers {
+			prefillCost := float64(unmatchedTokens) * GORGO_MS_PER_TOKEN
+			totalPeerCost := float64(peer.Metrics.Latency) + prefillCost
+
+			if totalPeerCost < lowestPeerCost {
+				lowestPeerCost = totalPeerCost
+				bestPeer = peer
+			}
+		}
+	}
+
+	// 3. If no peers in tree, evaluate all available peers with cold-start cost
+	if bestPeer == nil && len(peers) > 0 {
+		for _, peer := range peers {
+			status, ok := availabilityMap[peer]
+			if !ok || !status.Available || !status.Healthy {
+				continue
+			}
+			// Cold-start: full prefill cost
+			prefillCost := float64(totalTokens) * GORGO_MS_PER_TOKEN
+			totalPeerCost := float64(peer.Metrics.Latency) + prefillCost
+
+			if totalPeerCost < lowestPeerCost {
+				lowestPeerCost = totalPeerCost
+				bestPeer = peer
+			}
+		}
+	}
+
+	// 4. Compare local vs best peer
+	// Return nil means "keep locally" (process or queue)
+	if bestPeer == nil || localCost <= lowestPeerCost {
+		return nil // Local is cheaper or equal - process/queue locally
+	}
+
+	return bestPeer // Peer is cheaper - forward to peer
+}
+
+// calculateLocalCost computes the estimated cost of processing this request locally
+// Cost = sum(running request costs) + sum(queued request costs) + incoming request cost
+func (p *GORGO2Policy) calculateLocalCost(requestPath string, requestTokens int) float64 {
+	if p.lb == nil {
+		return 0
+	}
+
+	var totalCost float64
+
+	// Cost from running requests: 0.5 * MS_PER_TOKEN * tokens
+	// Lower factor because running requests are already partially processed
+	p.lb.runningRequestsMu.RLock()
+	for _, running := range p.lb.runningRequests {
+		totalCost += GORGO2_RUNNING_COST_FACTOR * GORGO_MS_PER_TOKEN * float64(running.tokenCount)
+	}
+	p.lb.runningRequestsMu.RUnlock()
+
+	// Cost from queued requests: MS_PER_TOKEN * tokens
+	// Use pre-calculated token counts to avoid expensive operations under lock
+	// Copy queue length and aggregate token count quickly, then release lock
+	p.lb.queueMu.Lock()
+	queuedTokens := 0
+	for _, qr := range p.lb.queue {
+		// Use pre-calculated token count (stored when request was enqueued)
+		if qr.tokenCount > 0 {
+			queuedTokens += qr.tokenCount
+		} else {
+			// Fallback: estimate based on body size (4 chars/token)
+			queuedTokens += (len(qr.bodyBytes) + 3) / 4
+		}
+	}
+	p.lb.queueMu.Unlock()
+
+	totalCost += GORGO_MS_PER_TOKEN * float64(queuedTokens)
+
+	// Add cost for the incoming request itself
+	totalCost += GORGO_MS_PER_TOKEN * float64(requestTokens)
+
+	return totalCost
+}
+
+// findPrefixMatches finds all prefix matches for a request path in the tree
+func (p *GORGO2Policy) findPrefixMatches(requestPath string, availabilityMap map[*PeerNode]AvailabilityStatus) []prefixMatch {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	matches := []prefixMatch{}
+	if p.root == nil {
+		return matches
+	}
+
+	currentNode := p.root
+	i := 0
+	matchedSoFar := ""
+
+	for i < len(requestPath) {
+		currentChar := requestPath[i]
+		remainingText := requestPath[i:]
+		lookup, ok := currentNode.children[currentChar]
+		if !ok {
+			break
+		}
+
+		currentNode = lookup
+		sharedLen := sharedPrefixLength(remainingText, lookup.prefix)
+		if sharedLen > len(lookup.prefix) {
+			sharedLen = len(lookup.prefix)
+		}
+		matchedSoFar += lookup.prefix[:sharedLen]
+		i += sharedLen
+
+		// Check for available peers at this node
+		availablePeers := []*PeerNode{}
+		for _, peerNode := range lookup.peers {
+			if status, ok := availabilityMap[peerNode]; ok && status.Available && status.Healthy {
+				availablePeers = append(availablePeers, peerNode)
+			}
+		}
+
+		if len(availablePeers) > 0 {
+			matches = append(matches, prefixMatch{
+				matchedPrefix: matchedSoFar,
+				peers:         availablePeers,
+			})
+		}
+
+		if sharedLen < len(lookup.prefix) {
+			break
+		}
+	}
+
+	return matches
 }
 
 func (p *GORGOPolicy) Select(peers []*PeerNode, availabilityMap map[*PeerNode]AvailabilityStatus, requestPath string) *PeerNode {
@@ -467,6 +749,8 @@ type queuedRequest struct {
 	enqueuedAt time.Time
 	requestID  string // For tracing
 	bodyBytes  []byte // Cached body for potential forwarding
+	tokenCount int    // Pre-calculated token count for GORGO2
+	prompt     string // Extracted prompt text for GORGO2 prefix matching
 }
 
 // LoadBalancer is a distributed load balancer instance for a single node
@@ -490,6 +774,10 @@ type LoadBalancer struct {
 	// Request queue (unbounded slice-based queue)
 	queue   []*queuedRequest
 	queueMu sync.Mutex
+
+	// Running request tracking for GORGO2
+	runningRequests   map[string]*runningRequest
+	runningRequestsMu sync.RWMutex
 
 	// HTTP clients
 	httpClient *http.Client
@@ -547,10 +835,11 @@ func NewLoadBalancer(cfg *LoadBalancerConfig, self *remote.RunningInstance) *Loa
 				IdleConnTimeout:     config.DefaultIdleConnTimeout,
 			},
 		},
-		localProxy: localProxy,
-		tracer:     tracer,
-		ctx:        ctx,
-		cancel:     cancel,
+		localProxy:      localProxy,
+		tracer:          tracer,
+		ctx:             ctx,
+		cancel:          cancel,
+		runningRequests: make(map[string]*runningRequest), // For GORGO2
 	}
 
 	if cfg.QueueEnabled {
@@ -690,21 +979,40 @@ func (lb *LoadBalancer) Handler() http.Handler {
 
 		requestID := fmt.Sprintf("%d", time.Now().UnixNano())
 		wrappedWriter := &responseWriterWrapper{ResponseWriter: w, statusCode: 200}
-		
+
 		// Parse Hop Count
 		hops := 0
 		if hopStr := r.Header.Get("X-LB-Hop"); hopStr != "" {
 			fmt.Sscanf(hopStr, "%d", &hops)
 		}
 
+		// Pre-calculate token count for GORGO2 (read body early)
+		var bodyBytes []byte
+		var tokenCount int
+		var prompt string
+		if r.Body != nil {
+			bodyBytes, _ = io.ReadAll(r.Body)
+			r.Body.Close()
+			r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+			tokenCount, prompt = preCalculateTokenCount(bodyBytes)
+		}
+
 		lb.tracer.TraceRequestReceived(requestID, r.Method, r.URL.Path, r.RemoteAddr)
+
+		// For GORGO2: use prompt for routing decision instead of URL path
+		requestPath := r.URL.Path
+		if _, isGORGO2 := lb.strategy.(*GORGO2Policy); isGORGO2 && prompt != "" {
+			requestPath = prompt
+		}
 
 		hasCapacity := lb.localHasCapacity()
 
 		// A: Process locally if we have capacity
 		if hasCapacity {
+			lb.trackRunningRequest(requestID, tokenCount)
 			lb.tracer.TraceLocalProcessStart(requestID)
 			lb.localProxy.ServeHTTP(wrappedWriter, r)
+			lb.untrackRunningRequest(requestID)
 			lb.tracer.TraceRequestComplete(requestID, wrappedWriter.statusCode, "local")
 			return
 		}
@@ -712,15 +1020,27 @@ func (lb *LoadBalancer) Handler() http.Handler {
 		// B: Try to forward ONLY if we haven't exceeded MaxHops
 		if hops < config.MaxHops {
 			log.Printf("[LB] Request %s: local full, forwarding (current hops: %d)", requestID, hops)
-			if lb.forwardToPeer(wrappedWriter, r, requestID, hops+1) {
-				lb.tracer.TraceRequestComplete(requestID, wrappedWriter.statusCode, "peer")
-				return
+			// For GORGO2: consult strategy with prompt-based requestPath
+			targetPeer := lb.selectPeer(requestPath)
+			if targetPeer != nil {
+				// Pass pre-selected peer to avoid double selection
+				if lb.forwardToTargetPeer(wrappedWriter, r, requestID, hops+1, targetPeer, bodyBytes) {
+					lb.tracer.TraceRequestComplete(requestID, wrappedWriter.statusCode, "peer")
+					return
+				}
+			} else if _, isGORGO2 := lb.strategy.(*GORGO2Policy); !isGORGO2 {
+				// Non-GORGO2: try forward without explicit peer selection (uses URL path)
+				if lb.forwardToPeer(wrappedWriter, r, requestID, hops+1) {
+					lb.tracer.TraceRequestComplete(requestID, wrappedWriter.statusCode, "peer")
+					return
+				}
 			}
+			// For GORGO2: nil from selectPeer means "keep locally"
 		}
 
 		// C: Queue locally (Mandatory if already pushed or no peers available)
 		if lb.config.QueueEnabled {
-			if lb.enqueueRequest(wrappedWriter, r, requestID) {
+			if lb.enqueueRequestWithTokens(wrappedWriter, r, requestID, bodyBytes, tokenCount, prompt) {
 				lb.tracer.TraceRequestComplete(requestID, wrappedWriter.statusCode, "queue")
 			}
 			return
@@ -805,79 +1125,88 @@ func (lb *LoadBalancer) localHasCapacity() bool {
 }
 
 func (lb *LoadBalancer) forwardToPeer(w http.ResponseWriter, r *http.Request, requestID string, nextHop int) bool {
-    // Select peer using strategy
-    peer := lb.selectPeer(r.URL.Path)
-    if peer == nil {
-        log.Printf("[LB] No available peer for request %s", requestID)
-        return false
-    }
+	// Select peer using strategy (uses URL path for non-GORGO2)
+	peer := lb.selectPeer(r.URL.Path)
+	if peer == nil {
+		log.Printf("[LB] No available peer for request %s", requestID)
+		return false
+	}
+	return lb.forwardToTargetPeer(w, r, requestID, nextHop, peer, nil)
+}
 
-    // Build target URL
-    targetURL := fmt.Sprintf("http://%s:%d%s", peer.Instance.IP, peer.Port, r.URL.Path)
-    if r.URL.RawQuery != "" {
-        targetURL += "?" + r.URL.RawQuery
-    }
+// forwardToTargetPeer forwards a request to a specific pre-selected peer
+// If bodyBytes is nil, it will read from r.Body
+func (lb *LoadBalancer) forwardToTargetPeer(w http.ResponseWriter, r *http.Request, requestID string, nextHop int, peer *PeerNode, bodyBytes []byte) bool {
+	if peer == nil {
+		log.Printf("[LB] No peer provided for request %s", requestID)
+		return false
+	}
 
-    // Read and cache body for forwarding
-    var bodyBytes []byte
-    if r.Body != nil {
-        bodyBytes, _ = io.ReadAll(r.Body)
-        r.Body.Close()
-        r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-    }
+	// Build target URL
+	targetURL := fmt.Sprintf("http://%s:%d%s", peer.Instance.IP, peer.Port, r.URL.Path)
+	if r.URL.RawQuery != "" {
+		targetURL += "?" + r.URL.RawQuery
+	}
 
-    // Create forwarded request with timeout
-    ctx, cancel := context.WithTimeout(r.Context(), lb.config.RequestTimeout)
-    defer cancel()
+	// Read and cache body for forwarding (if not already provided)
+	if bodyBytes == nil && r.Body != nil {
+		bodyBytes, _ = io.ReadAll(r.Body)
+		r.Body.Close()
+		r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+	}
 
-    forwardReq, err := http.NewRequestWithContext(ctx, r.Method, targetURL, bytes.NewReader(bodyBytes))
-    if err != nil {
-        log.Printf("[LB] Failed to create forward request for %s: %v", requestID, err)
-        return false
-    }
+	// Create forwarded request with timeout
+	ctx, cancel := context.WithTimeout(r.Context(), lb.config.RequestTimeout)
+	defer cancel()
 
-    // Copy original headers
-    for key, values := range r.Header {
-        for _, value := range values {
-            forwardReq.Header.Add(key, value)
-        }
-    }
+	forwardReq, err := http.NewRequestWithContext(ctx, r.Method, targetURL, bytes.NewReader(bodyBytes))
+	if err != nil {
+		log.Printf("[LB] Failed to create forward request for %s: %v", requestID, err)
+		return false
+	}
 
-    // Set routing headers
-    forwardReq.Header.Set("X-Forwarded-For", r.RemoteAddr)
-    forwardReq.Header.Set("X-LB-Hop", fmt.Sprintf("%d", nextHop))
-    forwardReq.Header.Set("X-Request-ID", requestID)
+	// Copy original headers
+	for key, values := range r.Header {
+		for _, value := range values {
+			forwardReq.Header.Add(key, value)
+		}
+	}
 
-    // Trace forward start
-    lb.tracer.TraceForwardStart(requestID, peer.Instance.ID, peer.Instance.IP)
+	// Set routing headers
+	forwardReq.Header.Set("X-Forwarded-For", r.RemoteAddr)
+	forwardReq.Header.Set("X-LB-Hop", fmt.Sprintf("%d", nextHop))
+	forwardReq.Header.Set("X-Request-ID", requestID)
 
-    // Execute request
-    forwardStart := time.Now()
-    resp, err := lb.httpClient.Do(forwardReq)
-    forwardDuration := time.Since(forwardStart)
+	// Trace forward start
+	lb.tracer.TraceForwardStart(requestID, peer.Instance.ID, peer.Instance.IP)
 
-    if err != nil {
-        log.Printf("[LB] Failed to forward request %s to peer: %v", requestID, err)
-        lb.tracer.TraceForwardEnd(requestID, 0, float64(forwardDuration.Milliseconds()))
-        return false
-    }
-    defer resp.Body.Close()
+	// Execute request
+	forwardStart := time.Now()
+	resp, err := lb.httpClient.Do(forwardReq)
+	forwardDuration := time.Since(forwardStart)
 
-    // Trace forward completion
-    lb.tracer.TraceForwardEnd(requestID, resp.StatusCode, float64(forwardDuration.Milliseconds()))
+	if err != nil {
+		log.Printf("[LB] Failed to forward request %s to peer: %v", requestID, err)
+		lb.tracer.TraceForwardEnd(requestID, 0, float64(forwardDuration.Milliseconds()))
+		return false
+	}
+	defer resp.Body.Close()
 
-    // Copy response back to original writer
-    for key, values := range resp.Header {
-        for _, value := range values {
-            w.Header().Add(key, value)
-        }
-    }
-    w.WriteHeader(resp.StatusCode)
-    io.Copy(w, resp.Body)
+	// Trace forward completion
+	lb.tracer.TraceForwardEnd(requestID, resp.StatusCode, float64(forwardDuration.Milliseconds()))
 
-    log.Printf("[LB] Successfully forwarded request %s to %s (status: %d, duration: %v)",
-        requestID, peer.Instance.IP, resp.StatusCode, forwardDuration)
-    return true
+	// Copy response back to original writer
+	for key, values := range resp.Header {
+		for _, value := range values {
+			w.Header().Add(key, value)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	io.Copy(w, resp.Body)
+
+	log.Printf("[LB] Successfully forwarded request %s to %s (status: %d, duration: %v)",
+		requestID, peer.Instance.IP, resp.StatusCode, forwardDuration)
+	return true
 }
 
 // selectPeer selects a peer using the configured strategy
@@ -896,6 +1225,11 @@ func (lb *LoadBalancer) selectPeer(requestPath string) *PeerNode {
 // enqueueRequest adds a request to the queue
 // Returns false if the queue is full (all cluster capacity exhausted)
 func (lb *LoadBalancer) enqueueRequest(w http.ResponseWriter, r *http.Request, requestID string) bool {
+	return lb.enqueueRequestWithTokens(w, r, requestID, nil, 0, "")
+}
+
+// enqueueRequestWithTokens adds a request to the queue with pre-calculated token count (for GORGO2)
+func (lb *LoadBalancer) enqueueRequestWithTokens(w http.ResponseWriter, r *http.Request, requestID string, bodyBytes []byte, tokenCount int, prompt string) bool {
 	// Check max queue size before adding
 	lb.queueMu.Lock()
 	if lb.config.MaxQueueSize > 0 && len(lb.queue) >= lb.config.MaxQueueSize {
@@ -906,9 +1240,8 @@ func (lb *LoadBalancer) enqueueRequest(w http.ResponseWriter, r *http.Request, r
 		return false
 	}
 
-	// Read and cache body for potential forwarding later
-	var bodyBytes []byte
-	if r.Body != nil {
+	// Read and cache body for potential forwarding later (if not already provided)
+	if bodyBytes == nil && r.Body != nil {
 		bodyBytes, _ = io.ReadAll(r.Body)
 		r.Body.Close()
 		// Replace body so local proxy can still read it
@@ -922,13 +1255,15 @@ func (lb *LoadBalancer) enqueueRequest(w http.ResponseWriter, r *http.Request, r
 		enqueuedAt: time.Now(),
 		requestID:  requestID,
 		bodyBytes:  bodyBytes,
+		tokenCount: tokenCount, // Pre-calculated for GORGO2
+		prompt:     prompt,     // Extracted prompt for GORGO2
 	}
 
 	lb.queue = append(lb.queue, qr)
 	queueSize := len(lb.queue)
 	lb.queueMu.Unlock()
 
-	log.Printf("[LB] Request %s queued (queue size: %d/%d)", requestID, queueSize, lb.config.MaxQueueSize)
+	log.Printf("[LB] Request %s queued (queue size: %d/%d, tokens: %d)", requestID, queueSize, lb.config.MaxQueueSize, tokenCount)
 
 	// Wait for processing or timeout
 	select {
@@ -970,44 +1305,66 @@ func (lb *LoadBalancer) processQueue() {
 }
 
 func (lb *LoadBalancer) processQueuedRequests() {
-    // ... (Initial setup) ...
+	for {
+		lb.queueMu.Lock()
+		if len(lb.queue) == 0 {
+			lb.queueMu.Unlock()
+			break
+		}
+		qr := lb.queue[0]
 
-    for {
-        lb.queueMu.Lock()
-        if len(lb.queue) == 0 { lb.queueMu.Unlock(); break }
-        qr := lb.queue[0]
+		// Parse Hops for this specific queued request
+		hops := 0
+		if hopStr := qr.r.Header.Get("X-LB-Hop"); hopStr != "" {
+			fmt.Sscanf(hopStr, "%d", &hops)
+		}
 
-        // Parse Hops for this specific queued request
-        hops := 0
-        if hopStr := qr.r.Header.Get("X-LB-Hop"); hopStr != "" {
-            fmt.Sscanf(hopStr, "%d", &hops)
-        }
+		// For GORGO2: use prompt for peer selection
+		requestPath := qr.r.URL.Path
+		if _, isGORGO2 := lb.strategy.(*GORGO2Policy); isGORGO2 && qr.prompt != "" {
+			requestPath = qr.prompt
+		}
 
-        // Try to forward (only if below MaxHops)
-        if hops < config.MaxHops {
-            peer := lb.selectPeer(qr.r.URL.Path)
-            if peer != nil {
-                lb.queue = lb.queue[1:]
-                lb.queueMu.Unlock()
+		// Try to forward (only if below MaxHops)
+		if hops < config.MaxHops {
+			peer := lb.selectPeer(requestPath)
+			if peer != nil {
+				lb.queue = lb.queue[1:]
+				lb.queueMu.Unlock()
 
-                if lb.forwardQueuedRequest(qr, peer, hops+1) {
-                    close(qr.done)
-                } else {
-                    // Re-queue logic...
-                }
-                continue
-            }
-        }
+				if lb.forwardQueuedRequest(qr, peer, hops+1) {
+					close(qr.done)
+				} else {
+					// Forward failed, re-queue at the back
+					lb.queueMu.Lock()
+					lb.queue = append(lb.queue, qr)
+					lb.queueMu.Unlock()
+				}
+				continue
+			}
+		}
 
-        // Try local if forwarding isn't an option
-        if lb.localHasCapacity() {
-            // ... process locally ...
-            continue
-        }
+		// Try local if forwarding isn't an option
+		if lb.localHasCapacity() {
+			lb.queue = lb.queue[1:]
+			lb.queueMu.Unlock()
 
-        lb.queueMu.Unlock()
-        break
-    }
+			// Track running request for GORGO2
+			lb.trackRunningRequest(qr.requestID, qr.tokenCount)
+
+			// Process locally
+			lb.tracer.TraceLocalProcessStart(qr.requestID)
+			lb.localProxy.ServeHTTP(qr.w, qr.r)
+			lb.tracer.TraceLocalProcessEnd(qr.requestID, 200) // Assume success
+
+			lb.untrackRunningRequest(qr.requestID)
+			close(qr.done)
+			continue
+		}
+
+		lb.queueMu.Unlock()
+		break
+	}
 }
 
 // forwardQueuedRequest forwards a queued request to a peer
@@ -1197,6 +1554,8 @@ func (lb *LoadBalancer) getStrategyName() string {
 		return "prefix-tree"
 	case *GORGOPolicy:
 		return "gorgo"
+	case *GORGO2Policy:
+		return "gorgo2"
 	default:
 		return "unknown"
 	}
@@ -1296,7 +1655,7 @@ func (lb *LoadBalancer) handleConfigEndpoint(w http.ResponseWriter, r *http.Requ
 func (lb *LoadBalancer) handlePolicyEndpoint(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
-	availablePolicies := []string{"least-loaded", "prefix-tree", "gorgo"}
+	availablePolicies := []string{"least-loaded", "prefix-tree", "gorgo", "gorgo2"}
 
 	if r.Method == http.MethodGet {
 		// Also check query parameter for quick switching: /lb/policy?set=gorgo
@@ -1377,8 +1736,10 @@ func (lb *LoadBalancer) SetStrategy(name string) error {
 				prefix:   "",
 			},
 		}
+	case "gorgo2":
+		newStrategy = NewGORGO2Policy(lb)
 	default:
-		return fmt.Errorf("unknown policy: %s (available: least-loaded, prefix-tree, gorgo)", name)
+		return fmt.Errorf("unknown policy: %s (available: least-loaded, prefix-tree, gorgo, gorgo2)", name)
 	}
 
 	lb.peersMu.Lock()
@@ -1662,6 +2023,8 @@ func (lb *LoadBalancer) handleCacheClearEndpoint(w http.ResponseWriter, r *http.
 	case *PrefixTreePolicy:
 		cleared = strategy.ClearCache()
 	case *GORGOPolicy:
+		cleared = strategy.ClearCache()
+	case *GORGO2Policy:
 		cleared = strategy.ClearCache()
 	default:
 		json.NewEncoder(w).Encode(map[string]interface{}{
