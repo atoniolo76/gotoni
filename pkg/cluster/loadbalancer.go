@@ -1008,8 +1008,44 @@ func (lb *LoadBalancer) Stop() {
 
 func (lb *LoadBalancer) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// ... (Keep management endpoints the same as before) ...
+		// Route management endpoints first
+		switch r.URL.Path {
+		case "/lb/status":
+			lb.handleStatusEndpoint(w, r)
+			return
+		case "/lb/health":
+			lb.handleHealthEndpoint(w, r)
+			return
+		case "/lb/metrics":
+			lb.handleMetricsEndpoint(w, r)
+			return
+		case "/lb/config":
+			lb.handleConfigEndpoint(w, r)
+			return
+		case "/lb/policy":
+			lb.handlePolicyEndpoint(w, r)
+			return
+		case "/lb/tokenizer":
+			lb.handleTokenizerEndpoint(w, r)
+			return
+		case "/lb/peers":
+			lb.handlePeersEndpoint(w, r)
+			return
+		case "/lb/trace/start":
+			lb.handleTraceStartEndpoint(w, r)
+			return
+		case "/lb/trace/stop":
+			lb.handleTraceStopEndpoint(w, r)
+			return
+		case "/lb/trace/status":
+			lb.handleTraceStatusEndpoint(w, r)
+			return
+		case "/lb/cache/clear":
+			lb.handleCacheClearEndpoint(w, r)
+			return
+		}
 
+		// Regular request processing
 		requestID := fmt.Sprintf("%d", time.Now().UnixNano())
 		wrappedWriter := &responseWriterWrapper{ResponseWriter: w, statusCode: 200}
 

@@ -2,17 +2,22 @@
 
 This script:
 1. Loads WildChat-1M dataset from HuggingFace
-2. Extracts first user message as prompt for each conversation
-3. Computes a hash for each prompt
+2. Extracts conversations (single-turn or multi-turn)
+3. Computes a hash for each prompt/conversation
 4. Creates a lookup table mapping hash -> user location (lat, lon)
 5. Outputs:
    - wildchat_guidellm.jsonl: Prompts for GuideLLM
    - wildchat_location_lookup.json: Hash -> location mapping for geo-proxy
+
+Multi-turn mode:
+   - Each conversation turn becomes a separate entry
+   - Full message history is preserved up to each turn
+   - Messages are stored as JSON for the geo_proxy to parse
 """
 import argparse
 import hashlib
 import json
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import datasets
 
@@ -149,6 +154,145 @@ def hash_prompt(text: str) -> str:
     return hashlib.md5(key.encode()).hexdigest()[:16]
 
 
+def hash_messages(messages: List[Dict[str, str]]) -> str:
+    """Create a stable hash for a multi-turn conversation.
+
+    Uses the last user message + total message count for uniqueness.
+    """
+    # Find last user message
+    last_user_msg = ""
+    for msg in reversed(messages):
+        if msg.get("role") == "user":
+            last_user_msg = msg.get("content", "")
+            break
+
+    key = f"{last_user_msg[:100]}:{len(messages)}:{len(last_user_msg)}"
+    return hashlib.md5(key.encode()).hexdigest()[:16]
+
+
+def process_single_turn(ds, min_prompt_length: int) -> Tuple[List[Dict], Dict, Dict[str, int]]:
+    """Process dataset in single-turn mode (first user message only)."""
+    prompts = []
+    lookup = {}
+    location_stats: Dict[str, int] = {}
+
+    for item in ds:
+        conv = item.get("conversation", [])
+        if not conv:
+            continue
+
+        # Find first user message
+        prompt = None
+        for msg in conv:
+            if msg.get("role") == "user":
+                prompt = msg.get("content", "")
+                break
+
+        if not prompt or len(prompt) < min_prompt_length:
+            continue
+
+        # Get location data
+        country = item.get("country", "United States")
+        state = item.get("state")
+        lat, lon = get_location_coords(country, state)
+
+        # Compute hash
+        h = hash_prompt(prompt)
+
+        # Track location distribution
+        loc_key = state if state and state in LOCATION_COORDS else country
+        location_stats[loc_key] = location_stats.get(loc_key, 0) + 1
+
+        # Store mapping
+        lookup[h] = {"lat": lat, "lon": lon, "country": country, "state": state}
+        prompts.append({"prompt": prompt, "hash": h})
+
+    return prompts, lookup, location_stats
+
+
+def process_multi_turn(
+    ds,
+    min_prompt_length: int,
+    min_turns: int = 2,
+    max_turns: Optional[int] = None
+) -> Tuple[List[Dict], Dict, Dict[str, int]]:
+    """Process dataset in multi-turn mode (full conversation history per turn).
+
+    Each turn in a conversation becomes a separate entry with the full
+    message history up to that point.
+    """
+    prompts = []
+    lookup = {}
+    location_stats: Dict[str, int] = {}
+
+    for item in ds:
+        conv = item.get("conversation", [])
+        if not conv:
+            continue
+
+        # Get location data
+        country = item.get("country", "United States")
+        state = item.get("state")
+        lat, lon = get_location_coords(country, state)
+
+        # Track location
+        loc_key = state if state and state in LOCATION_COORDS else country
+        location_stats[loc_key] = location_stats.get(loc_key, 0) + 1
+
+        # Build conversation turns
+        # A "turn" ends when we have a user message followed by assistant response
+        messages_so_far = []
+        turn_count = 0
+
+        for i, msg in enumerate(conv):
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+
+            if role not in ("user", "assistant"):
+                continue
+
+            messages_so_far.append({"role": role, "content": content})
+
+            # A complete turn is user -> assistant
+            # We want to send requests at each user message (before assistant responds)
+            if role == "user" and len(content) >= min_prompt_length:
+                turn_count += 1
+
+                # Skip if below minimum turns
+                if turn_count < min_turns:
+                    continue
+
+                # Skip if above maximum turns
+                if max_turns and turn_count > max_turns:
+                    break
+
+                # Create entry with messages up to this point
+                # (excluding any assistant response that follows)
+                messages_for_entry = messages_so_far.copy()
+
+                # Compute hash based on conversation state
+                h = hash_messages(messages_for_entry)
+
+                # Store mapping
+                lookup[h] = {
+                    "lat": lat,
+                    "lon": lon,
+                    "country": country,
+                    "state": state
+                }
+
+                # Store as JSON string for GuideLLM
+                # The geo_proxy will detect and parse this
+                prompts.append({
+                    "prompt": json.dumps(messages_for_entry),
+                    "hash": h,
+                    "turn": turn_count,
+                    "is_multi_turn": True
+                })
+
+    return prompts, lookup, location_stats
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Preprocess WildChat for GuideLLM with geo-routing"
@@ -165,6 +309,18 @@ def main():
         "--min-prompt-length", type=int, default=10,
         help="Minimum prompt length in characters (default: 10)"
     )
+    parser.add_argument(
+        "--multi-turn", action="store_true",
+        help="Enable multi-turn conversation mode"
+    )
+    parser.add_argument(
+        "--min-turns", type=int, default=1,
+        help="Minimum turns to include (multi-turn mode only, default: 1)"
+    )
+    parser.add_argument(
+        "--max-turns", type=int, default=None,
+        help="Maximum turns to include per conversation (multi-turn mode only)"
+    )
     args = parser.parse_args()
 
     prompts_file = f"{args.output_dir}/wildchat_guidellm.jsonl"
@@ -176,54 +332,20 @@ def main():
         split=f"train[:{args.num_samples}]"
     )
 
-    prompts = []
-    lookup = {}
-    location_stats: Dict[str, int] = {}
-
-    print("Processing conversations...")
-    for item in ds:
-        # Get conversation
-        conv = item.get("conversation", [])
-        if not conv:
-            continue
-
-        # Find first user message
-        prompt = None
-        for msg in conv:
-            if msg.get("role") == "user":
-                prompt = msg.get("content", "")
-                break
-
-        if not prompt or len(prompt) < args.min_prompt_length:
-            continue
-
-        # Get location data
-        country = item.get("country", "United States")
-        state = item.get("state")
-
-        # Get coordinates
-        lat, lon = get_location_coords(country, state)
-
-        # Compute hash
-        h = hash_prompt(prompt)
-
-        # Track location distribution
-        loc_key = state if state and state in LOCATION_COORDS else country
-        location_stats[loc_key] = location_stats.get(loc_key, 0) + 1
-
-        # Store mapping (hash -> location)
-        lookup[h] = {
-            "lat": lat,
-            "lon": lon,
-            "country": country,
-            "state": state
-        }
-
-        # Store prompt for GuideLLM
-        prompts.append({
-            "prompt": prompt,
-            "hash": h
-        })
+    if args.multi_turn:
+        print(f"Processing in MULTI-TURN mode (min_turns={args.min_turns}, max_turns={args.max_turns})...")
+        prompts, lookup, location_stats = process_multi_turn(
+            ds,
+            args.min_prompt_length,
+            args.min_turns,
+            args.max_turns
+        )
+    else:
+        print("Processing in SINGLE-TURN mode...")
+        prompts, lookup, location_stats = process_single_turn(
+            ds,
+            args.min_prompt_length
+        )
 
     # Write prompts file for GuideLLM
     print(f"\nWriting {len(prompts)} prompts to {prompts_file}...")
