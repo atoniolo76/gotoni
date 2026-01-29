@@ -384,22 +384,28 @@ func ConnectToInstance(instanceIP string) error {
 		}
 	}
 
-	// Fallback: try to find any available key
+	// Fallback: try to find any available .pem key in ~/.ssh
 	if sshKeyFile == "" {
-		database, err := getDB()
+		sshDir, err := getSSHDir()
 		if err != nil {
-			return fmt.Errorf("failed to init db: %w", err)
+			return fmt.Errorf("failed to get ssh dir: %w", err)
 		}
-		defer database.Close()
 
-		keys, kerr := database.ListSSHKeys()
-		if kerr != nil || len(keys) == 0 {
-			return fmt.Errorf("no ssh keys available")
+		// Look for any .pem file in ~/.ssh (Lambda-style keys)
+		entries, err := os.ReadDir(sshDir)
+		if err != nil {
+			return fmt.Errorf("failed to read ssh dir: %w", err)
 		}
-		// Use first key
-		sshKeyFile = keys[0].PrivateKey
-		if _, err := os.Stat(sshKeyFile); os.IsNotExist(err) {
-			return fmt.Errorf("SSH key file %s does not exist", sshKeyFile)
+
+		for _, entry := range entries {
+			if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".pem") {
+				sshKeyFile = filepath.Join(sshDir, entry.Name())
+				break
+			}
+		}
+
+		if sshKeyFile == "" {
+			return fmt.Errorf("no ssh keys available in %s", sshDir)
 		}
 	}
 
@@ -413,69 +419,67 @@ func ConnectToInstance(instanceIP string) error {
 }
 
 // GetSSHKeyForInstance returns the SSH key file for a given instance ID
-// Deprecated: Use GetSSHKeyFileForKeyName instead with the instance's SSHKeyNames from the API
+// Deprecated: Use GetSSHKeyFileForInstance with RunningInstance from the API instead
 func GetSSHKeyForInstance(instanceID string) (string, error) {
-	db, err := getDB()
+	// Try to look up the instance from the API
+	httpClient := NewHTTPClient()
+	apiToken := GetAPIToken()
+
+	if apiToken != "" {
+		instance, err := GetInstance(httpClient, apiToken, instanceID)
+		if err == nil && len(instance.SSHKeyNames) > 0 {
+			return GetSSHKeyFileForKeyName(instance.SSHKeyNames[0])
+		}
+	}
+
+	// Fallback: try to find any .pem key
+	sshDir, err := getSSHDir()
 	if err != nil {
-		return "", fmt.Errorf("failed to init db: %w", err)
+		return "", fmt.Errorf("could not get ssh dir: %w", err)
 	}
-	defer db.Close()
 
-	instance, err := db.GetInstance(instanceID)
+	entries, err := os.ReadDir(sshDir)
 	if err != nil {
-		return "", fmt.Errorf("instance %s not found in db: %w", instanceID, err)
+		return "", fmt.Errorf("failed to read ssh dir: %w", err)
 	}
 
-	key, err := db.GetSSHKey(instance.SSHKeyName)
-	if err != nil {
-		return "", fmt.Errorf("ssh key %s not found: %w", instance.SSHKeyName, err)
+	for _, entry := range entries {
+		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".pem") {
+			return filepath.Join(sshDir, entry.Name()), nil
+		}
 	}
 
-	if _, err := os.Stat(key.PrivateKey); os.IsNotExist(err) {
-		return "", fmt.Errorf("SSH key file %s does not exist", key.PrivateKey)
-	}
-
-	return key.PrivateKey, nil
+	return "", fmt.Errorf("no ssh key found for instance %s", instanceID)
 }
 
 // GetSSHKeyFileForKeyName returns the private key file path for a given SSH key name.
-// This looks up the key in the local database where key name -> file path mappings are stored.
+// This looks up the key directly from the filesystem in ~/.ssh directory.
 // The key name typically comes from the instance's SSHKeyNames field from Lambda API.
 func GetSSHKeyFileForKeyName(keyName string) (string, error) {
-	database, err := getDB()
+	sshDir, err := getSSHDir()
 	if err != nil {
-		return "", fmt.Errorf("failed to init db: %w", err)
-	}
-	defer database.Close()
-
-	key, err := database.GetSSHKey(keyName)
-	if err != nil {
-		// Try common locations as fallback
-		sshDir, dirErr := getSSHDir()
-		if dirErr != nil {
-			return "", fmt.Errorf("ssh key %s not found in db and could not get ssh dir: %w", keyName, err)
-		}
-
-		// Try .pem extension
-		pemPath := filepath.Join(sshDir, keyName+".pem")
-		if _, statErr := os.Stat(pemPath); statErr == nil {
-			return pemPath, nil
-		}
-
-		// Try without extension
-		noExtPath := filepath.Join(sshDir, keyName)
-		if _, statErr := os.Stat(noExtPath); statErr == nil {
-			return noExtPath, nil
-		}
-
-		return "", fmt.Errorf("ssh key %s not found in db or filesystem", keyName)
+		return "", fmt.Errorf("could not get ssh dir: %w", err)
 	}
 
-	if _, err := os.Stat(key.PrivateKey); os.IsNotExist(err) {
-		return "", fmt.Errorf("SSH key file %s does not exist", key.PrivateKey)
+	// Try .pem extension first (Lambda format)
+	pemPath := filepath.Join(sshDir, keyName+".pem")
+	if _, statErr := os.Stat(pemPath); statErr == nil {
+		return pemPath, nil
 	}
 
-	return key.PrivateKey, nil
+	// Try without extension
+	noExtPath := filepath.Join(sshDir, keyName)
+	if _, statErr := os.Stat(noExtPath); statErr == nil {
+		return noExtPath, nil
+	}
+
+	// Try with id_ prefix (standard SSH format)
+	idPath := filepath.Join(sshDir, "id_"+keyName)
+	if _, statErr := os.Stat(idPath); statErr == nil {
+		return idPath, nil
+	}
+
+	return "", fmt.Errorf("ssh key %s not found in %s (tried: %s.pem, %s, id_%s)", keyName, sshDir, keyName, keyName, keyName)
 }
 
 // GetSSHKeyFileForInstance returns the private key file path for a RunningInstance.
@@ -545,7 +549,7 @@ func ListSSHKeys(httpClient *http.Client, apiToken string) ([]SSHKey, error) {
 	return provider.ListSSHKeys(httpClient, apiToken)
 }
 
-// AddExistingSSHKey adds an existing SSH key file to the gotoni configuration
+// AddExistingSSHKey adds an existing SSH key file to the ~/.ssh directory
 // Returns the key name and target path
 func AddExistingSSHKey(keyPath string, keyName string) (string, string, error) {
 	// Validate the key file exists
@@ -576,6 +580,12 @@ func AddExistingSSHKey(keyPath string, keyName string) (string, string, error) {
 	// Copy the key file to ssh directory
 	targetPath := filepath.Join(sshDir, keyName+".pem")
 
+	// Check if target already exists
+	if _, err := os.Stat(targetPath); err == nil {
+		// Key already exists at target location
+		return keyName, targetPath, nil
+	}
+
 	// Read the source file
 	sourceData, err := os.ReadFile(keyPath)
 	if err != nil {
@@ -585,17 +595,6 @@ func AddExistingSSHKey(keyPath string, keyName string) (string, string, error) {
 	// Write to target location with proper permissions (read-only by owner)
 	if err := os.WriteFile(targetPath, sourceData, 0400); err != nil {
 		return "", "", fmt.Errorf("failed to copy SSH key file: %w", err)
-	}
-
-	// Save to DB
-	database, err := getDB()
-	if err != nil {
-		return "", "", fmt.Errorf("failed to init db: %w", err)
-	}
-	defer database.Close()
-
-	if err := database.SaveSSHKey(&db.SSHKey{Name: keyName, PrivateKey: targetPath}); err != nil {
-		return "", "", fmt.Errorf("failed to save key to db: %w", err)
 	}
 
 	return keyName, targetPath, nil
