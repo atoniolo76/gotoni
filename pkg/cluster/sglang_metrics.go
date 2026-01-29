@@ -107,8 +107,15 @@ func (lb *LoadBalancer) pollLocalMetrics() {
 
 	// Update local metrics
 	lb.localMetricsMu.Lock()
+	wasHealthy := lb.localMetrics.Healthy
 	lb.localMetrics = *metrics
+	nowHealthy := lb.localMetrics.Healthy
 	lb.localMetricsMu.Unlock()
+
+	// Track health transition if state changed
+	if wasHealthy != nowHealthy {
+		lb.trackHealthTransition(nowHealthy)
+	}
 }
 
 // pollAllPeers polls metrics from all peers concurrently
@@ -299,20 +306,54 @@ func parsePrometheusMetrics(body string) (*SGLangMetrics, error) {
 	return metrics, nil
 }
 
+// trackHealthTransition records transitions between healthy and unhealthy states
+func (lb *LoadBalancer) trackHealthTransition(nowHealthy bool) {
+	lb.downtimeMu.Lock()
+	defer lb.downtimeMu.Unlock()
+
+	now := time.Now()
+	lb.lastHealthCheckTime = now
+
+	if lb.lastHealthyState && !nowHealthy {
+		// Transition: healthy -> unhealthy (start downtime)
+		lb.downtimeIntervals = append(lb.downtimeIntervals, downtimeInterval{
+			Start: now,
+		})
+		log.Printf("[LB] Downtime started at %v", now)
+	} else if !lb.lastHealthyState && nowHealthy {
+		// Transition: unhealthy -> healthy (end downtime)
+		if len(lb.downtimeIntervals) > 0 {
+			lastIdx := len(lb.downtimeIntervals) - 1
+			if lb.downtimeIntervals[lastIdx].End.IsZero() {
+				lb.downtimeIntervals[lastIdx].End = now
+				duration := now.Sub(lb.downtimeIntervals[lastIdx].Start)
+				log.Printf("[LB] Downtime ended at %v (duration: %v)", now, duration)
+			}
+		}
+	}
+	lb.lastHealthyState = nowHealthy
+}
+
 // markLocalUnhealthy marks the local SGLang as unhealthy after failed poll
 func (lb *LoadBalancer) markLocalUnhealthy() {
 	lb.localMetricsMu.Lock()
 	defer lb.localMetricsMu.Unlock()
 
 	lb.localMetrics.ConsecutiveFails++
+	wasHealthy := lb.localMetrics.Healthy
 	if lb.localMetrics.ConsecutiveFails >= lb.config.UnhealthyThreshold {
-		if lb.localMetrics.Healthy {
+		if wasHealthy {
 			log.Printf("[LB] Local SGLang marked unhealthy after %d consecutive failures",
 				lb.localMetrics.ConsecutiveFails)
 		}
 		lb.localMetrics.Healthy = false
 	}
 	lb.localMetrics.LastUpdated = time.Now()
+
+	// Track health transition (must be called without holding localMetricsMu)
+	if wasHealthy && !lb.localMetrics.Healthy {
+		go lb.trackHealthTransition(false)
+	}
 }
 
 // markPeerUnhealthy marks a peer as unhealthy after failed metrics poll

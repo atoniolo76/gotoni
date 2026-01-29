@@ -128,9 +128,10 @@ type GORGONode struct {
 
 // GORGO2Policy extends GORGO by comparing local queue cost vs peer costs
 type GORGO2Policy struct {
-	mu   sync.RWMutex
-	root *GORGONode        // Reuse GORGONode for prefix tree
-	lb   *LoadBalancer     // Reference to access running/queued request data
+	mu        sync.RWMutex
+	root      *GORGONode     // Prefix tree for peer KV cache locations
+	localRoot *GORGONode     // Prefix tree for local KV cache (nil peer marker)
+	lb        *LoadBalancer  // Reference to access running/queued request data
 }
 
 // runningRequest tracks a request currently being processed locally
@@ -218,6 +219,99 @@ func countGORGONodes(n *GORGONode) int {
 	return count
 }
 
+// Insert adds a prefix to the GORGO tree, associating it with a peer
+// peer can be nil to indicate local processing
+func (p *GORGOPolicy) Insert(prefix string, peer *PeerNode) {
+	if len(prefix) == 0 {
+		return
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.root == nil {
+		p.root = &GORGONode{
+			children: make(map[byte]*GORGONode),
+			peers:    []*PeerNode{},
+			prefix:   "",
+		}
+	}
+
+	currentNode := p.root
+	i := 0
+
+	for i < len(prefix) {
+		currentChar := prefix[i]
+		remainingText := prefix[i:]
+		lookup, ok := currentNode.children[currentChar]
+
+		if !ok {
+			// No child exists — create new node with entire remaining string
+			newNode := &GORGONode{
+				children: make(map[byte]*GORGONode),
+				peers:    []*PeerNode{peer},
+				prefix:   remainingText,
+			}
+			currentNode.children[currentChar] = newNode
+			return
+		}
+
+		sharedLen := sharedPrefixLength(remainingText, lookup.prefix)
+
+		if sharedLen < len(lookup.prefix) {
+			// Need to split the node
+			matchingPart := lookup.prefix[:sharedLen]
+			oldRemainingPart := lookup.prefix[sharedLen:]
+
+			// Create intermediate node
+			newNode := &GORGONode{
+				children: make(map[byte]*GORGONode),
+				peers:    []*PeerNode{},
+				prefix:   matchingPart,
+			}
+
+			// Move old node as child of new node
+			lookup.prefix = oldRemainingPart
+			newNode.children[oldRemainingPart[0]] = lookup
+			currentNode.children[currentChar] = newNode
+
+			i += sharedLen
+
+			if i < len(prefix) {
+				// Create leaf for remaining input
+				finalNode := &GORGONode{
+					children: make(map[byte]*GORGONode),
+					peers:    []*PeerNode{peer},
+					prefix:   prefix[i:],
+				}
+				newNode.children[prefix[i]] = finalNode
+			} else {
+				// Exact match at split point
+				newNode.peers = append(newNode.peers, peer)
+			}
+			return
+		}
+
+		i += sharedLen
+		if i >= len(prefix) {
+			// Exact match - add peer to this node
+			// Check if peer already exists (avoid duplicates)
+			found := false
+			for _, existingPeer := range lookup.peers {
+				if existingPeer == peer {
+					found = true
+					break
+				}
+			}
+			if !found {
+				lookup.peers = append(lookup.peers, peer)
+			}
+			return
+		}
+		currentNode = lookup
+	}
+}
+
 // =====================================================
 // GORGO2 HELPER FUNCTIONS
 // =====================================================
@@ -303,21 +397,172 @@ func NewGORGO2Policy(lb *LoadBalancer) *GORGO2Policy {
 			peers:    []*PeerNode{},
 			prefix:   "",
 		},
+		localRoot: &GORGONode{
+			children: make(map[byte]*GORGONode),
+			peers:    []*PeerNode{},
+			prefix:   "",
+		},
 		lb: lb,
 	}
 }
 
-// ClearCache resets the GORGO2 prefix tree to empty
+// ClearCache resets the GORGO2 prefix trees to empty
 func (p *GORGO2Policy) ClearCache() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	count := countGORGONodes(p.root)
+	count := countGORGONodes(p.root) + countGORGONodes(p.localRoot)
 	p.root = &GORGONode{
 		children: make(map[byte]*GORGONode),
 		peers:    []*PeerNode{},
 		prefix:   "",
 	}
+	p.localRoot = &GORGONode{
+		children: make(map[byte]*GORGONode),
+		peers:    []*PeerNode{},
+		prefix:   "",
+	}
 	return count
+}
+
+// Insert adds a prefix to the peer tree, associating it with a peer
+func (p *GORGO2Policy) Insert(prefix string, peer *PeerNode) {
+	if len(prefix) == 0 || peer == nil {
+		return
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	insertIntoGORGOTree(p.root, prefix, peer)
+}
+
+// InsertLocal adds a prefix to the local tree (for KV cache on this node)
+func (p *GORGO2Policy) InsertLocal(prefix string) {
+	if len(prefix) == 0 {
+		return
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	// Use nil peer as marker for local
+	insertIntoGORGOTree(p.localRoot, prefix, nil)
+}
+
+// insertIntoGORGOTree is a helper to insert a prefix into a GORGONode tree
+func insertIntoGORGOTree(root *GORGONode, prefix string, peer *PeerNode) {
+	if root == nil {
+		return
+	}
+
+	currentNode := root
+	i := 0
+
+	for i < len(prefix) {
+		currentChar := prefix[i]
+		remainingText := prefix[i:]
+		lookup, ok := currentNode.children[currentChar]
+
+		if !ok {
+			// No child exists — create new node with entire remaining string
+			newNode := &GORGONode{
+				children: make(map[byte]*GORGONode),
+				peers:    []*PeerNode{peer},
+				prefix:   remainingText,
+			}
+			currentNode.children[currentChar] = newNode
+			return
+		}
+
+		sharedLen := sharedPrefixLength(remainingText, lookup.prefix)
+
+		if sharedLen < len(lookup.prefix) {
+			// Need to split the node
+			matchingPart := lookup.prefix[:sharedLen]
+			oldRemainingPart := lookup.prefix[sharedLen:]
+
+			// Create intermediate node
+			newNode := &GORGONode{
+				children: make(map[byte]*GORGONode),
+				peers:    []*PeerNode{},
+				prefix:   matchingPart,
+			}
+
+			// Move old node as child of new node
+			lookup.prefix = oldRemainingPart
+			newNode.children[oldRemainingPart[0]] = lookup
+			currentNode.children[currentChar] = newNode
+
+			i += sharedLen
+
+			if i < len(prefix) {
+				// Create leaf for remaining input
+				finalNode := &GORGONode{
+					children: make(map[byte]*GORGONode),
+					peers:    []*PeerNode{peer},
+					prefix:   prefix[i:],
+				}
+				newNode.children[prefix[i]] = finalNode
+			} else {
+				// Exact match at split point
+				newNode.peers = append(newNode.peers, peer)
+			}
+			return
+		}
+
+		i += sharedLen
+		if i >= len(prefix) {
+			// Exact match - add peer to this node (avoid duplicates)
+			for _, existingPeer := range lookup.peers {
+				if existingPeer == peer {
+					return
+				}
+			}
+			lookup.peers = append(lookup.peers, peer)
+			return
+		}
+		currentNode = lookup
+	}
+}
+
+// findLocalPrefixMatch finds the longest matching prefix in the local tree
+// Returns the length of matched prefix (0 if no match)
+func (p *GORGO2Policy) findLocalPrefixMatch(requestPath string) int {
+	if p.localRoot == nil || len(requestPath) == 0 {
+		return 0
+	}
+
+	// Note: caller should hold at least read lock
+	currentNode := p.localRoot
+	matchedLen := 0
+	i := 0
+
+	for i < len(requestPath) {
+		currentChar := requestPath[i]
+		remainingText := requestPath[i:]
+		lookup, ok := currentNode.children[currentChar]
+		if !ok {
+			break
+		}
+
+		sharedLen := sharedPrefixLength(remainingText, lookup.prefix)
+		i += sharedLen
+
+		// If this node has the local marker (nil peer), record the match
+		for _, peer := range lookup.peers {
+			if peer == nil {
+				matchedLen = i
+				break
+			}
+		}
+
+		if sharedLen < len(lookup.prefix) {
+			break // partial match within node
+		}
+		currentNode = lookup
+	}
+
+	return matchedLen
 }
 
 // Select implements LoadBalancingStrategy for GORGO2
@@ -433,7 +678,17 @@ func (p *GORGO2Policy) calculateLocalCost(requestPath string, requestTokens int)
 	totalCost += msPerToken * float64(queuedTokens)
 
 	// Add cost for the incoming request itself
-	totalCost += msPerToken * float64(requestTokens)
+	// Check if we have a local prefix match - if so, only unmatched tokens need prefill
+	localMatchLen := p.findLocalPrefixMatch(requestPath)
+	if localMatchLen > 0 && localMatchLen < len(requestPath) {
+		// Calculate tokens for unmatched portion only
+		unmatchedText := requestPath[localMatchLen:]
+		unmatchedTokens := GetTokenCount(unmatchedText)
+		totalCost += msPerToken * float64(unmatchedTokens)
+	} else {
+		// No local prefix match - full prefill cost
+		totalCost += msPerToken * float64(requestTokens)
+	}
 
 	return totalCost
 }
@@ -822,6 +1077,26 @@ type LoadBalancer struct {
 	cancel  context.CancelFunc
 	wg      sync.WaitGroup
 	running atomic.Bool
+
+	// Aggregate metrics
+	startTime              time.Time
+	totalRequestsHandled   atomic.Int64 // Total requests received
+	totalRequestsLocal     atomic.Int64 // Requests processed locally
+	totalRequestsForwarded atomic.Int64 // Requests forwarded to peers
+	totalRequestsQueued    atomic.Int64 // Requests that were queued
+	totalRequestsRejected  atomic.Int64 // Requests rejected (queue full, no peers, etc.)
+
+	// Downtime tracking
+	downtimeIntervals   []downtimeInterval
+	downtimeMu          sync.RWMutex
+	lastHealthyState    bool
+	lastHealthCheckTime time.Time
+}
+
+// downtimeInterval tracks a period when the local backend was unhealthy
+type downtimeInterval struct {
+	Start time.Time `json:"start"`
+	End   time.Time `json:"end,omitempty"` // Zero if still in downtime
 }
 
 // NewLoadBalancer creates a new load balancer for this node
@@ -873,6 +1148,10 @@ func NewLoadBalancer(cfg *LoadBalancerConfig, self *remote.RunningInstance) *Loa
 		runningRequests:   make(map[string]*runningRequest), // For GORGO2
 		msPerToken:        cfg.GORGOMsPerToken,
 		runningCostFactor: cfg.GORGO2RunningCostFactor,
+		// Aggregate metrics
+		startTime:         time.Now(),
+		downtimeIntervals: make([]downtimeInterval, 0),
+		lastHealthyState:  true, // Assume healthy at start
 	}
 
 	if cfg.QueueEnabled {
@@ -1049,6 +1328,9 @@ func (lb *LoadBalancer) Handler() http.Handler {
 		requestID := fmt.Sprintf("%d", time.Now().UnixNano())
 		wrappedWriter := &responseWriterWrapper{ResponseWriter: w, statusCode: 200}
 
+		// Increment total requests handled
+		lb.totalRequestsHandled.Add(1)
+
 		// Parse Hop Count
 		hops := 0
 		if hopStr := r.Header.Get("X-LB-Hop"); hopStr != "" {
@@ -1078,11 +1360,20 @@ func (lb *LoadBalancer) Handler() http.Handler {
 
 		// A: Process locally if we have capacity
 		if hasCapacity {
+			lb.totalRequestsLocal.Add(1)
 			lb.trackRunningRequest(requestID, tokenCount)
 			lb.tracer.TraceLocalProcessStart(requestID)
 			lb.localProxy.ServeHTTP(wrappedWriter, r)
 			lb.untrackRunningRequest(requestID)
 			lb.tracer.TraceRequestComplete(requestID, wrappedWriter.statusCode, "local")
+			// Record local prefix in tree for future routing decisions
+			if wrappedWriter.statusCode >= 200 && wrappedWriter.statusCode < 300 && requestPath != "" {
+				if gorgo2, ok := lb.strategy.(*GORGO2Policy); ok {
+					gorgo2.InsertLocal(requestPath)
+				} else if gorgo, ok := lb.strategy.(*GORGOPolicy); ok {
+					gorgo.Insert(requestPath, nil) // nil indicates local
+				}
+			}
 			return
 		}
 
@@ -1094,12 +1385,22 @@ func (lb *LoadBalancer) Handler() http.Handler {
 			if targetPeer != nil {
 				// Pass pre-selected peer to avoid double selection
 				if lb.forwardToTargetPeer(wrappedWriter, r, requestID, hops+1, targetPeer, bodyBytes) {
+					lb.totalRequestsForwarded.Add(1)
 					lb.tracer.TraceRequestComplete(requestID, wrappedWriter.statusCode, "peer")
+					// Record peer prefix in tree for future routing decisions
+					if wrappedWriter.statusCode >= 200 && wrappedWriter.statusCode < 300 && requestPath != "" {
+						if gorgo2, ok := lb.strategy.(*GORGO2Policy); ok {
+							gorgo2.Insert(requestPath, targetPeer)
+						} else if gorgo, ok := lb.strategy.(*GORGOPolicy); ok {
+							gorgo.Insert(requestPath, targetPeer)
+						}
+					}
 					return
 				}
 			} else if _, isGORGO2 := lb.strategy.(*GORGO2Policy); !isGORGO2 {
 				// Non-GORGO2: try forward without explicit peer selection (uses URL path)
 				if lb.forwardToPeer(wrappedWriter, r, requestID, hops+1) {
+					lb.totalRequestsForwarded.Add(1)
 					lb.tracer.TraceRequestComplete(requestID, wrappedWriter.statusCode, "peer")
 					return
 				}
@@ -1110,11 +1411,15 @@ func (lb *LoadBalancer) Handler() http.Handler {
 		// C: Queue locally (Mandatory if already pushed or no peers available)
 		if lb.config.QueueEnabled {
 			if lb.enqueueRequestWithTokens(wrappedWriter, r, requestID, bodyBytes, tokenCount, prompt) {
+				lb.totalRequestsQueued.Add(1)
 				lb.tracer.TraceRequestComplete(requestID, wrappedWriter.statusCode, "queue")
+			} else {
+				lb.totalRequestsRejected.Add(1)
 			}
 			return
 		}
 
+		lb.totalRequestsRejected.Add(1)
 		http.Error(w, "Service at capacity", http.StatusServiceUnavailable)
 	})
 }
@@ -1402,6 +1707,14 @@ func (lb *LoadBalancer) processQueuedRequests() {
 				lb.queueMu.Unlock()
 
 				if lb.forwardQueuedRequest(qr, peer, hops+1) {
+					// Record peer prefix in tree for future routing decisions
+					if requestPath != "" {
+						if gorgo2, ok := lb.strategy.(*GORGO2Policy); ok {
+							gorgo2.Insert(requestPath, peer)
+						} else if gorgo, ok := lb.strategy.(*GORGOPolicy); ok {
+							gorgo.Insert(requestPath, peer)
+						}
+					}
 					close(qr.done)
 				} else {
 					// Forward failed, re-queue at the back
@@ -1427,6 +1740,16 @@ func (lb *LoadBalancer) processQueuedRequests() {
 			lb.tracer.TraceLocalProcessEnd(qr.requestID, 200) // Assume success
 
 			lb.untrackRunningRequest(qr.requestID)
+
+			// Record local prefix in tree for future routing decisions
+			if requestPath != "" {
+				if gorgo2, ok := lb.strategy.(*GORGO2Policy); ok {
+					gorgo2.InsertLocal(requestPath)
+				} else if gorgo, ok := lb.strategy.(*GORGOPolicy); ok {
+					gorgo.Insert(requestPath, nil) // nil indicates local
+				}
+			}
+
 			close(qr.done)
 			continue
 		}
@@ -1517,10 +1840,30 @@ func (lb *LoadBalancer) handleStatusEndpoint(w http.ResponseWriter, r *http.Requ
 	}
 	lb.peersMu.RUnlock()
 
-	// Get queue size
+	// Get queue size (instantaneous queue depth)
 	lb.queueMu.Lock()
 	queueSize := len(lb.queue)
 	lb.queueMu.Unlock()
+
+	// Get downtime intervals
+	lb.downtimeMu.RLock()
+	downtimeIntervals := make([]downtimeInterval, len(lb.downtimeIntervals))
+	copy(downtimeIntervals, lb.downtimeIntervals)
+	lb.downtimeMu.RUnlock()
+
+	// Calculate total downtime
+	var totalDowntime time.Duration
+	for _, interval := range downtimeIntervals {
+		if interval.End.IsZero() {
+			// Still in downtime
+			totalDowntime += time.Since(interval.Start)
+		} else {
+			totalDowntime += interval.End.Sub(interval.Start)
+		}
+	}
+
+	// Calculate uptime
+	uptime := time.Since(lb.startTime)
 
 	status := map[string]interface{}{
 		"running":         lb.running.Load(),
@@ -1537,6 +1880,18 @@ func (lb *LoadBalancer) handleStatusEndpoint(w http.ResponseWriter, r *http.Requ
 		"listen_port":     lb.config.LoadBalancerPort,
 		"backend_port":    lb.config.ApplicationPort,
 		"metrics_enabled": lb.config.MetricsEnabled,
+		// Aggregate metrics
+		"aggregate": map[string]interface{}{
+			"total_requests":     lb.totalRequestsHandled.Load(),
+			"requests_local":     lb.totalRequestsLocal.Load(),
+			"requests_forwarded": lb.totalRequestsForwarded.Load(),
+			"requests_queued":    lb.totalRequestsQueued.Load(),
+			"requests_rejected":  lb.totalRequestsRejected.Load(),
+			"start_time":         lb.startTime.Format(time.RFC3339),
+			"uptime_seconds":     uptime.Seconds(),
+			"downtime_seconds":   totalDowntime.Seconds(),
+			"downtime_intervals": len(downtimeIntervals),
+		},
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -1590,6 +1945,34 @@ func (lb *LoadBalancer) handleMetricsEndpoint(w http.ResponseWriter, r *http.Req
 	}
 	lb.peersMu.RUnlock()
 
+	// Get queue depth
+	lb.queueMu.Lock()
+	queueDepth := len(lb.queue)
+	lb.queueMu.Unlock()
+
+	// Get downtime intervals
+	lb.downtimeMu.RLock()
+	downtimeIntervals := make([]map[string]interface{}, 0, len(lb.downtimeIntervals))
+	var totalDowntime time.Duration
+	for _, interval := range lb.downtimeIntervals {
+		di := map[string]interface{}{
+			"start": interval.Start.Format(time.RFC3339),
+		}
+		if interval.End.IsZero() {
+			di["end"] = nil
+			di["duration_seconds"] = time.Since(interval.Start).Seconds()
+			totalDowntime += time.Since(interval.Start)
+		} else {
+			di["end"] = interval.End.Format(time.RFC3339)
+			di["duration_seconds"] = interval.End.Sub(interval.Start).Seconds()
+			totalDowntime += interval.End.Sub(interval.Start)
+		}
+		downtimeIntervals = append(downtimeIntervals, di)
+	}
+	lb.downtimeMu.RUnlock()
+
+	uptime := time.Since(lb.startTime)
+
 	metrics := map[string]interface{}{
 		"local": map[string]interface{}{
 			"running_reqs": localMetrics.NumRunningReqs,
@@ -1607,6 +1990,18 @@ func (lb *LoadBalancer) handleMetricsEndpoint(w http.ResponseWriter, r *http.Req
 			"queue_timeout":   lb.config.QueueTimeout.String(),
 			"request_timeout": lb.config.RequestTimeout.String(),
 			"gpu_threshold":   lb.config.GPUCacheThreshold,
+		},
+		"aggregate": map[string]interface{}{
+			"total_requests":     lb.totalRequestsHandled.Load(),
+			"requests_local":     lb.totalRequestsLocal.Load(),
+			"requests_forwarded": lb.totalRequestsForwarded.Load(),
+			"requests_queued":    lb.totalRequestsQueued.Load(),
+			"requests_rejected":  lb.totalRequestsRejected.Load(),
+			"queue_depth":        queueDepth,
+			"start_time":         lb.startTime.Format(time.RFC3339),
+			"uptime_seconds":     uptime.Seconds(),
+			"downtime_seconds":   totalDowntime.Seconds(),
+			"downtime_intervals": downtimeIntervals,
 		},
 	}
 
