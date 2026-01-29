@@ -38,9 +38,26 @@ func BuildGotoniLinux(outputPath string) error {
 	return nil
 }
 
-// DeployGotoniToCluster uploads the gotoni binary to all cluster instances
+// DeployGotoniToCluster uploads the gotoni binary to all cluster instances.
+// It stops running gotoni processes (LB, etc.) and removes the old binary before uploading.
 func DeployGotoniToCluster(cluster *Cluster, binaryPath string) error {
 	fmt.Printf("Deploying gotoni to %d instances...\n", len(cluster.Instances))
+
+	// First, stop all running gotoni processes on the cluster
+	fmt.Println("  Stopping running gotoni processes...")
+	cleanupScript := `
+# Stop load balancer
+tmux kill-session -t gotoni-start_gotoni_load_balancer 2>/dev/null || true
+PIDS=$(pgrep -f "gotoni lb" 2>/dev/null | head -5)
+if [ -n "$PIDS" ]; then kill $PIDS 2>/dev/null; fi
+
+# Remove old binary
+rm -f /home/ubuntu/gotoni
+
+echo "CLEANED"
+`
+	cluster.ExecuteOnCluster(cleanupScript)
+	time.Sleep(1 * time.Second)
 
 	var wg sync.WaitGroup
 	var failCount int
@@ -60,16 +77,6 @@ func DeployGotoniToCluster(cluster *Cluster, binaryPath string) error {
 				mu.Unlock()
 				return
 			}
-
-			// Delete old binary first
-			rmCmd := exec.Command("ssh",
-				"-i", sshKeyPath,
-				"-o", "StrictHostKeyChecking=no",
-				"-o", "UserKnownHostsFile=/dev/null",
-				fmt.Sprintf("ubuntu@%s", instance.IP),
-				"rm -f /home/ubuntu/gotoni",
-			)
-			rmCmd.Run() // Ignore errors
 
 			// SCP upload
 			scpCmd := exec.Command("scp",
@@ -121,7 +128,15 @@ func DeployLBStrategyWithConfig(cluster *Cluster, config LBDeployConfig) error {
 	fmt.Printf("Deploying LB strategy: %s\n", config.Strategy)
 
 	// Stop existing load balancers (silently)
-	cluster.ExecuteOnCluster("tmux kill-session -t gotoni-start_gotoni_load_balancer 2>/dev/null; pkill -f 'gotoni lb' 2>/dev/null; exit 0")
+	// Note: Use pgrep + kill instead of pkill -f to avoid killing the SSH session
+	stopScript := `
+tmux kill-session -t gotoni-start_gotoni_load_balancer 2>/dev/null || true
+tmux kill-session -t gotoni-lb 2>/dev/null || true
+PIDS=$(pgrep -f "gotoni lb" 2>/dev/null | head -5)
+if [ -n "$PIDS" ]; then kill $PIDS 2>/dev/null; fi
+exit 0
+`
+	cluster.ExecuteOnCluster(stopScript)
 	time.Sleep(2 * time.Second)
 
 	// Collect all peer IPs

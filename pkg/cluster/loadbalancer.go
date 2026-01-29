@@ -25,6 +25,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/atoniolo76/gotoni/pkg/config"
 	"github.com/atoniolo76/gotoni/pkg/remote"
 )
 
@@ -41,7 +42,8 @@ type LoadBalancerConfig struct {
 	RequestTimeout        time.Duration         `json:"request_timeout"`
 	QueueEnabled          bool                  `json:"queue_enabled"`
 	QueueTimeout          time.Duration         `json:"queue_timeout"`
-	Strategy              LoadBalancingStrategy `json:"-"` // Not serializable
+	MaxQueueSize          int                   `json:"max_queue_size"` // Max requests in queue before rejecting (0 = unlimited)
+	Strategy              LoadBalancingStrategy `json:"-"`              // Not serializable
 
 	// SGLang metrics polling (see sglang_metrics.go for polling logic)
 	MetricsEnabled      bool          `json:"metrics_enabled"`
@@ -64,16 +66,17 @@ type LoadBalancerConfig struct {
 	ClusterName string `json:"cluster_name"`
 }
 
-// DefaultLoadBalancerConfig returns sensible defaults
+// DefaultLoadBalancerConfig returns sensible defaults from pkg/config/constants.go
 func DefaultLoadBalancerConfig() *LoadBalancerConfig {
 	metricsConfig := DefaultMetricsConfig()
 	return &LoadBalancerConfig{
-		MaxConcurrentRequests: 10,
-		ApplicationPort:       8080,
-		LoadBalancerPort:      8000,
-		RequestTimeout:        30 * time.Second,
-		QueueEnabled:          true,
-		QueueTimeout:          30 * time.Second,
+		MaxConcurrentRequests: config.DefaultMaxConcurrentRequests,
+		ApplicationPort:       config.DefaultApplicationPort,
+		LoadBalancerPort:      config.DefaultLoadBalancerPort,
+		RequestTimeout:        config.DefaultRequestTimeout,
+		QueueEnabled:          config.DefaultQueueEnabled,
+		QueueTimeout:          config.DefaultQueueTimeout,
+		MaxQueueSize:          config.DefaultMaxQueueSize,
 		Strategy:              &LeastLoadedPolicy{},
 
 		// SGLang metrics config
@@ -84,8 +87,9 @@ func DefaultLoadBalancerConfig() *LoadBalancerConfig {
 		UnhealthyThreshold:  metricsConfig.UnhealthyThreshold,
 		GPUCacheThreshold:   metricsConfig.GPUCacheThreshold,
 
-		// SkyServe-style IE queue indicator (enabled by default)
-		UseIEQueueIndicator: true,
+		// Running threshold takes priority over IE queue indicator
+		RunningReqsThreshold: config.DefaultRunningReqsThreshold,
+		UseIEQueueIndicator:  config.DefaultUseIEQueueIndicator,
 	}
 }
 
@@ -461,6 +465,8 @@ type queuedRequest struct {
 	done       chan struct{}
 	err        error
 	enqueuedAt time.Time
+	requestID  string // For tracing
+	bodyBytes  []byte // Cached body for potential forwarding
 }
 
 // LoadBalancer is a distributed load balancer instance for a single node
@@ -500,15 +506,15 @@ type LoadBalancer struct {
 }
 
 // NewLoadBalancer creates a new load balancer for this node
-func NewLoadBalancer(config *LoadBalancerConfig, self *remote.RunningInstance) *LoadBalancer {
-	if config == nil {
-		config = DefaultLoadBalancerConfig()
+func NewLoadBalancer(cfg *LoadBalancerConfig, self *remote.RunningInstance) *LoadBalancer {
+	if cfg == nil {
+		cfg = DefaultLoadBalancerConfig()
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 
 	// Create local backend proxy
-	localURL, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", config.ApplicationPort))
+	localURL, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", cfg.ApplicationPort))
 	localProxy := httputil.NewSingleHostReverseProxy(localURL)
 
 	// Customize proxy error handler
@@ -518,27 +524,27 @@ func NewLoadBalancer(config *LoadBalancerConfig, self *remote.RunningInstance) *
 	}
 
 	// Use default strategy if none provided
-	if config.Strategy == nil {
-		config.Strategy = &LeastLoadedPolicy{}
+	if cfg.Strategy == nil {
+		cfg.Strategy = &LeastLoadedPolicy{}
 	}
 
 	// Initialize tracer for event-driven tracing
-	nodeID := config.NodeID
+	nodeID := cfg.NodeID
 	if nodeID == "" && self != nil {
 		nodeID = self.ID[:16]
 	}
 	tracer := NewTracer(nodeID)
 
 	lb := &LoadBalancer{
-		config:   config,
+		config:   cfg,
 		self:     self,
 		peers:    make(map[*PeerNode]AvailabilityStatus),
-		strategy: config.Strategy,
+		strategy: cfg.Strategy,
 		httpClient: &http.Client{
-			Timeout: config.RequestTimeout,
+			Timeout: cfg.RequestTimeout,
 			Transport: &http.Transport{
-				MaxIdleConnsPerHost: 100,
-				IdleConnTimeout:     90 * time.Second,
+				MaxIdleConnsPerHost: config.DefaultMaxIdleConnsPerHost,
+				IdleConnTimeout:     config.DefaultIdleConnTimeout,
 			},
 		},
 		localProxy: localProxy,
@@ -547,7 +553,7 @@ func NewLoadBalancer(config *LoadBalancerConfig, self *remote.RunningInstance) *
 		cancel:     cancel,
 	}
 
-	if config.QueueEnabled {
+	if cfg.QueueEnabled {
 		lb.queue = make([]*queuedRequest, 0)
 	}
 
@@ -639,6 +645,14 @@ func (lb *LoadBalancer) Start() error {
 
 	lb.running.Store(true)
 
+	// Warn if no peers configured - this is likely a misconfiguration
+	lb.peersMu.RLock()
+	peerCount := len(lb.peers)
+	lb.peersMu.RUnlock()
+	if peerCount == 0 {
+		log.Printf("[LB] ⚠️  WARNING: No peers configured! When at capacity, requests will queue locally instead of being forwarded. This can cause resource exhaustion under heavy load.")
+	}
+
 	// Start queue processor if enabled
 	if lb.config.QueueEnabled {
 		lb.wg.Add(1)
@@ -651,8 +665,8 @@ func (lb *LoadBalancer) Start() error {
 		go lb.pollMetricsLoop()
 	}
 
-	log.Printf("[LB] Load balancer started (max concurrent: %d, metrics polling: %v)",
-		lb.config.MaxConcurrentRequests, lb.config.MetricsEnabled)
+	log.Printf("[LB] Load balancer started (max concurrent: %d, peers: %d, max queue: %d, metrics polling: %v)",
+		lb.config.MaxConcurrentRequests, peerCount, lb.config.MaxQueueSize, lb.config.MetricsEnabled)
 
 	return nil
 }
@@ -784,8 +798,11 @@ func (lb *LoadBalancer) Handler() http.Handler {
 			lb.queueMu.Unlock()
 			lb.tracer.TraceQueueEnter(requestID, queueDepth)
 
-			lb.enqueueRequest(wrappedWriter, r)
-			lb.tracer.TraceRequestComplete(requestID, wrappedWriter.statusCode, "queue")
+			if lb.enqueueRequest(wrappedWriter, r, requestID) {
+				lb.tracer.TraceRequestComplete(requestID, wrappedWriter.statusCode, "queue")
+			} else {
+				lb.tracer.TraceRequestComplete(requestID, 503, "queue_full")
+			}
 			return
 		}
 
@@ -978,20 +995,41 @@ func (lb *LoadBalancer) selectPeer(requestPath string) *PeerNode {
 }
 
 // enqueueRequest adds a request to the queue
-func (lb *LoadBalancer) enqueueRequest(w http.ResponseWriter, r *http.Request) {
+// Returns false if the queue is full (all cluster capacity exhausted)
+func (lb *LoadBalancer) enqueueRequest(w http.ResponseWriter, r *http.Request, requestID string) bool {
+	// Check max queue size before adding
+	lb.queueMu.Lock()
+	if lb.config.MaxQueueSize > 0 && len(lb.queue) >= lb.config.MaxQueueSize {
+		lb.queueMu.Unlock()
+		log.Printf("[LB] Queue full (%d/%d) - all cluster capacity exhausted, rejecting request",
+			len(lb.queue), lb.config.MaxQueueSize)
+		http.Error(w, "Cluster at capacity - queue full", http.StatusServiceUnavailable)
+		return false
+	}
+
+	// Read and cache body for potential forwarding later
+	var bodyBytes []byte
+	if r.Body != nil {
+		bodyBytes, _ = io.ReadAll(r.Body)
+		r.Body.Close()
+		// Replace body so local proxy can still read it
+		r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+	}
+
 	qr := &queuedRequest{
 		w:          w,
 		r:          r,
 		done:       make(chan struct{}),
 		enqueuedAt: time.Now(),
+		requestID:  requestID,
+		bodyBytes:  bodyBytes,
 	}
 
-	// Add to unbounded queue
-	lb.queueMu.Lock()
 	lb.queue = append(lb.queue, qr)
+	queueSize := len(lb.queue)
 	lb.queueMu.Unlock()
 
-	log.Printf("[LB] Request queued (queue size: %d)", len(lb.queue))
+	log.Printf("[LB] Request %s queued (queue size: %d/%d)", requestID, queueSize, lb.config.MaxQueueSize)
 
 	// Wait for processing or timeout
 	select {
@@ -1000,17 +1038,26 @@ func (lb *LoadBalancer) enqueueRequest(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, qr.err.Error(), http.StatusServiceUnavailable)
 		}
 	case <-time.After(lb.config.QueueTimeout):
+		// Trace queue exit with timeout
+		lb.tracer.TraceQueueExit(requestID, float64(time.Since(qr.enqueuedAt).Microseconds())/1000.0, "timeout")
 		http.Error(w, "Queue timeout", http.StatusGatewayTimeout)
 	case <-r.Context().Done():
+		// Trace queue exit with cancellation
+		lb.tracer.TraceQueueExit(requestID, float64(time.Since(qr.enqueuedAt).Microseconds())/1000.0, "cancelled")
 		http.Error(w, "Request cancelled", http.StatusRequestTimeout)
 	}
+	return true
 }
 
-// processQueue processes queued requests when local SGLang has capacity
+// processQueue probes the queue and processes requests by:
+// 1. First trying to forward to available peers (priority)
+// 2. Falling back to local processing if local has capacity
+// This ensures queued requests get distributed across the cluster.
 func (lb *LoadBalancer) processQueue() {
 	defer lb.wg.Done()
 
-	ticker := time.NewTicker(10 * time.Millisecond)
+	// Probe frequently to minimize queue latency
+	ticker := time.NewTicker(config.DefaultQueueProbeInterval)
 	defer ticker.Stop()
 
 	for {
@@ -1018,34 +1065,178 @@ func (lb *LoadBalancer) processQueue() {
 		case <-lb.ctx.Done():
 			return
 		case <-ticker.C:
-			// Check if local SGLang has capacity using real metrics
-			if !lb.localHasCapacity() {
-				continue
-			}
-
-			// Try to dequeue
-			lb.queueMu.Lock()
-			if len(lb.queue) > 0 {
-				qr := lb.queue[0]
-				lb.queue = lb.queue[1:] // Remove first element
-				lb.queueMu.Unlock()
-
-				// Check if request is still valid
-				if time.Since(qr.enqueuedAt) > lb.config.QueueTimeout {
-					qr.err = fmt.Errorf("queue timeout")
-					close(qr.done)
-					continue
-				}
-
-				// Process the request locally
-				lb.localProxy.ServeHTTP(qr.w, qr.r)
-				close(qr.done)
-			} else {
-				lb.queueMu.Unlock()
-				// No requests in queue
-			}
+			lb.processQueuedRequests()
 		}
 	}
+}
+
+// processQueuedRequests attempts to process all queued requests
+// Priority: forward to peers > process locally
+func (lb *LoadBalancer) processQueuedRequests() {
+	lb.queueMu.Lock()
+	queueDepth := len(lb.queue)
+	if queueDepth == 0 {
+		lb.queueMu.Unlock()
+		return
+	}
+	lb.queueMu.Unlock()
+
+	// Count available peers for tracing
+	lb.peersMu.RLock()
+	peersAvailable := 0
+	for _, status := range lb.peers {
+		if status.Available && status.Healthy {
+			peersAvailable++
+		}
+	}
+	lb.peersMu.RUnlock()
+
+	forwarded := 0
+	processedLocally := 0
+
+	// Process queue - try to forward to peers first, then local
+	for {
+		lb.queueMu.Lock()
+		if len(lb.queue) == 0 {
+			lb.queueMu.Unlock()
+			break
+		}
+
+		qr := lb.queue[0]
+
+		// Check if request is still valid (not timed out)
+		if time.Since(qr.enqueuedAt) > lb.config.QueueTimeout {
+			lb.queue = lb.queue[1:]
+			lb.queueMu.Unlock()
+			qr.err = fmt.Errorf("queue timeout")
+			close(qr.done)
+			continue
+		}
+
+		// Check if request context is still valid
+		if qr.r.Context().Err() != nil {
+			lb.queue = lb.queue[1:]
+			lb.queueMu.Unlock()
+			qr.err = fmt.Errorf("request cancelled")
+			close(qr.done)
+			continue
+		}
+
+		// Try to forward to a peer first (priority)
+		peer := lb.selectPeer(qr.r.URL.Path)
+		if peer != nil {
+			// Remove from queue before forwarding
+			lb.queue = lb.queue[1:]
+			lb.queueMu.Unlock()
+
+			// Trace the forward attempt
+			lb.tracer.TraceQueueForwardAttempt(qr.requestID, queueDepth, true, peer.Instance.IP)
+
+			// Forward the request
+			waitTimeMs := float64(time.Since(qr.enqueuedAt).Microseconds()) / 1000.0
+			if lb.forwardQueuedRequest(qr, peer) {
+				lb.tracer.TraceQueueExit(qr.requestID, waitTimeMs, "forwarded_to_peer")
+				forwarded++
+				close(qr.done)
+			} else {
+				// Forward failed - re-queue at the back
+				lb.queueMu.Lock()
+				lb.queue = append(lb.queue, qr)
+				lb.queueMu.Unlock()
+				log.Printf("[LB] Forward failed for %s, re-queued", qr.requestID)
+			}
+			continue
+		}
+
+		// No peers available - try local processing if we have capacity
+		if lb.localHasCapacity() {
+			lb.queue = lb.queue[1:]
+			lb.queueMu.Unlock()
+
+			waitTimeMs := float64(time.Since(qr.enqueuedAt).Microseconds()) / 1000.0
+			lb.tracer.TraceQueueExit(qr.requestID, waitTimeMs, "local_process")
+
+			// Restore body for local proxy
+			qr.r.Body = io.NopCloser(bytes.NewReader(qr.bodyBytes))
+			lb.localProxy.ServeHTTP(qr.w, qr.r)
+			processedLocally++
+			close(qr.done)
+			continue
+		}
+
+		// Neither peers nor local have capacity - stop processing this cycle
+		lb.queueMu.Unlock()
+		break
+	}
+
+	// Trace the probe results if we did any work
+	if forwarded > 0 || processedLocally > 0 {
+		lb.tracer.TraceQueueProbe(queueDepth, peersAvailable, forwarded)
+		log.Printf("[LB] Queue probe: depth=%d, peers=%d, forwarded=%d, local=%d",
+			queueDepth, peersAvailable, forwarded, processedLocally)
+	}
+}
+
+// forwardQueuedRequest forwards a queued request to a peer
+// Returns true on success, false on failure
+func (lb *LoadBalancer) forwardQueuedRequest(qr *queuedRequest, peer *PeerNode) bool {
+	// Build forward URL
+	targetURL := fmt.Sprintf("http://%s:%d%s", peer.Instance.IP, peer.Port, qr.r.URL.Path)
+	if qr.r.URL.RawQuery != "" {
+		targetURL += "?" + qr.r.URL.RawQuery
+	}
+
+	// Create forwarded request with timeout
+	ctx, cancel := context.WithTimeout(qr.r.Context(), lb.config.RequestTimeout)
+	defer cancel()
+
+	forwardReq, err := http.NewRequestWithContext(ctx, qr.r.Method, targetURL, bytes.NewReader(qr.bodyBytes))
+	if err != nil {
+		log.Printf("[LB] Failed to create forward request for %s: %v", qr.requestID, err)
+		return false
+	}
+
+	// Copy headers
+	for key, values := range qr.r.Header {
+		for _, value := range values {
+			forwardReq.Header.Add(key, value)
+		}
+	}
+	forwardReq.Header.Set("X-Forwarded-For", qr.r.RemoteAddr)
+	forwardReq.Header.Set("X-LB-Hop", "1")
+	forwardReq.Header.Set("X-Request-ID", qr.requestID)
+	forwardReq.Header.Set("X-Queue-Wait-Ms", fmt.Sprintf("%.2f", float64(time.Since(qr.enqueuedAt).Microseconds())/1000.0))
+
+	// Trace forward start
+	lb.tracer.TraceForwardStart(qr.requestID, peer.Instance.ID, peer.Instance.IP)
+
+	forwardStart := time.Now()
+	resp, err := lb.httpClient.Do(forwardReq)
+	forwardDuration := time.Since(forwardStart)
+
+	if err != nil {
+		log.Printf("[LB] Queue forward to %s failed: %v", peer.Instance.IP, err)
+		lb.tracer.TraceForwardEnd(qr.requestID, 0, float64(forwardDuration.Microseconds())/1000.0)
+		return false
+	}
+	defer resp.Body.Close()
+
+	// Copy response to original writer
+	for key, values := range resp.Header {
+		for _, value := range values {
+			qr.w.Header().Add(key, value)
+		}
+	}
+	qr.w.Header().Set("X-Served-By", peer.Instance.ID)
+	qr.w.Header().Set("X-Queue-Forwarded", "true")
+	qr.w.WriteHeader(resp.StatusCode)
+	io.Copy(qr.w, resp.Body)
+
+	lb.tracer.TraceForwardEnd(qr.requestID, resp.StatusCode, float64(forwardDuration.Microseconds())/1000.0)
+
+	log.Printf("[LB] Queue request %s forwarded to %s -> status=%d in %.1fms",
+		qr.requestID, peer.Instance.IP, resp.StatusCode, float64(forwardDuration.Milliseconds()))
+	return true
 }
 
 // handleStatusEndpoint returns the load balancer status as JSON

@@ -8,6 +8,9 @@
 # Loki
 .data/
 
+# Guidellm
+benchmarks.html
+
 # Test binary, build output
 *.test
 *.out

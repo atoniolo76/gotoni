@@ -255,12 +255,13 @@ func (t *Tracer) TraceQueueEnter(requestID string, queueDepth int) {
 		Args: map[string]interface{}{
 			"request_id":  requestID,
 			"queue_depth": queueDepth,
+			"action":      "enqueue",
 		},
 	})
 }
 
 // TraceQueueExit records when a request leaves the queue
-func (t *Tracer) TraceQueueExit(requestID string, waitTimeMs float64) {
+func (t *Tracer) TraceQueueExit(requestID string, waitTimeMs float64, exitReason string) {
 	if !t.IsActive() {
 		return
 	}
@@ -273,6 +274,46 @@ func (t *Tracer) TraceQueueExit(requestID string, waitTimeMs float64) {
 		Args: map[string]interface{}{
 			"request_id":   requestID,
 			"wait_time_ms": waitTimeMs,
+			"exit_reason":  exitReason, // "local_process", "forwarded_to_peer", "timeout", "cancelled"
+		},
+	})
+}
+
+// TraceQueueForwardAttempt records when the queue processor attempts to forward a request
+func (t *Tracer) TraceQueueForwardAttempt(requestID string, queueDepth int, peerSelected bool, targetPeer string) {
+	if !t.IsActive() {
+		return
+	}
+
+	t.recordEvent(TraceEvent{
+		Name: "queue_forward_attempt",
+		Cat:  "queue",
+		Ph:   "i", // Instant event
+		Tid:  hashString(requestID) % 1000,
+		Args: map[string]interface{}{
+			"request_id":    requestID,
+			"queue_depth":   queueDepth,
+			"peer_selected": peerSelected,
+			"target_peer":   targetPeer,
+		},
+	})
+}
+
+// TraceQueueProbe records when the queue probe runs
+func (t *Tracer) TraceQueueProbe(queueDepth int, peersAvailable int, forwarded int) {
+	if !t.IsActive() {
+		return
+	}
+
+	t.recordEvent(TraceEvent{
+		Name: "queue_probe",
+		Cat:  "queue",
+		Ph:   "i", // Instant event
+		Tid:  0,   // Use thread 0 for system events
+		Args: map[string]interface{}{
+			"queue_depth":     queueDepth,
+			"peers_available": peersAvailable,
+			"forwarded":       forwarded,
 		},
 	})
 }
