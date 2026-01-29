@@ -197,6 +197,28 @@ Examples:
 	Run: runLBTune,
 }
 
+// lbLatencyCmd displays point-to-point latencies between nodes
+var lbLatencyCmd = &cobra.Command{
+	Use:   "latency",
+	Short: "Display point-to-point transport latencies between nodes",
+	Long: `Display the measured network latencies between load balancer nodes.
+
+Latencies are measured during metrics polling and represent the round-trip
+time from each node to its peers. This helps understand inter-region
+transport costs for load balancing decisions.
+
+Examples:
+  # Show latencies from all instances to their peers
+  gotoni lb latency --all
+
+  # Show latencies from specific hosts
+  gotoni lb latency --host 192.168.1.100,192.168.1.101
+
+  # Show as a matrix format
+  gotoni lb latency --all --matrix`,
+	Run: runLBLatency,
+}
+
 func init() {
 	rootCmd.AddCommand(lbCmd)
 	lbCmd.AddCommand(lbStartCmd)
@@ -207,6 +229,7 @@ func init() {
 	lbCmd.AddCommand(lbPeersCmd)
 	lbPeersCmd.AddCommand(lbPeersAddMeshCmd)
 	lbCmd.AddCommand(lbTuneCmd)
+	lbCmd.AddCommand(lbLatencyCmd)
 
 	// Flags for lb start - defaults from pkg/config/constants.go
 	lbStartCmd.Flags().String("config", "", "Path to JSON config file")
@@ -266,6 +289,12 @@ func init() {
 	lbTuneCmd.Flags().Int("port", config.DefaultLoadBalancerPort, "Load balancer port")
 	lbTuneCmd.Flags().Float64("ms-per-token", 0, "Set ms_per_token (t_prefill) - 0 means don't change")
 	lbTuneCmd.Flags().Float64("running-cost-factor", 0, "Set running_cost_factor - 0 means don't change")
+
+	// Flags for lb latency
+	lbLatencyCmd.Flags().Bool("all", false, "Show latencies from all running instances")
+	lbLatencyCmd.Flags().StringSlice("host", []string{}, "Load balancer host(s) to query (comma-separated)")
+	lbLatencyCmd.Flags().Int("port", config.DefaultLoadBalancerPort, "Load balancer port")
+	lbLatencyCmd.Flags().Bool("matrix", false, "Display as a matrix format")
 }
 
 func runLBStart(cmd *cobra.Command, args []string) {
@@ -980,4 +1009,182 @@ func runLBTune(cmd *cobra.Command, args []string) {
 			}
 		}
 	}
+}
+
+func runLBLatency(cmd *cobra.Command, args []string) {
+	useAll, _ := cmd.Flags().GetBool("all")
+	hosts, _ := cmd.Flags().GetStringSlice("host")
+	port, _ := cmd.Flags().GetInt("port")
+	useMatrix, _ := cmd.Flags().GetBool("matrix")
+
+	client := &http.Client{Timeout: 5 * time.Second}
+
+	// Get hosts from cluster if --all is specified
+	var allHosts []string
+	if useAll {
+		apiToken := remote.GetAPIToken()
+		if apiToken == "" {
+			log.Fatal("LAMBDA_API_KEY not set. Required for --all flag.")
+		}
+		httpClient := remote.NewHTTPClient()
+		instances, err := remote.ListRunningInstances(httpClient, apiToken)
+		if err != nil {
+			log.Fatalf("Failed to list instances: %v", err)
+		}
+		for _, inst := range instances {
+			allHosts = append(allHosts, inst.IP)
+		}
+		if len(allHosts) == 0 {
+			log.Fatal("No running instances found")
+		}
+		fmt.Printf("Collecting latencies from %d instances...\n\n", len(allHosts))
+	} else if len(hosts) > 0 {
+		// Expand comma-separated hosts
+		for _, h := range hosts {
+			for _, host := range strings.Split(h, ",") {
+				host = strings.TrimSpace(host)
+				if host != "" {
+					allHosts = append(allHosts, host)
+				}
+			}
+		}
+	} else {
+		// Default to localhost if nothing specified
+		allHosts = []string{"localhost"}
+	}
+
+	// Collect latency data from all hosts
+	// Map: source -> (dest -> latency_ms)
+	latencyData := make(map[string]map[string]int64)
+
+	for _, host := range allHosts {
+		metricsURL := fmt.Sprintf("http://%s:%d/lb/metrics", host, port)
+		resp, err := client.Get(metricsURL)
+		if err != nil {
+			fmt.Printf("❌ %s: failed to connect - %v\n", host, err)
+			continue
+		}
+
+		var result map[string]interface{}
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			resp.Body.Close()
+			fmt.Printf("❌ %s: failed to parse response - %v\n", host, err)
+			continue
+		}
+		resp.Body.Close()
+
+		// Extract peer latencies
+		peers, ok := result["peers"].(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		latencyData[host] = make(map[string]int64)
+		for _, peerData := range peers {
+			peer := peerData.(map[string]interface{})
+			peerIP := peer["ip"].(string)
+			latencyMs := int64(0)
+			if lat, ok := peer["latency_ms"].(float64); ok {
+				latencyMs = int64(lat)
+			}
+			latencyData[host][peerIP] = latencyMs
+		}
+	}
+
+	if len(latencyData) == 0 {
+		fmt.Println("No latency data collected")
+		return
+	}
+
+	if useMatrix {
+		// Display as matrix format
+		displayLatencyMatrix(allHosts, latencyData)
+	} else {
+		// Display as list format
+		displayLatencyList(latencyData)
+	}
+}
+
+func displayLatencyList(latencyData map[string]map[string]int64) {
+	for source, peers := range latencyData {
+		if len(peers) == 0 {
+			fmt.Printf("📍 %s: no peers configured\n", source)
+			continue
+		}
+		fmt.Printf("📍 %s:\n", source)
+		for dest, latency := range peers {
+			indicator := "✅"
+			if latency > 100 {
+				indicator = "⚠️"
+			} else if latency > 200 {
+				indicator = "🐢"
+			}
+			fmt.Printf("   %s → %s: %d ms\n", indicator, dest, latency)
+		}
+	}
+}
+
+func displayLatencyMatrix(allHosts []string, latencyData map[string]map[string]int64) {
+	// Build list of all unique hosts (sources + destinations)
+	hostSet := make(map[string]bool)
+	for source := range latencyData {
+		hostSet[source] = true
+		for dest := range latencyData[source] {
+			hostSet[dest] = true
+		}
+	}
+
+	// Create ordered host list
+	var hosts []string
+	for h := range hostSet {
+		hosts = append(hosts, h)
+	}
+
+	// Truncate IPs for display (last octet)
+	shortName := func(ip string) string {
+		parts := strings.Split(ip, ".")
+		if len(parts) == 4 {
+			return "." + parts[3]
+		}
+		return ip
+	}
+
+	// Calculate column width
+	colWidth := 8
+
+	// Print header
+	fmt.Printf("\nLatency Matrix (ms):\n")
+	fmt.Printf("%15s", "From \\ To")
+	for _, h := range hosts {
+		fmt.Printf("%*s", colWidth, shortName(h))
+	}
+	fmt.Println()
+	fmt.Printf("%15s", strings.Repeat("-", 15))
+	for range hosts {
+		fmt.Printf("%s", strings.Repeat("-", colWidth))
+	}
+	fmt.Println()
+
+	// Print rows
+	for _, source := range hosts {
+		fmt.Printf("%15s", shortName(source))
+		for _, dest := range hosts {
+			if source == dest {
+				fmt.Printf("%*s", colWidth, "-")
+			} else if peers, ok := latencyData[source]; ok {
+				if lat, ok := peers[dest]; ok {
+					fmt.Printf("%*d", colWidth, lat)
+				} else {
+					fmt.Printf("%*s", colWidth, "?")
+				}
+			} else {
+				fmt.Printf("%*s", colWidth, "?")
+			}
+		}
+		fmt.Println()
+	}
+	fmt.Println()
+
+	// Print legend
+	fmt.Println("Legend: - = self, ? = no data")
 }
