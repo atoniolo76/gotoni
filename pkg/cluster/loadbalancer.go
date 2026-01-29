@@ -61,6 +61,10 @@ type LoadBalancerConfig struct {
 	// If > 0: forward when running_reqs exceeds this (overrides IE queue)
 	RunningReqsThreshold int `json:"running_reqs_threshold"`
 
+	// GORGO/GORGO2 tuning parameters (runtime adjustable)
+	GORGOMsPerToken         float64 `json:"gorgo_ms_per_token"`
+	GORGO2RunningCostFactor float64 `json:"gorgo2_running_cost_factor"`
+
 	// Node identity for tracing
 	NodeID      string `json:"node_id"`
 	ClusterName string `json:"cluster_name"`
@@ -90,6 +94,10 @@ func DefaultLoadBalancerConfig() *LoadBalancerConfig {
 		// Running threshold takes priority over IE queue indicator
 		RunningReqsThreshold: config.DefaultRunningReqsThreshold,
 		UseIEQueueIndicator:  config.DefaultUseIEQueueIndicator,
+
+		// GORGO/GORGO2 tuning parameters
+		GORGOMsPerToken:         config.DefaultGORGOMsPerToken,
+		GORGO2RunningCostFactor: config.DefaultGORGO2RunningCostFactor,
 	}
 }
 
@@ -109,6 +117,7 @@ type prefixNode struct {
 type GORGOPolicy struct {
 	mu   sync.RWMutex
 	root *GORGONode
+	lb   *LoadBalancer // Reference to access tuning parameters
 }
 
 type GORGONode struct {
@@ -116,11 +125,6 @@ type GORGONode struct {
 	peers    []*PeerNode
 	prefix   string // variable length
 }
-
-const GORGO_MS_PER_TOKEN = 0.094 // Cold-start prefill rate on 8xA100 with Mistral-7B
-
-// GORGO2 constants
-const GORGO2_RUNNING_COST_FACTOR = 0.5 // Running requests cost less (already partially processed)
 
 // GORGO2Policy extends GORGO by comparing local queue cost vs peer costs
 type GORGO2Policy struct {
@@ -327,6 +331,14 @@ func (p *GORGO2Policy) Select(peers []*PeerNode, availabilityMap map[*PeerNode]A
 	// Calculate total token count for this request
 	totalTokens := GetTokenCount(requestPath)
 
+	// Get tuning parameters from lb
+	msPerToken := config.DefaultGORGOMsPerToken
+	if p.lb != nil {
+		p.lb.tuningMu.RLock()
+		msPerToken = p.lb.msPerToken
+		p.lb.tuningMu.RUnlock()
+	}
+
 	// 1. Calculate local node cost
 	localCost := p.calculateLocalCost(requestPath, totalTokens)
 
@@ -342,7 +354,7 @@ func (p *GORGO2Policy) Select(peers []*PeerNode, availabilityMap map[*PeerNode]A
 		unmatchedTokens := GetTokenCount(unmatchedText)
 
 		for _, peer := range match.peers {
-			prefillCost := float64(unmatchedTokens) * GORGO_MS_PER_TOKEN
+			prefillCost := float64(unmatchedTokens) * msPerToken
 			totalPeerCost := float64(peer.Metrics.Latency) + prefillCost
 
 			if totalPeerCost < lowestPeerCost {
@@ -360,7 +372,7 @@ func (p *GORGO2Policy) Select(peers []*PeerNode, availabilityMap map[*PeerNode]A
 				continue
 			}
 			// Cold-start: full prefill cost
-			prefillCost := float64(totalTokens) * GORGO_MS_PER_TOKEN
+			prefillCost := float64(totalTokens) * msPerToken
 			totalPeerCost := float64(peer.Metrics.Latency) + prefillCost
 
 			if totalPeerCost < lowestPeerCost {
@@ -386,17 +398,23 @@ func (p *GORGO2Policy) calculateLocalCost(requestPath string, requestTokens int)
 		return 0
 	}
 
+	// Get tuning parameters from lb
+	p.lb.tuningMu.RLock()
+	msPerToken := p.lb.msPerToken
+	runningCostFactor := p.lb.runningCostFactor
+	p.lb.tuningMu.RUnlock()
+
 	var totalCost float64
 
-	// Cost from running requests: 0.5 * MS_PER_TOKEN * tokens
+	// Cost from running requests: runningCostFactor * msPerToken * tokens
 	// Lower factor because running requests are already partially processed
 	p.lb.runningRequestsMu.RLock()
 	for _, running := range p.lb.runningRequests {
-		totalCost += GORGO2_RUNNING_COST_FACTOR * GORGO_MS_PER_TOKEN * float64(running.tokenCount)
+		totalCost += runningCostFactor * msPerToken * float64(running.tokenCount)
 	}
 	p.lb.runningRequestsMu.RUnlock()
 
-	// Cost from queued requests: MS_PER_TOKEN * tokens
+	// Cost from queued requests: msPerToken * tokens
 	// Use pre-calculated token counts to avoid expensive operations under lock
 	// Copy queue length and aggregate token count quickly, then release lock
 	p.lb.queueMu.Lock()
@@ -412,10 +430,10 @@ func (p *GORGO2Policy) calculateLocalCost(requestPath string, requestTokens int)
 	}
 	p.lb.queueMu.Unlock()
 
-	totalCost += GORGO_MS_PER_TOKEN * float64(queuedTokens)
+	totalCost += msPerToken * float64(queuedTokens)
 
 	// Add cost for the incoming request itself
-	totalCost += GORGO_MS_PER_TOKEN * float64(requestTokens)
+	totalCost += msPerToken * float64(requestTokens)
 
 	return totalCost
 }
@@ -530,12 +548,20 @@ func (p *GORGOPolicy) Select(peers []*PeerNode, availabilityMap map[*PeerNode]Av
 	lowestCost := int(^uint(0) >> 1)
 	var bestPeer *PeerNode
 
+	// Get ms per token from lb (with fallback to config default)
+	msPerToken := config.DefaultGORGOMsPerToken
+	if p.lb != nil {
+		p.lb.tuningMu.RLock()
+		msPerToken = p.lb.msPerToken
+		p.lb.tuningMu.RUnlock()
+	}
+
 	for _, match := range matches {
 		unmatchedText := requestPath[len(match.node.prefix):]
 		unmatchedTokens := GetTokenCount(unmatchedText)
 
 		for _, peer := range match.node.peers {
-			prefillCost := float64(unmatchedTokens) * GORGO_MS_PER_TOKEN
+			prefillCost := float64(unmatchedTokens) * msPerToken
 			totalCost := int(peer.Metrics.Latency) + int(prefillCost)
 
 			if totalCost < lowestCost {
@@ -779,6 +805,11 @@ type LoadBalancer struct {
 	runningRequests   map[string]*runningRequest
 	runningRequestsMu sync.RWMutex
 
+	// GORGO/GORGO2 tuning parameters (runtime adjustable)
+	msPerToken        float64
+	runningCostFactor float64
+	tuningMu          sync.RWMutex
+
 	// HTTP clients
 	httpClient *http.Client
 	localProxy *httputil.ReverseProxy
@@ -835,11 +866,13 @@ func NewLoadBalancer(cfg *LoadBalancerConfig, self *remote.RunningInstance) *Loa
 				IdleConnTimeout:     config.DefaultIdleConnTimeout,
 			},
 		},
-		localProxy:      localProxy,
-		tracer:          tracer,
-		ctx:             ctx,
-		cancel:          cancel,
-		runningRequests: make(map[string]*runningRequest), // For GORGO2
+		localProxy:        localProxy,
+		tracer:            tracer,
+		ctx:               ctx,
+		cancel:            cancel,
+		runningRequests:   make(map[string]*runningRequest), // For GORGO2
+		msPerToken:        cfg.GORGOMsPerToken,
+		runningCostFactor: cfg.GORGO2RunningCostFactor,
 	}
 
 	if cfg.QueueEnabled {
@@ -1568,6 +1601,12 @@ func (lb *LoadBalancer) handleConfigEndpoint(w http.ResponseWriter, r *http.Requ
 	w.Header().Set("Content-Type", "application/json")
 
 	if r.Method == http.MethodGet {
+		// Get tuning parameters
+		lb.tuningMu.RLock()
+		msPerToken := lb.msPerToken
+		runningCostFactor := lb.runningCostFactor
+		lb.tuningMu.RUnlock()
+
 		// Return current config
 		config := map[string]interface{}{
 			"policy":              lb.getStrategyName(),
@@ -1579,6 +1618,9 @@ func (lb *LoadBalancer) handleConfigEndpoint(w http.ResponseWriter, r *http.Requ
 			"gpu_cache_threshold": lb.config.GPUCacheThreshold,
 			"listen_port":         lb.config.LoadBalancerPort,
 			"backend_port":        lb.config.ApplicationPort,
+			// GORGO/GORGO2 tuning parameters
+			"ms_per_token":        msPerToken,
+			"running_cost_factor": runningCostFactor,
 		}
 		json.NewEncoder(w).Encode(config)
 		return
@@ -1591,6 +1633,9 @@ func (lb *LoadBalancer) handleConfigEndpoint(w http.ResponseWriter, r *http.Requ
 			MaxConcurrent     *int     `json:"max_concurrent"`
 			QueueEnabled      *bool    `json:"queue_enabled"`
 			GPUCacheThreshold *float64 `json:"gpu_cache_threshold"`
+			// GORGO/GORGO2 tuning parameters
+			MsPerToken        *float64 `json:"ms_per_token"`
+			RunningCostFactor *float64 `json:"running_cost_factor"`
 		}
 
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -1632,6 +1677,34 @@ func (lb *LoadBalancer) handleConfigEndpoint(w http.ResponseWriter, r *http.Requ
 			changes = append(changes, fmt.Sprintf("gpu_cache_threshold: %.2f -> %.2f", old, *req.GPUCacheThreshold))
 		}
 
+		// Update GORGO ms_per_token if specified
+		if req.MsPerToken != nil {
+			lb.tuningMu.Lock()
+			old := lb.msPerToken
+			lb.msPerToken = *req.MsPerToken
+			lb.config.GORGOMsPerToken = *req.MsPerToken
+			lb.tuningMu.Unlock()
+			changes = append(changes, fmt.Sprintf("ms_per_token: %.4f -> %.4f", old, *req.MsPerToken))
+			log.Printf("[LB] ms_per_token changed: %.4f -> %.4f", old, *req.MsPerToken)
+		}
+
+		// Update GORGO2 running_cost_factor if specified
+		if req.RunningCostFactor != nil {
+			lb.tuningMu.Lock()
+			old := lb.runningCostFactor
+			lb.runningCostFactor = *req.RunningCostFactor
+			lb.config.GORGO2RunningCostFactor = *req.RunningCostFactor
+			lb.tuningMu.Unlock()
+			changes = append(changes, fmt.Sprintf("running_cost_factor: %.2f -> %.2f", old, *req.RunningCostFactor))
+			log.Printf("[LB] running_cost_factor changed: %.2f -> %.2f", old, *req.RunningCostFactor)
+		}
+
+		// Get current tuning params for response
+		lb.tuningMu.RLock()
+		currentMsPerToken := lb.msPerToken
+		currentRunningCostFactor := lb.runningCostFactor
+		lb.tuningMu.RUnlock()
+
 		response := map[string]interface{}{
 			"success": true,
 			"changes": changes,
@@ -1640,6 +1713,8 @@ func (lb *LoadBalancer) handleConfigEndpoint(w http.ResponseWriter, r *http.Requ
 				"max_concurrent":      lb.config.MaxConcurrentRequests,
 				"queue_enabled":       lb.config.QueueEnabled,
 				"gpu_cache_threshold": lb.config.GPUCacheThreshold,
+				"ms_per_token":        currentMsPerToken,
+				"running_cost_factor": currentRunningCostFactor,
 			},
 		}
 		json.NewEncoder(w).Encode(response)
@@ -1735,6 +1810,7 @@ func (lb *LoadBalancer) SetStrategy(name string) error {
 				peers:    []*PeerNode{},
 				prefix:   "",
 			},
+			lb: lb,
 		}
 	case "gorgo2":
 		newStrategy = NewGORGO2Policy(lb)

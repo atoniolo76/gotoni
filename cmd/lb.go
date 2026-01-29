@@ -172,6 +172,31 @@ Example:
 	Run: runLBPeersAddMesh,
 }
 
+// lbTuneCmd adjusts GORGO/GORGO2 tuning parameters at runtime
+var lbTuneCmd = &cobra.Command{
+	Use:   "tune",
+	Short: "Get or set GORGO/GORGO2 tuning parameters",
+	Long: `Get or set tuning parameters for GORGO/GORGO2 policies on running load balancers.
+
+Parameters:
+  --ms-per-token        Estimated prefill time per token in ms (t_prefill)
+  --running-cost-factor Weight for running requests in GORGO2 cost calculation (0.0-1.0)
+
+Examples:
+  # Show current tuning parameters on all instances
+  gotoni lb tune --all
+
+  # Set ms_per_token on all instances
+  gotoni lb tune --ms-per-token 0.1 --all
+
+  # Set running_cost_factor on specific hosts
+  gotoni lb tune --running-cost-factor 0.3 --host 192.168.1.100,192.168.1.101
+
+  # Set both parameters
+  gotoni lb tune --ms-per-token 0.15 --running-cost-factor 0.4 --all`,
+	Run: runLBTune,
+}
+
 func init() {
 	rootCmd.AddCommand(lbCmd)
 	lbCmd.AddCommand(lbStartCmd)
@@ -181,6 +206,7 @@ func init() {
 	lbCmd.AddCommand(lbClearCacheCmd)
 	lbCmd.AddCommand(lbPeersCmd)
 	lbPeersCmd.AddCommand(lbPeersAddMeshCmd)
+	lbCmd.AddCommand(lbTuneCmd)
 
 	// Flags for lb start - defaults from pkg/config/constants.go
 	lbStartCmd.Flags().String("config", "", "Path to JSON config file")
@@ -202,6 +228,10 @@ func init() {
 
 	// Cluster identity
 	lbStartCmd.Flags().String("cluster-name", "default", "Cluster name for tracing")
+
+	// GORGO/GORGO2 tuning parameters
+	lbStartCmd.Flags().Float64("ms-per-token", config.DefaultGORGOMsPerToken, "Estimated prefill time per token in ms (t_prefill)")
+	lbStartCmd.Flags().Float64("running-cost-factor", config.DefaultGORGO2RunningCostFactor, "Weight for running requests in GORGO2 (0.0-1.0)")
 
 	// Flags for lb status
 	lbStatusCmd.Flags().Bool("all", false, "Check all running instances in cluster")
@@ -229,6 +259,13 @@ func init() {
 	// Flags for lb peers add-mesh
 	lbPeersAddMeshCmd.Flags().StringSlice("host", []string{}, "All LB hosts to configure as mesh (comma-separated)")
 	lbPeersAddMeshCmd.Flags().Int("port", config.DefaultLoadBalancerPort, "Load balancer port")
+
+	// Flags for lb tune
+	lbTuneCmd.Flags().Bool("all", false, "Apply to all running instances in cluster")
+	lbTuneCmd.Flags().StringSlice("host", []string{}, "Load balancer host(s) to target (comma-separated)")
+	lbTuneCmd.Flags().Int("port", config.DefaultLoadBalancerPort, "Load balancer port")
+	lbTuneCmd.Flags().Float64("ms-per-token", 0, "Set ms_per_token (t_prefill) - 0 means don't change")
+	lbTuneCmd.Flags().Float64("running-cost-factor", 0, "Set running_cost_factor - 0 means don't change")
 }
 
 func runLBStart(cmd *cobra.Command, args []string) {
@@ -286,6 +323,12 @@ func runLBStart(cmd *cobra.Command, args []string) {
 	clusterName, _ := cmd.Flags().GetString("cluster-name")
 	config.NodeID = nodeID
 	config.ClusterName = clusterName
+
+	// Get GORGO/GORGO2 tuning parameters
+	msPerToken, _ := cmd.Flags().GetFloat64("ms-per-token")
+	config.GORGOMsPerToken = msPerToken
+	runningCostFactor, _ := cmd.Flags().GetFloat64("running-cost-factor")
+	config.GORGO2RunningCostFactor = runningCostFactor
 
 	// Set strategy based on flag (gorgo2 is set after lb is created since it needs lb reference)
 	switch strategy {
@@ -355,6 +398,12 @@ func runLBStart(cmd *cobra.Command, args []string) {
 	fmt.Printf("  Max concurrent:   %d\n", config.MaxConcurrentRequests)
 	fmt.Printf("  Queue enabled:    %v\n", config.QueueEnabled)
 	fmt.Printf("  Strategy:         %s\n", strategy)
+	if strategy == "gorgo" || strategy == "gorgo2" {
+		fmt.Printf("  ms_per_token:     %.4f\n", config.GORGOMsPerToken)
+	}
+	if strategy == "gorgo2" {
+		fmt.Printf("  running_cost_factor: %.2f\n", config.GORGO2RunningCostFactor)
+	}
 	if config.RunningReqsThreshold > 0 {
 		fmt.Printf("  Running threshold: %d (forward when running_reqs >= %d)\n", config.RunningReqsThreshold, config.RunningReqsThreshold)
 	} else {
@@ -828,4 +877,107 @@ func runLBPeersAddMesh(cmd *cobra.Command, args []string) {
 	}
 
 	fmt.Println("🔗 Mesh configuration complete!")
+}
+
+func runLBTune(cmd *cobra.Command, args []string) {
+	useAll, _ := cmd.Flags().GetBool("all")
+	hosts, _ := cmd.Flags().GetStringSlice("host")
+	port, _ := cmd.Flags().GetInt("port")
+	msPerToken, _ := cmd.Flags().GetFloat64("ms-per-token")
+	runningCostFactor, _ := cmd.Flags().GetFloat64("running-cost-factor")
+
+	client := &http.Client{Timeout: 5 * time.Second}
+
+	// Get hosts from cluster if --all is specified
+	var allHosts []string
+	if useAll {
+		apiToken := remote.GetAPIToken()
+		if apiToken == "" {
+			log.Fatal("LAMBDA_API_KEY not set. Required for --all flag.")
+		}
+		httpClient := remote.NewHTTPClient()
+		instances, err := remote.ListRunningInstances(httpClient, apiToken)
+		if err != nil {
+			log.Fatalf("Failed to list instances: %v", err)
+		}
+		for _, inst := range instances {
+			allHosts = append(allHosts, inst.IP)
+		}
+		if len(allHosts) == 0 {
+			log.Fatal("No running instances found")
+		}
+		fmt.Printf("Targeting %d instances...\n\n", len(allHosts))
+	} else if len(hosts) > 0 {
+		// Expand comma-separated hosts
+		for _, h := range hosts {
+			for _, host := range strings.Split(h, ",") {
+				host = strings.TrimSpace(host)
+				if host != "" {
+					allHosts = append(allHosts, host)
+				}
+			}
+		}
+	} else {
+		// Default to localhost if nothing specified
+		allHosts = []string{"localhost"}
+	}
+
+	// Check if we're setting values or just getting
+	isSettingValues := msPerToken > 0 || runningCostFactor > 0
+
+	for _, host := range allHosts {
+		configURL := fmt.Sprintf("http://%s:%d/lb/config", host, port)
+
+		if !isSettingValues {
+			// GET current tuning parameters
+			resp, err := client.Get(configURL)
+			if err != nil {
+				fmt.Printf("❌ %s: failed to connect - %v\n", host, err)
+				continue
+			}
+			defer resp.Body.Close()
+
+			var result map[string]interface{}
+			if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+				fmt.Printf("❌ %s: failed to parse response - %v\n", host, err)
+				continue
+			}
+
+			policy := result["policy"]
+			mspt := result["ms_per_token"]
+			rcf := result["running_cost_factor"]
+			fmt.Printf("✅ %s: policy=%s, ms_per_token=%.4f, running_cost_factor=%.2f\n",
+				host, policy, mspt, rcf)
+		} else {
+			// POST to update tuning parameters
+			reqBody := make(map[string]interface{})
+			if msPerToken > 0 {
+				reqBody["ms_per_token"] = msPerToken
+			}
+			if runningCostFactor > 0 {
+				reqBody["running_cost_factor"] = runningCostFactor
+			}
+
+			bodyBytes, _ := json.Marshal(reqBody)
+			resp, err := client.Post(configURL, "application/json", strings.NewReader(string(bodyBytes)))
+			if err != nil {
+				fmt.Printf("❌ %s: failed to connect - %v\n", host, err)
+				continue
+			}
+			defer resp.Body.Close()
+
+			var result map[string]interface{}
+			if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+				fmt.Printf("❌ %s: failed to parse response - %v\n", host, err)
+				continue
+			}
+
+			if result["success"] == true {
+				changes := result["changes"]
+				fmt.Printf("✅ %s: %v\n", host, changes)
+			} else {
+				fmt.Printf("❌ %s: %v\n", host, result["error"])
+			}
+		}
+	}
 }

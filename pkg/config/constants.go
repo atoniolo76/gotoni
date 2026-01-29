@@ -60,13 +60,26 @@ const (
 // Load Balancing Strategy
 const (
 	// DefaultStrategy is the load balancing algorithm to use
-	// Options: "gorgo", "least-loaded", "prefix-tree"
+	// Options: "gorgo", "gorgo2", "least-loaded", "prefix-tree"
 	DefaultStrategy = "gorgo"
 
 	// DefaultUseIEQueueIndicator controls whether to use SGLang's internal queue
 	// as the capacity indicator. When true, forwards when NumWaitingReqs > 0.
 	// Note: RunningReqsThreshold > 0 overrides this setting.
 	DefaultUseIEQueueIndicator = true
+)
+
+// GORGO/GORGO2 Policy Tuning Parameters
+const (
+	// DefaultGORGOMsPerToken is the estimated prefill time per token in milliseconds
+	// This represents cold-start prefill rate on 8xA100 with Mistral-7B
+	// Adjust based on your hardware and model
+	DefaultGORGOMsPerToken = 0.094
+
+	// DefaultGORGO2RunningCostFactor is the weight applied to running requests
+	// Running requests cost less because they're already partially processed
+	// Range: 0.0 to 1.0 (lower = running requests weighted less)
+	DefaultGORGO2RunningCostFactor = 0.5
 )
 
 // =============================================================================
