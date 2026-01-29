@@ -8,9 +8,16 @@
 # Loki
 .data/
 
+# Guidellm
+benchmarks.html
+
 # Test binary, build output
 *.test
 *.out
+
+# Target
+target/
+Cargo.lock
 
 # Output of the go coverage tool
 *.coverprofile
@@ -69,6 +76,21 @@ config.yaml
 *.gif
 !docs/*.gif
 
+# Trace files
+*.trace.json
+*.trace.json.gz
+
+# Metrics files
+*.metrics.json
+*.metrics.json.gz
+
+# Summary files
+*.summary.json
+*.summary.json.gz
+
+# jsonl files
+*.jsonl
+
 # Data files
 *.csv
 *.json
@@ -98,4 +120,4 @@ gotoni
 
 # Test coverage
 *.coverprofile
-coverage.html
+coverage.html.env

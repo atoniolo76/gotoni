@@ -146,18 +146,8 @@ func (p *LambdaProvider) LaunchInstance(httpClient *http.Client, apiToken string
 			SSHKeyName: finalSSHKeyName,
 			SSHKeyFile: sshKeyFile,
 		}
-
-		// Save instance info to DB
-		// We only have ID and key info right now. Detailed info comes later or via GetInstance.
-		// But we need to store the mapping instanceID -> sshKeyName
-		inst := &db.Instance{
-			ID:         instanceID,
-			SSHKeyName: finalSSHKeyName,
-			// Other fields empty for now, will be updated later or on status check
-		}
-		if err := database.SaveInstance(inst); err != nil {
-			return nil, fmt.Errorf("failed to save instance to db: %w", err)
-		}
+		// Note: Instance state is managed by Lambda API, not local DB
+		// SSH key file path is stored in DB separately (done by CreateSSHKeyForProject or via --ssh-key flag handling)
 	}
 
 	return instances, nil
@@ -171,13 +161,6 @@ func (p *LambdaProvider) LaunchAndWait(httpClient *http.Client, apiToken string,
 		return nil, fmt.Errorf("failed to launch instances: %w", err)
 	}
 
-	// Init DB for updating instance details
-	database, err := db.InitDB()
-	if err != nil {
-		return nil, fmt.Errorf("failed to init db: %w", err)
-	}
-	defer database.Close()
-
 	// Wait for each instance to become ready
 	for i, instance := range instances {
 		fmt.Printf("Waiting for instance %s to become ready...\n", instance.ID)
@@ -186,29 +169,8 @@ func (p *LambdaProvider) LaunchAndWait(httpClient *http.Client, apiToken string,
 		}
 		fmt.Printf("Instance %s is now ready!\n", instance.ID)
 
-		// Get full instance details now that it's ready
-		instanceDetails, err := p.GetInstance(httpClient, apiToken, instance.ID)
-		if err != nil {
-			fmt.Printf("Warning: Failed to get instance details: %v\n", err)
-			continue
-		}
-
-		// Update database with full details
-		inst := &db.Instance{
-			ID:             instance.ID,
-			Name:           name,
-			Region:         region,
-			Status:         instanceDetails.Status,
-			SSHKeyName:     instance.SSHKeyName,
-			FilesystemName: filesystemName,
-			InstanceType:   instanceDetails.InstanceType.Name,
-			IPAddress:      instanceDetails.IP,
-		}
-		if err := database.SaveInstance(inst); err != nil {
-			fmt.Printf("Warning: Failed to update instance in db: %v\n", err)
-		}
-
-		// Update the returned instance with IP
+		// Instance state is managed by Lambda API, not local DB
+		// Just preserve the launch info in the returned struct
 		instances[i].ID = instance.ID
 		instances[i].SSHKeyName = instance.SSHKeyName
 		instances[i].SSHKeyFile = instance.SSHKeyFile
