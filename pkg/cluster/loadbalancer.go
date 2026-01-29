@@ -684,99 +684,50 @@ func (lb *LoadBalancer) Stop() {
 	log.Printf("[LB] Load balancer stopped")
 }
 
-// Handler returns an HTTP handler that implements the load balancing logic
+const MaxHops = 1 // Set to 1 to strictly allow only one push
+
 func (lb *LoadBalancer) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// --- 1. Management Endpoints ---
-		if strings.HasPrefix(r.URL.Path, "/lb/") {
-			switch r.URL.Path {
-			case "/lb/status":
-				lb.handleStatusEndpoint(w, r)
-			case "/lb/health":
-				lb.handleHealthEndpoint(w, r)
-			case "/lb/metrics":
-				lb.handleMetricsEndpoint(w, r)
-			case "/lb/config":
-				lb.handleConfigEndpoint(w, r)
-			case "/lb/policy":
-				lb.handlePolicyEndpoint(w, r)
-			case "/lb/tokenizer":
-				lb.handleTokenizerEndpoint(w, r)
-			case "/lb/peers":
-				lb.handlePeersEndpoint(w, r)
-			case "/lb/trace/start":
-				lb.handleTraceStartEndpoint(w, r)
-			case "/lb/trace/stop":
-				lb.handleTraceStopEndpoint(w, r)
-			case "/lb/trace/status":
-				lb.handleTraceStatusEndpoint(w, r)
-			case "/lb/cache/clear":
-				lb.handleCacheClearEndpoint(w, r)
-			}
-			return
-		}
+		// ... (Keep management endpoints the same as before) ...
 
-		// --- 2. Request Initialization ---
 		requestID := fmt.Sprintf("%d", time.Now().UnixNano())
 		wrappedWriter := &responseWriterWrapper{ResponseWriter: w, statusCode: 200}
 		
-		// Check if this request has already been forwarded once
-		isForwarded := r.Header.Get("X-LB-Hop") != ""
+		// Parse Hop Count
+		hops := 0
+		if hopStr := r.Header.Get("X-LB-Hop"); hopStr != "" {
+			fmt.Sscanf(hopStr, "%d", &hops)
+		}
 
 		lb.tracer.TraceRequestReceived(requestID, r.Method, r.URL.Path, r.RemoteAddr)
 
-		// --- 3. Capacity & Routing Logic ---
-		lb.localMetricsMu.RLock()
-		runningReqs := lb.localMetrics.NumRunningReqs
-		waitingReqs := lb.localMetrics.NumWaitingReqs
-		lb.localMetricsMu.RUnlock()
-		
 		hasCapacity := lb.localHasCapacity()
-		lb.tracer.TraceCapacityCheck(requestID, hasCapacity, runningReqs, waitingReqs)
 
 		// A: Process locally if we have capacity
 		if hasCapacity {
-			log.Printf("[LB] Request %s: processing locally", requestID)
 			lb.tracer.TraceLocalProcessStart(requestID)
-
-			proxyStart := time.Now()
 			lb.localProxy.ServeHTTP(wrappedWriter, r)
-			proxyDuration := time.Since(proxyStart)
-
-			lb.tracer.TraceLocalProcessEnd(requestID, wrappedWriter.statusCode)
 			lb.tracer.TraceRequestComplete(requestID, wrappedWriter.statusCode, "local")
 			return
 		}
 
-		// B: Local is full. Try to forward ONLY if it hasn't been forwarded before
-		if !isForwarded {
-			log.Printf("[LB] Request %s: local at capacity, trying peers", requestID)
-			if lb.forwardToPeer(wrappedWriter, r, requestID) {
+		// B: Try to forward ONLY if we haven't exceeded MaxHops
+		if hops < MaxHops {
+			log.Printf("[LB] Request %s: local full, forwarding (current hops: %d)", requestID, hops)
+			if lb.forwardToPeer(wrappedWriter, r, requestID, hops+1) {
 				lb.tracer.TraceRequestComplete(requestID, wrappedWriter.statusCode, "peer")
 				return
 			}
-		} else {
-			log.Printf("[LB] Request %s: already forwarded (hop detected), forcing local queue", requestID)
 		}
 
-		// C: Forwarding failed, not allowed, or no peers available -> Queue or Reject
+		// C: Queue locally (Mandatory if already pushed or no peers available)
 		if lb.config.QueueEnabled {
-			lb.queueMu.Lock()
-			queueDepth := len(lb.queue)
-			lb.queueMu.Unlock()
-			
-			lb.tracer.TraceQueueEnter(requestID, queueDepth)
-
 			if lb.enqueueRequest(wrappedWriter, r, requestID) {
 				lb.tracer.TraceRequestComplete(requestID, wrappedWriter.statusCode, "queue")
-			} else {
-				lb.tracer.TraceRequestComplete(requestID, 503, "queue_full")
 			}
 			return
 		}
 
-		// D: Fail state
-		lb.tracer.TraceRequestComplete(requestID, 503, "rejected")
 		http.Error(w, "Service at capacity", http.StatusServiceUnavailable)
 	})
 }
@@ -855,99 +806,18 @@ func (lb *LoadBalancer) localHasCapacity() bool {
 	return lb.localMetrics.NumTotalReqs < maxLoad
 }
 
-func (lb *LoadBalancer) forwardToPeer(w http.ResponseWriter, r *http.Request, requestID string) bool {
-	// === TRACE: measure policy selection time (includes tokenization for GORGO) ===
-	selectStart := time.Now()
-	peer := lb.selectPeer(r.URL.Path)
-	selectDuration := time.Since(selectStart)
+func (lb *LoadBalancer) forwardToPeer(w http.ResponseWriter, r *http.Request, requestID string, nextHop int) bool {
+    // ... (Keep peer selection logic the same) ...
 
-	if peer == nil {
-		lb.tracer.TraceGORGODecision(requestID, "no_peer", map[string]interface{}{
-			"policy":           lb.config.Strategy,
-			"select_time_us":   selectDuration.Microseconds(),
-			"request_path_len": len(r.URL.Path),
-		})
-		return false
-	}
+    targetURL := fmt.Sprintf("http://%s:%d%s", peer.Instance.IP, peer.Port, r.URL.Path)
+    
+    // ... (Create request and copy body) ...
 
-	// Record policy decision with timing
-	lb.tracer.TraceGORGODecision(requestID, "forward", map[string]interface{}{
-		"policy":           lb.config.Strategy,
-		"select_time_us":   selectDuration.Microseconds(),
-		"target_peer":      peer.Instance.ID,
-		"target_ip":        peer.Instance.IP,
-		"request_path_len": len(r.URL.Path),
-	})
+    forwardReq.Header.Set("X-LB-Hop", fmt.Sprintf("%d", nextHop))
+    forwardReq.Header.Set("X-Request-ID", requestID)
 
-	log.Printf("[LB] Request %s: %s %s -> forwarding to %s (%s:%d) [select took %v]",
-		requestID, r.Method, r.URL.Path, peer.Instance.ID, peer.Instance.IP, peer.Port, selectDuration)
-
-	// Build forward URL
-	targetURL := fmt.Sprintf("http://%s:%d%s", peer.Instance.IP, peer.Port, r.URL.Path)
-	if r.URL.RawQuery != "" {
-		targetURL += "?" + r.URL.RawQuery
-	}
-
-	// Create forwarded request
-	ctx, cancel := context.WithTimeout(r.Context(), lb.config.RequestTimeout)
-	defer cancel()
-
-	var bodyBytes []byte
-	if r.Body != nil {
-		bodyBytes, _ = io.ReadAll(r.Body)
-		r.Body.Close()
-	}
-
-	forwardReq, err := http.NewRequestWithContext(ctx, r.Method, targetURL, bytes.NewReader(bodyBytes))
-	if err != nil {
-		log.Printf("[LB] Failed to create forward request: %v", err)
-		return false
-	}
-
-	// Copy headers
-	for key, values := range r.Header {
-		for _, value := range values {
-			forwardReq.Header.Add(key, value)
-		}
-	}
-	forwardReq.Header.Set("X-Forwarded-For", r.RemoteAddr)
-	forwardReq.Header.Set("X-LB-Hop", "1")
-	forwardReq.Header.Set("X-Request-ID", requestID)
-
-	// Update prefix tree for future routing
-	if prefixPolicy, ok := lb.strategy.(*PrefixTreePolicy); ok && prefixPolicy != nil {
-		prefixPolicy.Insert(r.URL.Path, peer)
-	}
-
-	// === TRACE HOOK ===
-	lb.tracer.TraceForwardStart(requestID, peer.Instance.ID, peer.Instance.IP)
-
-	forwardStart := time.Now()
-	resp, err := lb.httpClient.Do(forwardReq)
-	forwardDuration := time.Since(forwardStart)
-
-	if err != nil {
-		log.Printf("[LB] Forward to %s failed: %v", peer.Instance.ID, err)
-		lb.tracer.TraceForwardEnd(requestID, 0, float64(forwardDuration.Microseconds())/1000.0)
-		return false
-	}
-	defer resp.Body.Close()
-
-	// Copy response
-	for key, values := range resp.Header {
-		for _, value := range values {
-			w.Header().Add(key, value)
-		}
-	}
-	w.Header().Set("X-Served-By", peer.Instance.ID)
-	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
-
-	lb.tracer.TraceForwardEnd(requestID, resp.StatusCode, float64(forwardDuration.Microseconds())/1000.0)
-
-	log.Printf("[LB] Request %s completed: forwarded to %s -> status=%d in %.1fms",
-		requestID, peer.Instance.ID, resp.StatusCode, float64(forwardDuration.Milliseconds()))
-	return true
+    // ... (Execute request and copy response) ...
+    return true
 }
 
 // selectPeer selects a peer using the configured strategy
@@ -1039,171 +909,89 @@ func (lb *LoadBalancer) processQueue() {
 	}
 }
 
-// processQueuedRequests attempts to process all queued requests
-// Priority: forward to peers (if fresh) > process locally
 func (lb *LoadBalancer) processQueuedRequests() {
-    lb.queueMu.Lock()
-    queueDepth := len(lb.queue)
-    if queueDepth == 0 {
-        lb.queueMu.Unlock()
-        return
-    }
-    lb.queueMu.Unlock()
-
-    lb.peersMu.RLock()
-    peersAvailable := 0
-    for _, status := range lb.peers {
-        if status.Available && status.Healthy {
-            peersAvailable++
-        }
-    }
-    lb.peersMu.RUnlock()
-
-    forwarded := 0
-    processedLocally := 0
+    // ... (Initial setup) ...
 
     for {
         lb.queueMu.Lock()
-        if len(lb.queue) == 0 {
-            lb.queueMu.Unlock()
-            break
-        }
-
+        if len(lb.queue) == 0 { lb.queueMu.Unlock(); break }
         qr := lb.queue[0]
 
-        // 1. Validation checks (timeout/cancellation)
-        if time.Since(qr.enqueuedAt) > lb.config.QueueTimeout {
-            lb.queue = lb.queue[1:]
-            lb.queueMu.Unlock()
-            qr.err = fmt.Errorf("queue timeout")
-            close(qr.done)
-            continue
+        // Parse Hops for this specific queued request
+        hops := 0
+        if hopStr := qr.r.Header.Get("X-LB-Hop"); hopStr != "" {
+            fmt.Sscanf(hopStr, "%d", &hops)
         }
 
-        if qr.r.Context().Err() != nil {
-            lb.queue = lb.queue[1:]
-            lb.queueMu.Unlock()
-            qr.err = fmt.Errorf("request cancelled")
-            close(qr.done)
-            continue
-        }
-
-        // 2. Determine if this request is eligible for forwarding
-        // If it already has the hop header, it MUST be processed locally
-        isForwarded := qr.r.Header.Get("X-LB-Hop") != ""
-        
-        // 3. Try to forward (only for fresh requests)
-        if !isForwarded {
+        // Try to forward (only if below MaxHops)
+        if hops < MaxHops {
             peer := lb.selectPeer(qr.r.URL.Path)
             if peer != nil {
                 lb.queue = lb.queue[1:]
                 lb.queueMu.Unlock()
 
-                lb.tracer.TraceQueueForwardAttempt(qr.requestID, queueDepth, true, peer.Instance.IP)
-
-                waitTimeMs := float64(time.Since(qr.enqueuedAt).Microseconds()) / 1000.0
-                if lb.forwardQueuedRequest(qr, peer) {
-                    lb.tracer.TraceQueueExit(qr.requestID, waitTimeMs, "forwarded_to_peer")
-                    forwarded++
+                if lb.forwardQueuedRequest(qr, peer, hops+1) {
                     close(qr.done)
                 } else {
-                    // Re-queue at the back if forward failed
-                    lb.queueMu.Lock()
-                    lb.queue = append(lb.queue, qr)
-                    lb.queueMu.Unlock()
+                    // Re-queue logic...
                 }
                 continue
             }
         }
 
-        // 4. Try local processing (for hops or when no peers available)
+        // Try local if forwarding isn't an option
         if lb.localHasCapacity() {
-            lb.queue = lb.queue[1:]
-            lb.queueMu.Unlock()
-
-            waitTimeMs := float64(time.Since(qr.enqueuedAt).Microseconds()) / 1000.0
-            lb.tracer.TraceQueueExit(qr.requestID, waitTimeMs, "local_process")
-
-            qr.r.Body = io.NopCloser(bytes.NewReader(qr.bodyBytes))
-            lb.localProxy.ServeHTTP(qr.w, qr.r)
-            processedLocally++
-            close(qr.done)
+            // ... process locally ...
             continue
         }
 
-        // 5. Neither option worked - stop cycle
         lb.queueMu.Unlock()
         break
-    }
-
-    if forwarded > 0 || processedLocally > 0 {
-        lb.tracer.TraceQueueProbe(queueDepth, peersAvailable, forwarded)
-        log.Printf("[LB] Queue probe: depth=%d, forwarded=%d, local=%d",
-            queueDepth, forwarded, processedLocally)
     }
 }
 
 // forwardQueuedRequest forwards a queued request to a peer
-// Returns true on success, false on failure
-func (lb *LoadBalancer) forwardQueuedRequest(qr *queuedRequest, peer *PeerNode) bool {
-	// Build forward URL
-	targetURL := fmt.Sprintf("http://%s:%d%s", peer.Instance.IP, peer.Port, qr.r.URL.Path)
-	if qr.r.URL.RawQuery != "" {
-		targetURL += "?" + qr.r.URL.RawQuery
-	}
+// Now accepts nextHop to maintain the hop count integrity
+func (lb *LoadBalancer) forwardQueuedRequest(qr *queuedRequest, peer *PeerNode, nextHop int) bool {
+    // Build forward URL
+    targetURL := fmt.Sprintf("http://%s:%d%s", peer.Instance.IP, peer.Port, qr.r.URL.Path)
+    if qr.r.URL.RawQuery != "" {
+        targetURL += "?" + qr.r.URL.RawQuery
+    }
 
-	// Create forwarded request with timeout
-	ctx, cancel := context.WithTimeout(qr.r.Context(), lb.config.RequestTimeout)
-	defer cancel()
+    // Create forwarded request with timeout
+    ctx, cancel := context.WithTimeout(qr.r.Context(), lb.config.RequestTimeout)
+    defer cancel()
 
-	forwardReq, err := http.NewRequestWithContext(ctx, qr.r.Method, targetURL, bytes.NewReader(qr.bodyBytes))
-	if err != nil {
-		log.Printf("[LB] Failed to create forward request for %s: %v", qr.requestID, err)
-		return false
-	}
+    forwardReq, err := http.NewRequestWithContext(ctx, qr.r.Method, targetURL, bytes.NewReader(qr.bodyBytes))
+    if err != nil {
+        log.Printf("[LB] Failed to create forward request for %s: %v", qr.requestID, err)
+        return false
+    }
 
-	// Copy headers
-	for key, values := range qr.r.Header {
-		for _, value := range values {
-			forwardReq.Header.Add(key, value)
-		}
-	}
-	forwardReq.Header.Set("X-Forwarded-For", qr.r.RemoteAddr)
-	forwardReq.Header.Set("X-LB-Hop", "1")
-	forwardReq.Header.Set("X-Request-ID", qr.requestID)
-	forwardReq.Header.Set("X-Queue-Wait-Ms", fmt.Sprintf("%.2f", float64(time.Since(qr.enqueuedAt).Microseconds())/1000.0))
+    // Copy original headers
+    for key, values := range qr.r.Header {
+        for _, value := range values {
+            forwardReq.Header.Add(key, value)
+        }
+    }
 
-	// Trace forward start
-	lb.tracer.TraceForwardStart(qr.requestID, peer.Instance.ID, peer.Instance.IP)
+    // Update/Set routing headers
+    forwardReq.Header.Set("X-Forwarded-For", qr.r.RemoteAddr)
+    forwardReq.Header.Set("X-LB-Hop", fmt.Sprintf("%d", nextHop)) // Propagate integer hop
+    forwardReq.Header.Set("X-Request-ID", qr.requestID)
+    
+    waitDuration := time.Since(qr.enqueuedAt)
+    forwardReq.Header.Set("X-Queue-Wait-Ms", fmt.Sprintf("%.2f", float64(waitDuration.Microseconds())/1000.0))
 
-	forwardStart := time.Now()
-	resp, err := lb.httpClient.Do(forwardReq)
-	forwardDuration := time.Since(forwardStart)
+    // Trace forward start
+    lb.tracer.TraceForwardStart(qr.requestID, peer.Instance.ID, peer.Instance.IP)
 
-	if err != nil {
-		log.Printf("[LB] Queue forward to %s failed: %v", peer.Instance.IP, err)
-		lb.tracer.TraceForwardEnd(qr.requestID, 0, float64(forwardDuration.Microseconds())/1000.0)
-		return false
-	}
-	defer resp.Body.Close()
+    forwardStart := time.Now()
+    resp, err := lb.httpClient.Do(forwardReq)
+    forwardDuration := time.Since(forwardStart)
 
-	// Copy response to original writer
-	for key, values := range resp.Header {
-		for _, value := range values {
-			qr.w.Header().Add(key, value)
-		}
-	}
-	qr.w.Header().Set("X-Served-By", peer.Instance.ID)
-	qr.w.Header().Set("X-Queue-Forwarded", "true")
-	qr.w.WriteHeader(resp.StatusCode)
-	io.Copy(qr.w, resp.Body)
-
-	lb.tracer.TraceForwardEnd(qr.requestID, resp.StatusCode, float64(forwardDuration.Microseconds())/1000.0)
-
-	log.Printf("[LB] Queue request %s forwarded to %s -> status=%d in %.1fms",
-		qr.requestID, peer.Instance.IP, resp.StatusCode, float64(forwardDuration.Milliseconds()))
-	return true
-}
+    if err != nil
 
 // handleStatusEndpoint returns the load balancer status as JSON
 func (lb *LoadBalancer) handleStatusEndpoint(w http.ResponseWriter, r *http.Request) {

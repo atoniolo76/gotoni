@@ -21,6 +21,8 @@ const (
 	DefaultApplicationPort = 8080
 )
 
+const MaxHops = 1
+
 // Capacity & Request Handling
 const (
 	// DefaultMaxConcurrentRequests is the max requests before forwarding to peers
