@@ -99,7 +99,7 @@ var lbPolicyCmd = &cobra.Command{
 	Short: "Get or set load balancer policy",
 	Long: `Get the current policy or switch to a new one on all cluster instances.
 
-Available policies: least-loaded, prefix-tree, gorgo
+Available policies: least-loaded, prefix-tree, gorgo, gorgo2
 
 Examples:
   # Show current policy on all running instances (recommended)
@@ -193,7 +193,7 @@ func init() {
 	lbStartCmd.Flags().Duration("request-timeout", config.DefaultRequestTimeout, "Request timeout for forwarded requests")
 	lbStartCmd.Flags().StringSlice("peers", []string{}, "Peer addresses in format ip:port (can specify multiple)")
 	lbStartCmd.Flags().String("pid-file", "/tmp/gotoni-lb.pid", "Path to PID file")
-	lbStartCmd.Flags().String("strategy", config.DefaultStrategy, "Load balancing strategy (least-loaded, prefix-tree, gorgo)")
+	lbStartCmd.Flags().String("strategy", config.DefaultStrategy, "Load balancing strategy (least-loaded, prefix-tree, gorgo, gorgo2)")
 	lbStartCmd.Flags().String("node-id", "", "Unique identifier for this node in the cluster")
 
 	// Selective pushing flags
@@ -287,14 +287,16 @@ func runLBStart(cmd *cobra.Command, args []string) {
 	config.NodeID = nodeID
 	config.ClusterName = clusterName
 
-	// Set strategy based on flag
+	// Set strategy based on flag (gorgo2 is set after lb is created since it needs lb reference)
 	switch strategy {
 	case "least-loaded":
 		config.Strategy = &serve.LeastLoadedPolicy{}
 	case "prefix-tree":
 		config.Strategy = serve.NewPrefixTreePolicy()
 	case "gorgo":
-		config.Strategy = &serve.GORGOPolicy{}
+		config.Strategy = &serve.GORGOPolicy{} // Will be properly initialized via SetStrategy later
+	case "gorgo2":
+		config.Strategy = nil // Will be set after lb is created
 	default:
 		config.Strategy = &serve.LeastLoadedPolicy{}
 	}
@@ -325,6 +327,13 @@ func runLBStart(cmd *cobra.Command, args []string) {
 			}
 		}
 		lb.AddPeerByIP(peerIP, peerPort)
+	}
+
+	// Set GORGO2 strategy after lb is created (needs lb reference)
+	if strategy == "gorgo2" {
+		if err := lb.SetStrategy("gorgo2"); err != nil {
+			log.Fatalf("Failed to set gorgo2 strategy: %v", err)
+		}
 	}
 
 	// Setup signal handling for graceful shutdown
