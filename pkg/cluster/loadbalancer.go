@@ -687,86 +687,56 @@ func (lb *LoadBalancer) Stop() {
 // Handler returns an HTTP handler that implements the load balancing logic
 func (lb *LoadBalancer) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Handle load balancer status endpoint
-		if r.URL.Path == "/lb/status" {
-			lb.handleStatusEndpoint(w, r)
+		// --- 1. Management Endpoints ---
+		if strings.HasPrefix(r.URL.Path, "/lb/") {
+			switch r.URL.Path {
+			case "/lb/status":
+				lb.handleStatusEndpoint(w, r)
+			case "/lb/health":
+				lb.handleHealthEndpoint(w, r)
+			case "/lb/metrics":
+				lb.handleMetricsEndpoint(w, r)
+			case "/lb/config":
+				lb.handleConfigEndpoint(w, r)
+			case "/lb/policy":
+				lb.handlePolicyEndpoint(w, r)
+			case "/lb/tokenizer":
+				lb.handleTokenizerEndpoint(w, r)
+			case "/lb/peers":
+				lb.handlePeersEndpoint(w, r)
+			case "/lb/trace/start":
+				lb.handleTraceStartEndpoint(w, r)
+			case "/lb/trace/stop":
+				lb.handleTraceStopEndpoint(w, r)
+			case "/lb/trace/status":
+				lb.handleTraceStatusEndpoint(w, r)
+			case "/lb/cache/clear":
+				lb.handleCacheClearEndpoint(w, r)
+			}
 			return
 		}
 
-		// Handle load balancer health endpoint
-		if r.URL.Path == "/lb/health" {
-			lb.handleHealthEndpoint(w, r)
-			return
-		}
-
-		// Handle load balancer metrics endpoint
-		if r.URL.Path == "/lb/metrics" {
-			lb.handleMetricsEndpoint(w, r)
-			return
-		}
-
-		// Handle load balancer config endpoint (GET/POST for runtime config changes)
-		if r.URL.Path == "/lb/config" {
-			lb.handleConfigEndpoint(w, r)
-			return
-		}
-
-		// Handle policy switching endpoint (convenience shortcut)
-		if r.URL.Path == "/lb/policy" {
-			lb.handlePolicyEndpoint(w, r)
-			return
-		}
-
-		// Handle tokenizer test endpoint (verify CGO tokenizer is working)
-		if r.URL.Path == "/lb/tokenizer" {
-			lb.handleTokenizerEndpoint(w, r)
-			return
-		}
-
-		// Handle peers endpoint
-		if r.URL.Path == "/lb/peers" {
-			lb.handlePeersEndpoint(w, r)
-			return
-		}
-
-		// Handle trace endpoints (Perfetto-compatible)
-		if r.URL.Path == "/lb/trace/start" {
-			lb.handleTraceStartEndpoint(w, r)
-			return
-		}
-		if r.URL.Path == "/lb/trace/stop" {
-			lb.handleTraceStopEndpoint(w, r)
-			return
-		}
-		if r.URL.Path == "/lb/trace/status" {
-			lb.handleTraceStatusEndpoint(w, r)
-			return
-		}
-
-		// Handle cache clear endpoint
-		if r.URL.Path == "/lb/cache/clear" {
-			lb.handleCacheClearEndpoint(w, r)
-			return
-		}
-
-		// Generate request ID
+		// --- 2. Request Initialization ---
 		requestID := fmt.Sprintf("%d", time.Now().UnixNano())
 		wrappedWriter := &responseWriterWrapper{ResponseWriter: w, statusCode: 200}
+		
+		// Check if this request has already been forwarded once
+		isForwarded := r.Header.Get("X-LB-Hop") != ""
 
-		// === TRACE HOOK: Request received ===
 		lb.tracer.TraceRequestReceived(requestID, r.Method, r.URL.Path, r.RemoteAddr)
 
-		// === TRACE HOOK: Capacity check ===
+		// --- 3. Capacity & Routing Logic ---
 		lb.localMetricsMu.RLock()
 		runningReqs := lb.localMetrics.NumRunningReqs
 		waitingReqs := lb.localMetrics.NumWaitingReqs
 		lb.localMetricsMu.RUnlock()
+		
 		hasCapacity := lb.localHasCapacity()
 		lb.tracer.TraceCapacityCheck(requestID, hasCapacity, runningReqs, waitingReqs)
 
-		// Process locally if we have capacity
+		// A: Process locally if we have capacity
 		if hasCapacity {
-			log.Printf("[LB] Request %s: %s %s -> processing locally", requestID, r.Method, r.URL.Path)
+			log.Printf("[LB] Request %s: processing locally", requestID)
 			lb.tracer.TraceLocalProcessStart(requestID)
 
 			proxyStart := time.Now()
@@ -775,27 +745,26 @@ func (lb *LoadBalancer) Handler() http.Handler {
 
 			lb.tracer.TraceLocalProcessEnd(requestID, wrappedWriter.statusCode)
 			lb.tracer.TraceRequestComplete(requestID, wrappedWriter.statusCode, "local")
-
-			log.Printf("[LB] Request %s completed: local (status=%d, duration=%.1fms)",
-				requestID, wrappedWriter.statusCode, float64(proxyDuration.Milliseconds()))
 			return
 		}
 
-		// Local at capacity - try to forward to a peer
-		log.Printf("[LB] Request %s: local at capacity (running=%d, waiting=%d), trying peers",
-			requestID, runningReqs, waitingReqs)
-
-		if lb.forwardToPeer(wrappedWriter, r, requestID) {
-			lb.tracer.TraceRequestComplete(requestID, wrappedWriter.statusCode, "peer")
-			return
+		// B: Local is full. Try to forward ONLY if it hasn't been forwarded before
+		if !isForwarded {
+			log.Printf("[LB] Request %s: local at capacity, trying peers", requestID)
+			if lb.forwardToPeer(wrappedWriter, r, requestID) {
+				lb.tracer.TraceRequestComplete(requestID, wrappedWriter.statusCode, "peer")
+				return
+			}
+		} else {
+			log.Printf("[LB] Request %s: already forwarded (hop detected), forcing local queue", requestID)
 		}
 
-		// No healthy peers - queue or reject
+		// C: Forwarding failed, not allowed, or no peers available -> Queue or Reject
 		if lb.config.QueueEnabled {
-			log.Printf("[LB] Request %s: queueing (no capacity, no healthy peers)", requestID)
 			lb.queueMu.Lock()
 			queueDepth := len(lb.queue)
 			lb.queueMu.Unlock()
+			
 			lb.tracer.TraceQueueEnter(requestID, queueDepth)
 
 			if lb.enqueueRequest(wrappedWriter, r, requestID) {
@@ -806,7 +775,7 @@ func (lb *LoadBalancer) Handler() http.Handler {
 			return
 		}
 
-		// All options exhausted
+		// D: Fail state
 		lb.tracer.TraceRequestComplete(requestID, 503, "rejected")
 		http.Error(w, "Service at capacity", http.StatusServiceUnavailable)
 	})
@@ -1071,110 +1040,107 @@ func (lb *LoadBalancer) processQueue() {
 }
 
 // processQueuedRequests attempts to process all queued requests
-// Priority: forward to peers > process locally
+// Priority: forward to peers (if fresh) > process locally
 func (lb *LoadBalancer) processQueuedRequests() {
-	lb.queueMu.Lock()
-	queueDepth := len(lb.queue)
-	if queueDepth == 0 {
-		lb.queueMu.Unlock()
-		return
-	}
-	lb.queueMu.Unlock()
+    lb.queueMu.Lock()
+    queueDepth := len(lb.queue)
+    if queueDepth == 0 {
+        lb.queueMu.Unlock()
+        return
+    }
+    lb.queueMu.Unlock()
 
-	// Count available peers for tracing
-	lb.peersMu.RLock()
-	peersAvailable := 0
-	for _, status := range lb.peers {
-		if status.Available && status.Healthy {
-			peersAvailable++
-		}
-	}
-	lb.peersMu.RUnlock()
+    lb.peersMu.RLock()
+    peersAvailable := 0
+    for _, status := range lb.peers {
+        if status.Available && status.Healthy {
+            peersAvailable++
+        }
+    }
+    lb.peersMu.RUnlock()
 
-	forwarded := 0
-	processedLocally := 0
+    forwarded := 0
+    processedLocally := 0
 
-	// Process queue - try to forward to peers first, then local
-	for {
-		lb.queueMu.Lock()
-		if len(lb.queue) == 0 {
-			lb.queueMu.Unlock()
-			break
-		}
+    for {
+        lb.queueMu.Lock()
+        if len(lb.queue) == 0 {
+            lb.queueMu.Unlock()
+            break
+        }
 
-		qr := lb.queue[0]
+        qr := lb.queue[0]
 
-		// Check if request is still valid (not timed out)
-		if time.Since(qr.enqueuedAt) > lb.config.QueueTimeout {
-			lb.queue = lb.queue[1:]
-			lb.queueMu.Unlock()
-			qr.err = fmt.Errorf("queue timeout")
-			close(qr.done)
-			continue
-		}
+        // 1. Validation checks (timeout/cancellation)
+        if time.Since(qr.enqueuedAt) > lb.config.QueueTimeout {
+            lb.queue = lb.queue[1:]
+            lb.queueMu.Unlock()
+            qr.err = fmt.Errorf("queue timeout")
+            close(qr.done)
+            continue
+        }
 
-		// Check if request context is still valid
-		if qr.r.Context().Err() != nil {
-			lb.queue = lb.queue[1:]
-			lb.queueMu.Unlock()
-			qr.err = fmt.Errorf("request cancelled")
-			close(qr.done)
-			continue
-		}
+        if qr.r.Context().Err() != nil {
+            lb.queue = lb.queue[1:]
+            lb.queueMu.Unlock()
+            qr.err = fmt.Errorf("request cancelled")
+            close(qr.done)
+            continue
+        }
 
-		// Try to forward to a peer first (priority)
-		peer := lb.selectPeer(qr.r.URL.Path)
-		if peer != nil {
-			// Remove from queue before forwarding
-			lb.queue = lb.queue[1:]
-			lb.queueMu.Unlock()
+        // 2. Determine if this request is eligible for forwarding
+        // If it already has the hop header, it MUST be processed locally
+        isForwarded := qr.r.Header.Get("X-LB-Hop") != ""
+        
+        // 3. Try to forward (only for fresh requests)
+        if !isForwarded {
+            peer := lb.selectPeer(qr.r.URL.Path)
+            if peer != nil {
+                lb.queue = lb.queue[1:]
+                lb.queueMu.Unlock()
 
-			// Trace the forward attempt
-			lb.tracer.TraceQueueForwardAttempt(qr.requestID, queueDepth, true, peer.Instance.IP)
+                lb.tracer.TraceQueueForwardAttempt(qr.requestID, queueDepth, true, peer.Instance.IP)
 
-			// Forward the request
-			waitTimeMs := float64(time.Since(qr.enqueuedAt).Microseconds()) / 1000.0
-			if lb.forwardQueuedRequest(qr, peer) {
-				lb.tracer.TraceQueueExit(qr.requestID, waitTimeMs, "forwarded_to_peer")
-				forwarded++
-				close(qr.done)
-			} else {
-				// Forward failed - re-queue at the back
-				lb.queueMu.Lock()
-				lb.queue = append(lb.queue, qr)
-				lb.queueMu.Unlock()
-				log.Printf("[LB] Forward failed for %s, re-queued", qr.requestID)
-			}
-			continue
-		}
+                waitTimeMs := float64(time.Since(qr.enqueuedAt).Microseconds()) / 1000.0
+                if lb.forwardQueuedRequest(qr, peer) {
+                    lb.tracer.TraceQueueExit(qr.requestID, waitTimeMs, "forwarded_to_peer")
+                    forwarded++
+                    close(qr.done)
+                } else {
+                    // Re-queue at the back if forward failed
+                    lb.queueMu.Lock()
+                    lb.queue = append(lb.queue, qr)
+                    lb.queueMu.Unlock()
+                }
+                continue
+            }
+        }
 
-		// No peers available - try local processing if we have capacity
-		if lb.localHasCapacity() {
-			lb.queue = lb.queue[1:]
-			lb.queueMu.Unlock()
+        // 4. Try local processing (for hops or when no peers available)
+        if lb.localHasCapacity() {
+            lb.queue = lb.queue[1:]
+            lb.queueMu.Unlock()
 
-			waitTimeMs := float64(time.Since(qr.enqueuedAt).Microseconds()) / 1000.0
-			lb.tracer.TraceQueueExit(qr.requestID, waitTimeMs, "local_process")
+            waitTimeMs := float64(time.Since(qr.enqueuedAt).Microseconds()) / 1000.0
+            lb.tracer.TraceQueueExit(qr.requestID, waitTimeMs, "local_process")
 
-			// Restore body for local proxy
-			qr.r.Body = io.NopCloser(bytes.NewReader(qr.bodyBytes))
-			lb.localProxy.ServeHTTP(qr.w, qr.r)
-			processedLocally++
-			close(qr.done)
-			continue
-		}
+            qr.r.Body = io.NopCloser(bytes.NewReader(qr.bodyBytes))
+            lb.localProxy.ServeHTTP(qr.w, qr.r)
+            processedLocally++
+            close(qr.done)
+            continue
+        }
 
-		// Neither peers nor local have capacity - stop processing this cycle
-		lb.queueMu.Unlock()
-		break
-	}
+        // 5. Neither option worked - stop cycle
+        lb.queueMu.Unlock()
+        break
+    }
 
-	// Trace the probe results if we did any work
-	if forwarded > 0 || processedLocally > 0 {
-		lb.tracer.TraceQueueProbe(queueDepth, peersAvailable, forwarded)
-		log.Printf("[LB] Queue probe: depth=%d, peers=%d, forwarded=%d, local=%d",
-			queueDepth, peersAvailable, forwarded, processedLocally)
-	}
+    if forwarded > 0 || processedLocally > 0 {
+        lb.tracer.TraceQueueProbe(queueDepth, peersAvailable, forwarded)
+        log.Printf("[LB] Queue probe: depth=%d, forwarded=%d, local=%d",
+            queueDepth, forwarded, processedLocally)
+    }
 }
 
 // forwardQueuedRequest forwards a queued request to a peer
