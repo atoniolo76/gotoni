@@ -120,4 +120,8 @@ gotoni
 
 # Test coverage
 *.coverprofile
-coverage.html.env
+coverage.html
+
+# Environment variables
+.env
+.env.*
