@@ -1,110 +1,135 @@
-# gotoni
+# GORGO
 
-![gotoni running a remote command](./docs/Terminal.gif)
+Maximizing KV-Cache Reuse While Minimizing Network Latency in Cross-Region LLM Load Balancing.
 
-Automate Lambda.ai with Ansible-inspired Go CLI
+## Python Environment Setup
 
-## Installation
+Create a Python virtual environment in the benchmark directory:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/atoniolo76/gotoni/main/install.sh | bash
+cd benchmark
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+cd ..
 ```
 
-## Setup
-
-Export your [Lambda API key](https://cloud.lambda.ai/api-keys/cloud-api):
-
+## Setup for Research Replication/Experimentation
+1. [Install golang](https://go.dev/doc/install)
+2. Clone this repo
+3. Build gotoni from source
+```bash
+go build -o gotoni
+```
+4. Setup an account on [Lambda.ai](https://lambda.ai) and run:
 ```bash
 export LAMBDA_API_KEY=your_token_here
 ```
+> Email [atoniolo76@gmail.com](mailto:atoniolo76@gmail.com) to get a Lambda.ai API key for testing
+5. Run `gotoni available` to see available Lambda instances and `gotoni launch` to check out instances
+- Note: Instances from at least three separate regions are required for Gorgo's TTFT improvement (or two if running GORGO-proxy)
+6. Run `gotoni cluster setup`, which handles sglang installation, mistral-7b download, and the gotoni binary deployment for load balancer processes. Uses all currently running Lambda.ai instances on your account.
 
-## Workflow
+## Benchmarking Routing Policies
 
-### 1. Launch an Instance (with Filesystem)
+The repository includes preprocessed WildChat datasets:
+- `benchmark/wildchat_guidellm.jsonl` - 8,893 prompts with location mappings
+- `benchmark/wildchat_location_lookup.json` - 8,117 unique location entries
 
-Launch an instance with a persistent filesystem attached. If the filesystem doesn't exist, it will be created. The `--wait` flag ensures the command polls until the instance is ready.
+### Step 1: Run Benchmarks
 
-```bash
-gotoni launch my-project \
-  -t gpu_1x_a10 \
-  --filesystem my-data \
-  --wait
-```
+**Available profiles**: `poisson`, `sweep`, `constant`, `concurrent`, `throughput`
 
-### 2. Open in IDE
-
-Once launched, instantly open the remote workspace in your preferred IDE (defaults to Cursor).
-
-> **Prerequisite:** Ensure you have installed the command-line tool for your IDE.
-> - **Cursor:** `Cmd+Shift+P` > "Install 'cursor' command"
-> - **VS Code:** `Cmd+Shift+P` > "Install 'code' command"
+Start the geo-routing proxy and run GuideLLM benchmarks:
 
 ```bash
-gotoni open my-project
+# Start geo-routing proxy (routes by user location from WildChat)
+cd benchmark
+python geo_proxy.py --port 9000 &
+cd ..
+
+# Run GuideLLM benchmark
+guidellm benchmark \
+  --target http://localhost:9000/v1 \
+  --profile poisson \
+  --rate 5 \
+  --max-seconds 60 \
+  --data ./benchmark/wildchat_guidellm.jsonl \
+  --data-column-mapper '{"text_column": "prompt"}'
 ```
 
-Or force VS Code:
+Results, including metrics like TTFT and Throughput, are saved to `guidellm_results/`.
+
+**Note #1**: Update cluster node IPs in `geo_proxy.py` (lines 40-44) to match your deployment.
+
+**Note #2**: Between benchmarks, run `gotoni cluster flush-cache` to clear both KV-caches and LB prefix trees, otherwise prefix-tree and GORGO will behave like least-load.
+
+#### Other options
+
+Switch between routing strategies (gorgo, prefix-tree, least-load):
 
 ```bash
-gotoni open my-project --code
+gotoni cluster restart-lb --strategy prefix-tree --max-concurrent 50
 ```
 
-### 3. Share Access Securely
+`--max-concurrent` sets the maximum requests forwarded per instance (higher = more parallelism, lower = stricter queueing).
 
-Share SSH access with a friend or colleague using Magic Wormhole.
-
-**Sender:**
-```bash
-gotoni share my-project
-# Generates a secure code like: 7-guitarist-revenge
-```
-
-**Receiver:**
-```bash
-gotoni receive 7-guitarist-revenge
-# Automatically configures SSH keys and host entry
-ssh my-project
-```
-
-## Add Tasks on creation
-
-Create tasks that can be executed on instances during launch. You can also start services that will run in the background with systemd, such as an inference server.
-
-### Example: Install and Build vLLM
+Create traces of per-gpu request queueing/forwarding/processing. Before benchmarking, start the tracing service with:
 
 ```bash
-gotoni tasks add  --name "install depedencies" --command "pip install vllm"
-
-gotoni tasks add --name "run vllm" --command "vllm serve moonshotai/Kimi-K2-Thinking" --depends-on "install dependencies" --type service
+./gotoni cluster stop-trace
+```
+Once benchmark is complete: 
+```bash
+./gotoni cluster stop-trace
 ```
 
-### Launch with Tasks
+View in [perfetto.dev](https://perfetto.dev):
+
+![perfetto_trace](docs/perfetto_trace.png)
+
+
+#### Tuning GORGO Parameters
+
+Fine-tune GORGO's cost calculation by editing `pkg/config/constants.go`:
+
+1. **`DefaultGORGORunningCostFactor`** ($\hat{q}_s$ in paper) - Weight for running requests' prefill cost (default: 0.5)
+   - Lower = running requests weighted less in cost calculation
+
+2. **`DefaultGORGOMsPerToken`** ($t_p$ in paper) - Prefill time per token in ms (default: 0.094)
+   - Measured cold-start prefill rate on your hardware
+
+3. **`DefaultSGLangMaxRunningRequests`** - Max concurrent requests per SGLang instance (default: 10)
+   - Controls when requests queue (triggering the routing policy)
+
+After changes, rebuild and redeploy: `go build -o gotoni && gotoni cluster upload && gotoni cluster restart-lb`
+
+### Step 2: Analyze Benchmark Results
+
+After benchmarking completes, results are saved to `guidellm_results/` (benchmark metrics). Run:  
+
+View the per-gpu trace in `benchmark_results/`.
+
+#### Important Metrics
+
+- **Time to First Token (TTFT)**: First token generation latency (lower is better)
+- **Throughput**: Requests completed per second
+- **Average Latency**: Total request latency across all nodes
+
+## GORGO Centralized Proxy
+
+The centralized proxy (`gotoni proxy`) routes requests using GORGO with queue + running request tracking for ALL instances and not just the local server.
 
 ```bash
-gotoni launch ml-instance
-  -t gpu_1x_a100
-  -r us-west-1
-  --wait
-  --tasks "install depedencies,run vllm"
+# Deploy proxy to a cloud instance
+gotoni proxy deploy west_2 --listen-port 9000
+gotoni proxy --remote west_2 status
+
+# Manage servers
+gotoni proxy --remote west_2 clear-cache # clears *mirrored* prefix tree, not actual KV-cache on instances
+
+# Benchmark through proxy (replace IP with your instance's IP)
+guidellm benchmark --target http://146.235.219.131:9000/v1 --profile poisson --rate 5 --max-seconds 60
 ```
 
-
-## Commands Reference
-
-- `gotoni launch` - Launch instances (supports waiting, filesystems, and tasks)
-- `gotoni open` - Open remote instance in Cursor/VS Code
-- `gotoni share` - Securely share SSH access
-- `gotoni receive` - Receive SSH access and auto-configure
-- `gotoni tasks` - Manage automation tasks
-- `gotoni provision` - Run tasks on an existing instance
-- `gotoni list` - List active instances
-- `gotoni available` - List available instance types and regions
-- `gotoni run` - Execute remote commands
-- `gotoni delete` - Terminate instances
-- `gotoni filesystems` - Manage filesystems
-- `gotoni ssh-keys` - Manage SSH keys
-
-## Configuration
-
-Configuration is automatically managed in a local SQLite database.
-
+Running this benchmark without the geo_proxy.py will send all requests to the proxy, which will then run the GORGO forwarding policy (cache + latency aware).
