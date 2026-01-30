@@ -99,7 +99,7 @@ var lbPolicyCmd = &cobra.Command{
 	Short: "Get or set load balancer policy",
 	Long: `Get the current policy or switch to a new one on all cluster instances.
 
-Available policies: least-loaded, prefix-tree, gorgo, gorgo2
+Available policies: least-loaded, prefix-tree, gorgo
 
 Examples:
   # Show current policy on all running instances (recommended)
@@ -172,15 +172,15 @@ Example:
 	Run: runLBPeersAddMesh,
 }
 
-// lbTuneCmd adjusts GORGO/GORGO2 tuning parameters at runtime
+// lbTuneCmd adjusts GORGO tuning parameters at runtime
 var lbTuneCmd = &cobra.Command{
 	Use:   "tune",
-	Short: "Get or set GORGO/GORGO2 tuning parameters",
-	Long: `Get or set tuning parameters for GORGO/GORGO2 policies on running load balancers.
+	Short: "Get or set GORGO tuning parameters",
+	Long: `Get or set tuning parameters for GORGO policies on running load balancers.
 
 Parameters:
   --ms-per-token        Estimated prefill time per token in ms (t_prefill)
-  --running-cost-factor Weight for running requests in GORGO2 cost calculation (0.0-1.0)
+  --running-cost-factor Weight for running requests in GORGO cost calculation (0.0-1.0)
 
 Examples:
   # Show current tuning parameters on all instances
@@ -242,7 +242,7 @@ func init() {
 	lbStartCmd.Flags().Duration("request-timeout", config.DefaultRequestTimeout, "Request timeout for forwarded requests")
 	lbStartCmd.Flags().StringSlice("peers", []string{}, "Peer addresses in format ip:port (can specify multiple)")
 	lbStartCmd.Flags().String("pid-file", "/tmp/gotoni-lb.pid", "Path to PID file")
-	lbStartCmd.Flags().String("strategy", config.DefaultStrategy, "Load balancing strategy (least-loaded, prefix-tree, gorgo, gorgo2)")
+	lbStartCmd.Flags().String("strategy", config.DefaultStrategy, "Load balancing strategy (least-loaded, prefix-tree, gorgo)")
 	lbStartCmd.Flags().String("node-id", "", "Unique identifier for this node in the cluster")
 
 	// Selective pushing flags
@@ -252,9 +252,9 @@ func init() {
 	// Cluster identity
 	lbStartCmd.Flags().String("cluster-name", "default", "Cluster name for tracing")
 
-	// GORGO/GORGO2 tuning parameters
+	// GORGO tuning parameters
 	lbStartCmd.Flags().Float64("ms-per-token", config.DefaultGORGOMsPerToken, "Estimated prefill time per token in ms (t_prefill)")
-	lbStartCmd.Flags().Float64("running-cost-factor", config.DefaultGORGO2RunningCostFactor, "Weight for running requests in GORGO2 (0.0-1.0)")
+	lbStartCmd.Flags().Float64("running-cost-factor", config.DefaultGORGORunningCostFactor, "Weight for running requests in GORGO (0.0-1.0)")
 
 	// Flags for lb status
 	lbStatusCmd.Flags().Bool("all", false, "Check all running instances in cluster")
@@ -353,21 +353,19 @@ func runLBStart(cmd *cobra.Command, args []string) {
 	config.NodeID = nodeID
 	config.ClusterName = clusterName
 
-	// Get GORGO/GORGO2 tuning parameters
+	// Get GORGO tuning parameters
 	msPerToken, _ := cmd.Flags().GetFloat64("ms-per-token")
 	config.GORGOMsPerToken = msPerToken
 	runningCostFactor, _ := cmd.Flags().GetFloat64("running-cost-factor")
-	config.GORGO2RunningCostFactor = runningCostFactor
+	config.GORGORunningCostFactor = runningCostFactor
 
-	// Set strategy based on flag (gorgo2 is set after lb is created since it needs lb reference)
+	// Set strategy based on flag (gorgo is set after lb is created since it needs lb reference)
 	switch strategy {
 	case "least-loaded":
 		config.Strategy = &serve.LeastLoadedPolicy{}
 	case "prefix-tree":
 		config.Strategy = serve.NewPrefixTreePolicy()
 	case "gorgo":
-		config.Strategy = &serve.GORGOPolicy{} // Will be properly initialized via SetStrategy later
-	case "gorgo2":
 		config.Strategy = nil // Will be set after lb is created
 	default:
 		config.Strategy = &serve.LeastLoadedPolicy{}
@@ -401,10 +399,10 @@ func runLBStart(cmd *cobra.Command, args []string) {
 		lb.AddPeerByIP(peerIP, peerPort)
 	}
 
-	// Set GORGO2 strategy after lb is created (needs lb reference)
-	if strategy == "gorgo2" {
-		if err := lb.SetStrategy("gorgo2"); err != nil {
-			log.Fatalf("Failed to set gorgo2 strategy: %v", err)
+	// Set GORGO strategy after lb is created (needs lb reference)
+	if strategy == "gorgo" {
+		if err := lb.SetStrategy("gorgo"); err != nil {
+			log.Fatalf("Failed to set gorgo strategy: %v", err)
 		}
 	}
 
@@ -427,11 +425,9 @@ func runLBStart(cmd *cobra.Command, args []string) {
 	fmt.Printf("  Max concurrent:   %d\n", config.MaxConcurrentRequests)
 	fmt.Printf("  Queue enabled:    %v\n", config.QueueEnabled)
 	fmt.Printf("  Strategy:         %s\n", strategy)
-	if strategy == "gorgo" || strategy == "gorgo2" {
+	if strategy == "gorgo" {
 		fmt.Printf("  ms_per_token:     %.4f\n", config.GORGOMsPerToken)
-	}
-	if strategy == "gorgo2" {
-		fmt.Printf("  running_cost_factor: %.2f\n", config.GORGO2RunningCostFactor)
+		fmt.Printf("  running_cost_factor: %.2f\n", config.GORGORunningCostFactor)
 	}
 	if config.RunningReqsThreshold > 0 {
 		fmt.Printf("  Running threshold: %d (forward when running_reqs >= %d)\n", config.RunningReqsThreshold, config.RunningReqsThreshold)

@@ -424,6 +424,10 @@ def main():
         help="Path to routing log file (JSONL format)"
     )
     parser.add_argument(
+        "--nodes-file", type=str, default=None,
+        help="Path to JSON file with cluster nodes (overrides hardcoded CLUSTER_NODES)"
+    )
+    parser.add_argument(
         "--shutdown-timeout", type=int, default=30,
         help="Max seconds to wait for in-flight requests during shutdown (default: 30)"
     )
@@ -431,6 +435,21 @@ def main():
 
     # Update global shutdown timeout
     SHUTDOWN_TIMEOUT = args.shutdown_timeout
+
+    # Load cluster nodes from file if provided
+    global CLUSTER_NODES
+    if args.nodes_file:
+        try:
+            with open(args.nodes_file) as f:
+                nodes_data = json.load(f)
+            CLUSTER_NODES = [
+                (node["name"], node["ip"], node["port"], node["latitude"], node["longitude"])
+                for node in nodes_data
+            ]
+            print(f"Loaded {len(CLUSTER_NODES)} nodes from {args.nodes_file}")
+        except Exception as e:
+            print(f"Warning: Failed to load nodes file: {e}")
+            print("Using hardcoded CLUSTER_NODES")
 
     print("""
 ╔══════════════════════════════════════════════════════════════╗

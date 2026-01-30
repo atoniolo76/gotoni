@@ -7,6 +7,7 @@ No CGO needed - tokenizer is a separate Rust sidecar.
 package serve
 
 import (
+	"encoding/base64"
 	"fmt"
 	"os"
 	"os/exec"
@@ -45,18 +46,19 @@ func DeployGotoniToCluster(cluster *Cluster, binaryPath string) error {
 
 	// First, stop all running gotoni processes on the cluster
 	fmt.Println("  Stopping running gotoni processes...")
-	cleanupScript := `
+	// Use base64 encoding to avoid script text in process args
+	cleanupScript := `#!/bin/bash
 # Stop load balancer
 tmux kill-session -t gotoni-start_gotoni_load_balancer 2>/dev/null || true
-PIDS=$(pgrep -f "gotoni lb" 2>/dev/null | head -5)
-if [ -n "$PIDS" ]; then kill $PIDS 2>/dev/null; fi
+for pid in $(pgrep -f "gotoni lb" 2>/dev/null | head -5); do kill $pid 2>/dev/null || true; done
 
 # Remove old binary
 rm -f /home/ubuntu/gotoni
 
 echo "CLEANED"
 `
-	cluster.ExecuteOnCluster(cleanupScript)
+	encodedCleanup := base64.StdEncoding.EncodeToString([]byte(cleanupScript))
+	cluster.ExecuteOnCluster(fmt.Sprintf("echo %s | base64 -d | bash", encodedCleanup))
 	time.Sleep(1 * time.Second)
 
 	var wg sync.WaitGroup
@@ -128,15 +130,15 @@ func DeployLBStrategyWithConfig(cluster *Cluster, config LBDeployConfig) error {
 	fmt.Printf("Deploying LB strategy: %s\n", config.Strategy)
 
 	// Stop existing load balancers (silently)
-	// Note: Use pgrep + kill instead of pkill -f to avoid killing the SSH session
-	stopScript := `
+	// Use base64 encoding to avoid script text in process args
+	stopScript := `#!/bin/bash
 tmux kill-session -t gotoni-start_gotoni_load_balancer 2>/dev/null || true
 tmux kill-session -t gotoni-lb 2>/dev/null || true
-PIDS=$(pgrep -f "gotoni lb" 2>/dev/null | head -5)
-if [ -n "$PIDS" ]; then kill $PIDS 2>/dev/null; fi
+for pid in $(pgrep -f "gotoni lb" 2>/dev/null | head -5); do kill $pid 2>/dev/null || true; done
 exit 0
 `
-	cluster.ExecuteOnCluster(stopScript)
+	encodedStop := base64.StdEncoding.EncodeToString([]byte(stopScript))
+	cluster.ExecuteOnCluster(fmt.Sprintf("echo %s | base64 -d | bash", encodedStop))
 	time.Sleep(2 * time.Second)
 
 	// Collect all peer IPs

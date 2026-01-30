@@ -8,6 +8,7 @@ Instance state comes from Lambda API; SSH key paths are looked up locally.
 package cmd
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -199,15 +200,15 @@ func runLBDeploy(cmd *cobra.Command, args []string) {
 			defer wg.Done()
 
 			// Stop running LB and remove old binary
-			// Use pgrep + kill instead of pkill -f to avoid killing SSH session
-			cleanupScript := fmt.Sprintf(`
+			// Use base64 encoding to avoid script text in process args
+			cleanupScript := fmt.Sprintf(`#!/bin/bash
 tmux kill-session -t %s 2>/dev/null || true
 tmux kill-session -t gotoni-start_gotoni_load_balancer 2>/dev/null || true
-PIDS=$(pgrep -f "gotoni lb" 2>/dev/null | head -5)
-if [ -n "$PIDS" ]; then kill $PIDS 2>/dev/null; fi
+for pid in $(pgrep -f "gotoni lb" 2>/dev/null | head -5); do kill $pid 2>/dev/null || true; done
 rm -f %s
 `, sessionName, gotoniPath)
-			sshMgr.ExecuteCommand(instance.IP, cleanupScript)
+			encodedCleanup := base64.StdEncoding.EncodeToString([]byte(cleanupScript))
+			sshMgr.ExecuteCommand(instance.IP, fmt.Sprintf("echo %s | base64 -d | bash", encodedCleanup))
 
 			// Get SSH key for SCP
 			sshKeyPath, _ := remote.GetSSHKeyFileForInstance(&instance)

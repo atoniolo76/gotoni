@@ -8,6 +8,7 @@ SSH key file paths are looked up locally using the key names from Lambda API.
 package cmd
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -73,8 +74,13 @@ var clusterStopTraceCmd = &cobra.Command{
 
 var clusterFlushCacheCmd = &cobra.Command{
 	Use:   "flush-cache",
-	Short: "Flush KV cache on all SGLang servers",
-	Run:   runClusterFlushCache,
+	Short: "Flush KV caches and clear LB prefix trees on all instances",
+	Long: `Flush caches on all cluster instances:
+  1. Flush KV caches on all SGLang servers
+  2. Clear prefix tree caches on all load balancers
+  
+This ensures a completely fresh state for benchmarking.`,
+	Run: runClusterFlushCache,
 }
 
 var clusterStartTokenizerCmd = &cobra.Command{
@@ -89,6 +95,18 @@ var clusterTokenizerStatusCmd = &cobra.Command{
 	Run:   runClusterTokenizerStatus,
 }
 
+var clusterSetupCmd = &cobra.Command{
+	Use:   "setup",
+	Short: "Complete cluster setup: SGLang + upload gotoni + start LBs",
+	Long: `Complete cluster setup from zero to running:
+1. Setup SGLang cluster with model download
+2. Build and upload gotoni binary
+3. Start load balancers with Gorgo policy
+
+This command assumes you have running GPU instances already launched.`,
+	Run: runClusterSetup,
+}
+
 func init() {
 	rootCmd.AddCommand(clusterCmd)
 	clusterCmd.AddCommand(clusterStatusCmd)
@@ -99,6 +117,7 @@ func init() {
 	clusterCmd.AddCommand(clusterFlushCacheCmd)
 	clusterCmd.AddCommand(clusterStartTokenizerCmd)
 	clusterCmd.AddCommand(clusterTokenizerStatusCmd)
+	clusterCmd.AddCommand(clusterSetupCmd)
 
 	// Flags
 	clusterRestartLBCmd.Flags().String("strategy", "gorgo", "LB strategy: gorgo, prefix-tree, least-loaded")
@@ -108,6 +127,12 @@ func init() {
 	clusterStopTraceCmd.Flags().String("output-dir", "benchmark_results", "Directory to save traces")
 
 	clusterFlushCacheCmd.Flags().Int("port", 8080, "SGLang backend port")
+	clusterFlushCacheCmd.Flags().Int("lb-port", 8000, "Load balancer port")
+
+	clusterSetupCmd.Flags().String("cluster-name", "sglang-cluster", "Name for the SGLang cluster")
+	clusterSetupCmd.Flags().String("strategy", "gorgo", "LB strategy: gorgo, prefix-tree, least-loaded")
+	clusterSetupCmd.Flags().Int("max-concurrent", 100, "Max concurrent requests")
+	clusterSetupCmd.Flags().Int("running-threshold", 5, "Forward when running_reqs >= this (0=use ie-queue)")
 }
 
 type nodeStatus struct {
@@ -251,12 +276,12 @@ func runClusterRestartLB(cmd *cobra.Command, args []string) {
 				thresholdArg = fmt.Sprintf("--running-threshold %d", runningThreshold)
 			}
 
-			restartCmd := fmt.Sprintf(`
-# Kill existing LB (use pgrep + kill to avoid killing this script)
+			// Use base64 encoding to avoid the script text appearing in process args (which causes self-matching)
+			scriptContent := fmt.Sprintf(`#!/bin/bash
+# Kill existing LB
 tmux kill-session -t gotoni-lb 2>/dev/null || true
 tmux kill-session -t gotoni-start_gotoni_load_balancer 2>/dev/null || true
-PIDS=$(pgrep -f "gotoni lb" 2>/dev/null | head -5)
-if [ -n "$PIDS" ]; then kill $PIDS 2>/dev/null; fi
+for pid in $(pgrep -f "gotoni lb" 2>/dev/null | head -5); do kill $pid 2>/dev/null || true; done
 sleep 1
 
 # Check binary exists
@@ -288,6 +313,10 @@ else
   tail -20 /home/ubuntu/lb.log 2>/dev/null || echo "no log"
 fi
 `, strategy, maxConcurrent, instance.Name, thresholdArg, peersArg)
+
+			// Encode script to base64 and execute
+			encodedScript := base64.StdEncoding.EncodeToString([]byte(scriptContent))
+			restartCmd := fmt.Sprintf("echo %s | base64 -d | bash", encodedScript)
 
 			output, err := sshMgr.ExecuteCommandWithTimeout(instance.IP, restartCmd, 30*time.Second)
 			if err != nil {
@@ -349,13 +378,14 @@ func runClusterUpload(cmd *cobra.Command, args []string) {
 
 			// Stop running gotoni processes and delete old binary before uploading
 			// This ensures clean deployment without stale processes
-			cleanupScript := `
+			// Use base64 encoding to avoid script text in process args
+			cleanupScript := `#!/bin/bash
 tmux kill-session -t gotoni-start_gotoni_load_balancer 2>/dev/null || true
-PIDS=$(pgrep -f "gotoni lb" 2>/dev/null | head -5)
-if [ -n "$PIDS" ]; then kill $PIDS 2>/dev/null; fi
+for pid in $(pgrep -f "gotoni lb" 2>/dev/null | head -5); do kill $pid 2>/dev/null || true; done
 rm -f /home/ubuntu/gotoni
 `
-			sshMgr.ExecuteCommand(instance.IP, cleanupScript)
+			encodedCleanup := base64.StdEncoding.EncodeToString([]byte(cleanupScript))
+			sshMgr.ExecuteCommand(instance.IP, fmt.Sprintf("echo %s | base64 -d | bash", encodedCleanup))
 
 			// SCP upload (still need exec for file transfer)
 			scpCmd := exec.Command("scp",
@@ -468,6 +498,7 @@ func runClusterStopTrace(cmd *cobra.Command, args []string) {
 
 func runClusterFlushCache(cmd *cobra.Command, args []string) {
 	port, _ := cmd.Flags().GetInt("port")
+	lbPort, _ := cmd.Flags().GetInt("lb-port")
 
 	instances, err := getClusterNodes()
 	if err != nil {
@@ -477,7 +508,8 @@ func runClusterFlushCache(cmd *cobra.Command, args []string) {
 
 	client := &http.Client{Timeout: 10 * time.Second}
 
-	fmt.Println("Flushing KV caches on all SGLang servers...")
+	// Step 1: Flush KV caches on SGLang servers
+	fmt.Println("🗑️  Flushing KV caches on all SGLang servers...")
 
 	var wg sync.WaitGroup
 	for _, inst := range instances {
@@ -490,21 +522,49 @@ func runClusterFlushCache(cmd *cobra.Command, args []string) {
 
 			resp, err := client.Do(req)
 			if err != nil {
-				fmt.Printf("%-20s: ❌ %v\n", instance.Name, err)
+				fmt.Printf("  %-20s: ❌ %v\n", instance.Name, err)
 				return
 			}
 			defer resp.Body.Close()
 
 			if resp.StatusCode == 200 {
-				fmt.Printf("%-20s: ✅ cache flushed\n", instance.Name)
+				fmt.Printf("  %-20s: ✅ KV cache flushed\n", instance.Name)
 			} else {
-				fmt.Printf("%-20s: ❌ status %d\n", instance.Name, resp.StatusCode)
+				fmt.Printf("  %-20s: ❌ status %d\n", instance.Name, resp.StatusCode)
 			}
 		}(inst)
 	}
 
 	wg.Wait()
-	fmt.Println("\nDone.")
+	fmt.Println()
+
+	// Step 2: Clear prefix tree caches on load balancers
+	fmt.Println("🌳 Clearing prefix tree caches on all load balancers...")
+
+	for _, inst := range instances {
+		wg.Add(1)
+		go func(instance remote.RunningInstance) {
+			defer wg.Done()
+
+			clearURL := fmt.Sprintf("http://%s:%d/lb/cache/clear", instance.IP, lbPort)
+
+			resp, err := client.Post(clearURL, "application/json", nil)
+			if err != nil {
+				fmt.Printf("  %-20s: ❌ %v\n", instance.Name, err)
+				return
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode == 200 {
+				fmt.Printf("  %-20s: ✅ LB cache cleared\n", instance.Name)
+			} else {
+				fmt.Printf("  %-20s: ❌ status %d\n", instance.Name, resp.StatusCode)
+			}
+		}(inst)
+	}
+
+	wg.Wait()
+	fmt.Println("\n✅ All caches cleared!")
 }
 
 func runClusterStartTokenizer(cmd *cobra.Command, args []string) {
@@ -574,4 +634,130 @@ func runClusterTokenizerStatus(cmd *cobra.Command, args []string) {
 	}
 
 	fmt.Printf("\nSummary: %d/%d instances have tokenizer running\n", runningCount, len(results))
+}
+
+func runClusterSetup(cmd *cobra.Command, args []string) {
+	// Get flags
+	clusterName, _ := cmd.Flags().GetString("cluster-name")
+	strategy, _ := cmd.Flags().GetString("strategy")
+	maxConcurrent, _ := cmd.Flags().GetInt("max-concurrent")
+	runningThreshold, _ := cmd.Flags().GetInt("running-threshold")
+
+	fmt.Println("🚀 Starting complete cluster setup...")
+	fmt.Println("Steps:")
+	fmt.Println("  1. Connect to cluster and fix common issues (docker permissions)")
+	fmt.Println("  2. Setup SGLang Docker containers")
+	fmt.Println("  3. Build and upload gotoni binary")
+	fmt.Printf("  4. Start load balancers with strategy=%s\n", strategy)
+	fmt.Println()
+
+	// Get cluster instances
+	httpClient := remote.NewHTTPClient()
+	apiToken := remote.GetAPIToken()
+	if apiToken == "" {
+		fmt.Println("❌ Error: LAMBDA_API_KEY not set")
+		os.Exit(1)
+	}
+
+	// Step 1: Connect to cluster
+	fmt.Println("🔗 Step 1: Connecting to cluster...")
+	cl, err := serve.GetCluster(httpClient, apiToken, clusterName)
+	if err != nil {
+		fmt.Printf("❌ Failed to get cluster: %v\n", err)
+		os.Exit(1)
+	}
+
+	if err := cl.Connect(); err != nil {
+		fmt.Printf("❌ Failed to connect to cluster: %v\n", err)
+		os.Exit(1)
+	}
+	defer cl.Disconnect()
+
+	fmt.Printf("✅ Connected to %d instances\n\n", len(cl.Instances))
+
+	// Step 1b: Fix common issues (docker permissions)
+	fmt.Println("🔧 Step 1b: Fixing common issues (docker permissions)...")
+	fixDockerTask := remote.Task{
+		Name: "fix-docker-permissions",
+		Command: `
+# Add ubuntu user to docker group if not already a member
+if ! groups ubuntu | grep -q docker; then
+    sudo usermod -aG docker ubuntu
+    echo "Added ubuntu to docker group"
+else
+    echo "Docker group already configured"
+fi
+
+# Ensure docker is running
+sudo systemctl start docker 2>/dev/null || true
+echo "Docker permissions checked"
+`,
+		WorkingDir: "/home/ubuntu",
+	}
+	results := cl.RunTaskOnCluster(fixDockerTask)
+	fixedCount := 0
+	for _, err := range results {
+		if err == nil {
+			fixedCount++
+		}
+	}
+	fmt.Printf("✅ Docker permissions checked on %d/%d instances\n\n", fixedCount, len(cl.Instances))
+
+	// Step 2: Setup SGLang using SDK
+	fmt.Println("📦 Step 2: Setting up SGLang Docker containers...")
+	hfToken := os.Getenv("HF_TOKEN")
+	serve.SetupSGLangDockerOnCluster(cl, hfToken)
+
+	// Wait for SGLang to initialize
+	fmt.Println("  ⏳ Waiting 60s for SGLang to initialize (model loading)...")
+	time.Sleep(60 * time.Second)
+	fmt.Println()
+
+	// Step 3: Build and upload gotoni binary using SDK
+	fmt.Println("📤 Step 3: Building and uploading gotoni binary...")
+
+	// Build binary for Linux
+	buildCmd := exec.Command("go", "build", "-o", "/tmp/gotoni-linux", ".")
+	buildCmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS=linux", "GOARCH=amd64")
+	if output, err := buildCmd.CombinedOutput(); err != nil {
+		fmt.Printf("❌ Build failed: %v\n%s\n", err, output)
+		os.Exit(1)
+	}
+
+	info, _ := os.Stat("/tmp/gotoni-linux")
+	fmt.Printf("  Built /tmp/gotoni-linux (%d MB)\n", info.Size()/1024/1024)
+
+	// Upload using SDK function
+	if err := serve.DeployGotoniToCluster(cl, "/tmp/gotoni-linux"); err != nil {
+		fmt.Printf("⚠️  Some uploads failed: %v\n", err)
+	}
+	fmt.Println()
+
+	// Step 4: Start load balancers using SDK
+	fmt.Println("⚖️  Step 4: Starting load balancers...")
+
+	lbConfig := serve.LBDeployConfig{
+		Strategy:         strategy,
+		MaxConcurrent:    maxConcurrent,
+		RunningThreshold: runningThreshold,
+		ClusterName:      clusterName,
+	}
+
+	if err := serve.DeployLBStrategyWithConfig(cl, lbConfig); err != nil {
+		fmt.Printf("⚠️  Some LB deployments failed: %v\n", err)
+	}
+	fmt.Println()
+
+	// Final summary
+	fmt.Println("🎉 Complete cluster setup finished!")
+	fmt.Println()
+	fmt.Println("Summary:")
+	fmt.Printf("  - Cluster: %s (%d instances)\n", clusterName, len(cl.Instances))
+	fmt.Printf("  - Strategy: %s\n", strategy)
+	fmt.Printf("  - Max concurrent: %d\n", maxConcurrent)
+	fmt.Println()
+	fmt.Println("Next steps:")
+	fmt.Println("  - Check status:    gotoni cluster status")
+	fmt.Println("  - Start tracing:   gotoni cluster start-trace")
+	fmt.Println("  - Flush KV cache:  gotoni cluster flush-cache")
 }

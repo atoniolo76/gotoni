@@ -8,6 +8,7 @@ and has a global view of all requests across all servers.
 package cmd
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -765,8 +766,14 @@ func runProxyDeploy(cmd *cobra.Command, args []string) {
 	defer manager.CloseAllConnections()
 
 	// Kill any existing gotoni process
+	// Use base64 encoding to avoid self-matching
 	fmt.Println("Stopping any existing gotoni process...")
-	manager.ExecuteCommand(proxyInstance.IP, "pkill -9 -f gotoni || true")
+	killScript := `#!/bin/bash
+for pid in $(pgrep -f "gotoni" 2>/dev/null | head -10); do kill -9 $pid 2>/dev/null || true; done
+exit 0
+`
+	encodedKill := base64.StdEncoding.EncodeToString([]byte(killScript))
+	manager.ExecuteCommand(proxyInstance.IP, fmt.Sprintf("echo %s | base64 -d | bash", encodedKill))
 	time.Sleep(1 * time.Second)
 
 	// Make binary executable and start proxy
