@@ -75,6 +75,7 @@ config.yaml
 *.png
 *.gif
 !docs/*.gif
+!docs/*.png
 
 # Trace files
 *.trace.json

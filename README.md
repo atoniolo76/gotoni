@@ -86,7 +86,7 @@ Once benchmark is complete:
 
 View in [perfetto.dev](https://perfetto.dev):
 
-![perfetto_trace](docs/perfetto_trace.png)
+![perfetto_trace](https://raw.githubusercontent.com/atoniolo76/gotoni/benchmark-load-balancing/docs/perfetto_trace.png)
 
 
 #### Tuning GORGO Parameters
