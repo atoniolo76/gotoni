@@ -106,7 +106,7 @@ After changes, rebuild and redeploy: `go build -o gotoni && gotoni cluster uploa
 
 ### Step 2: Analyze Benchmark Results
 
-After benchmarking completes, results are saved to `guidellm_results/` (benchmark metrics). Run:  
+After benchmarking completes, results are saved to `guidellm_results/` (benchmark metrics).
 
 View the per-gpu trace in `benchmark_results/`.
 
