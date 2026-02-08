@@ -79,7 +79,7 @@ const (
 	// DefaultGORGORunningCostFactor is the weight applied to running requests
 	// Running requests cost less because they're already partially processed
 	// Range: 0.0 to 1.0 (lower = running requests weighted less)
-	DefaultGORGORunningCostFactor = 0.5
+	DefaultGORGORunningCostFactor = 1
 )
 
 // =============================================================================
