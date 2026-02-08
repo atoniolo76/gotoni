@@ -42,10 +42,10 @@ const (
 // Timeouts
 const (
 	// DefaultRequestTimeout is the timeout for forwarded requests to peers
-	DefaultRequestTimeout = 30 * time.Second
+	DefaultRequestTimeout = 0 * time.Second // no timeout
 
 	// DefaultQueueTimeout is how long a request can wait in queue before timing out
-	DefaultQueueTimeout = 30 * time.Second
+	DefaultQueueTimeout = 60 * time.Second // 1 minute timeout
 )
 
 // Queue Processing
@@ -115,7 +115,7 @@ const (
 	DefaultSGLangPort = 8080
 
 	// DefaultSGLangModel is the default model to serve
-	DefaultSGLangModel = "mistralai/Mistral-7B-Instruct-v0.3"
+	DefaultSGLangModel = "mistralai/Mistral-Large-3-675B-Instruct-2512"
 
 	// DefaultSGLangMaxRunningRequests limits concurrent requests in SGLang's GPU batch
 	// Set this low to force requests to queue, triggering load balancer forwarding

@@ -19,16 +19,20 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/atoniolo76/gotoni/pkg/config"
 )
 
 // ProxyConfig configures the centralized proxy
@@ -45,6 +49,13 @@ type ProxyConfig struct {
 	// GORGO cost parameters
 	MsPerToken        float64 `json:"ms_per_token"`
 	RunningCostFactor float64 `json:"running_cost_factor"` // qhat weight for running requests
+
+	// Capacity gating (like loadbalancer.go)
+	// When true: check server capacity before forwarding (gates requests at proxy level)
+	// When false: forward directly to SGLang (let SGLang handle internal queueing)
+	CapacityGatingEnabled bool `json:"capacity_gating_enabled"`
+	// Max running requests per server before we queue at proxy level
+	MaxRunningPerServer int `json:"max_running_per_server"`
 
 	// Metrics polling
 	MetricsEnabled      bool          `json:"metrics_enabled"`
@@ -65,19 +76,21 @@ type ProxyConfig struct {
 // DefaultProxyConfig returns sensible defaults
 func DefaultProxyConfig() *ProxyConfig {
 	return &ProxyConfig{
-		ListenPort:          8000,
-		RequestTimeout:      60 * time.Second,
-		QueueEnabled:        true,
-		QueueTimeout:        60 * time.Second,
-		MaxQueueSize:        10000,
-		MsPerToken:          0.094,  // Default for 8xA100 with Mistral-7B
-		RunningCostFactor:   0.5,    // qhat weight
-		MetricsEnabled:      true,
-		MetricsPollInterval: 500 * time.Millisecond,
-		MetricsEndpoint:     "/metrics",
-		MetricsTimeout:      500 * time.Millisecond,
-		UnhealthyThreshold:  3,
-		GPUCacheThreshold:   0.95,
+		ListenPort:            8000,
+		RequestTimeout:        60 * time.Second,
+		QueueEnabled:          true,
+		QueueTimeout:          60 * time.Second,
+		MaxQueueSize:          10000,
+		MsPerToken:            config.DefaultGORGOMsPerToken,        // Default for 8xA100 with Mistral-7B
+		RunningCostFactor:     config.DefaultGORGORunningCostFactor, // qhat weight
+		CapacityGatingEnabled: true,                                 // Gate requests at proxy level (like loadbalancer.go)
+		MaxRunningPerServer:   10,                                   // Max running requests per server before queueing
+		MetricsEnabled:        true,
+		MetricsPollInterval:   500 * time.Millisecond,
+		MetricsEndpoint:       "/metrics",
+		MetricsTimeout:        500 * time.Millisecond,
+		UnhealthyThreshold:    3,
+		GPUCacheThreshold:     0.95,
 		// Latency probing - runs more frequently than metrics for accurate RTT
 		LatencyProbeEnabled:  true,
 		LatencyProbeInterval: 100 * time.Millisecond, // probe every 100ms for responsive routing
@@ -102,12 +115,12 @@ type SGLangServer struct {
 	runningRequestsMu sync.RWMutex
 
 	// Network latency tracking
-	Latency          time.Duration   `json:"latency"`           // Current/latest latency
-	LatencyAvg       time.Duration   `json:"latency_avg"`       // Exponential moving average
-	LatencyMin       time.Duration   `json:"latency_min"`       // Min observed latency
-	LatencyMax       time.Duration   `json:"latency_max"`       // Max observed latency
-	latencyHistory   []time.Duration                            // Recent latency samples
-	latencyMu        sync.RWMutex
+	Latency        time.Duration   `json:"latency"`     // Current/latest latency
+	LatencyAvg     time.Duration   `json:"latency_avg"` // Exponential moving average
+	LatencyMin     time.Duration   `json:"latency_min"` // Min observed latency
+	LatencyMax     time.Duration   `json:"latency_max"` // Max observed latency
+	latencyHistory []time.Duration // Recent latency samples
+	latencyMu      sync.RWMutex
 }
 
 // SGLangMetrics from the server's /metrics or /get_server_info endpoint
@@ -124,24 +137,74 @@ type SGLangMetrics struct {
 
 // trackedRequest represents a request dispatched by the proxy
 type trackedRequest struct {
-	RequestID   string
-	TokenCount  int
-	Prompt      string
+	RequestID    string
+	TokenCount   int
+	Prompt       string
 	DispatchedAt time.Time
-	Server      *SGLangServer
+	Server       *SGLangServer
+}
+
+// RequestMetrics captures detailed metrics for a single request
+type RequestMetrics struct {
+	RequestID    string    `json:"request_id"`
+	Timestamp    time.Time `json:"timestamp"`
+	Prompt       string    `json:"-"` // Exclude from JSON export (privacy)
+	PromptLength int       `json:"prompt_length"`
+	TokenCount   int       `json:"token_count"`
+
+	// Latency metrics
+	NetworkLatencyMs float64 `json:"network_latency_ms"`
+	TTFTMs           float64 `json:"ttft_ms"`
+	TotalLatencyMs   float64 `json:"total_latency_ms"`
+	QueueTimeMs      float64 `json:"queue_time_ms"`
+
+	// Routing decision
+	SelectedServer   string `json:"selected_server"`
+	SelectedServerID string `json:"selected_server_id"`
+
+	// Queue/load prediction at routing time
+	// Complete GORGO formula: (queued * ms) + (running * ms * qhat) + (incoming * ms) - (matched_prefix * ms)
+	PredictedPrefillTimeMs float64            `json:"predicted_prefill_time_ms"` // Estimated wait based on complete GORGO formula
+	QueuedTokensAtRouting  int                `json:"queued_tokens_at_routing"`  // Tokens in queue when routed
+	RunningTokensAtRouting int                `json:"running_tokens_at_routing"` // Tokens running when routed
+	ServerCostsAtRouting   map[string]float64 `json:"server_costs_at_routing"`   // GORGO cost for each server at routing time
+
+	// Prefix cache hit ratios (matched_length / prompt_length) per region
+	// Key: serverID, Value: cache hit ratio (0.0 to 1.0)
+	PrefixCacheHitRatios map[string]float64 `json:"prefix_cache_hit_ratios"`
+
+	// Matched prefix lengths (in characters) per region
+	MatchedPrefixLengths map[string]int `json:"matched_prefix_lengths"`
+
+	// Status
+	StatusCode int    `json:"status_code"`
+	Success    bool   `json:"success"`
+	ErrorMsg   string `json:"error_msg,omitempty"`
+}
+
+// PrefixTreeStats captures summary statistics for the prefix tree.
+type PrefixTreeStats struct {
+	Nodes             int     `json:"nodes"`
+	Leaves            int     `json:"leaves"`
+	MaxDepth          int     `json:"max_depth"`
+	AvgDepth          float64 `json:"avg_depth"`
+	AvgBranching      float64 `json:"avg_branching"`
+	AvgPrefixLen      float64 `json:"avg_prefix_len"`
+	TotalServerRefs   int     `json:"total_server_refs"`
+	UniqueServerCount int     `json:"unique_server_count"`
 }
 
 // queuedRequest represents a request waiting in the proxy's queue
 type queuedRequest struct {
-	w           http.ResponseWriter
-	r           *http.Request
-	done        chan struct{}
-	err         error
-	enqueuedAt  time.Time
-	requestID   string
-	bodyBytes   []byte
-	tokenCount  int
-	prompt      string
+	w          http.ResponseWriter
+	r          *http.Request
+	done       chan struct{}
+	err        error
+	enqueuedAt time.Time
+	requestID  string
+	bodyBytes  []byte
+	tokenCount int
+	prompt     string
 }
 
 // GORGONode for prefix tree tracking
@@ -187,6 +250,11 @@ type HttpProxy struct {
 	totalRequestsForwarded atomic.Int64
 	totalRequestsQueued    atomic.Int64
 	totalRequestsRejected  atomic.Int64
+
+	// Request-level metrics collection (for CSV export)
+	requestMetrics           []RequestMetrics
+	requestMetricsMu         sync.RWMutex
+	metricsCollectionEnabled bool
 }
 
 // NewHttpProxy creates a new centralized proxy
@@ -341,8 +409,23 @@ func (p *HttpProxy) Handler() http.Handler {
 		case "/proxy/cache/clear":
 			p.handleCacheClearEndpoint(w, r)
 			return
+		case "/proxy/prefix/stats":
+			p.handlePrefixStatsEndpoint(w, r)
+			return
 		case "/proxy/latency":
 			p.handleLatencyEndpoint(w, r)
+			return
+		case "/proxy/metrics/export":
+			p.handleMetricsExportEndpoint(w, r)
+			return
+		case "/proxy/metrics/summary":
+			p.handleMetricsSummaryEndpoint(w, r)
+			return
+		case "/proxy/metrics/clear":
+			p.handleMetricsClearEndpoint(w, r)
+			return
+		case "/proxy/metrics/enable":
+			p.handleMetricsEnableEndpoint(w, r)
 			return
 		}
 
@@ -362,9 +445,9 @@ func (p *HttpProxy) Handler() http.Handler {
 		}
 
 		// Select best server using GORGO cost calculation
-		server := p.selectServer(prompt, tokenCount)
+		server, routing := p.selectServer(prompt, tokenCount)
 		if server != nil {
-			if p.forwardToServer(w, r, requestID, server, bodyBytes, tokenCount, prompt) {
+			if p.forwardToServer(w, r, requestID, server, bodyBytes, tokenCount, prompt, routing) {
 				p.totalRequestsForwarded.Add(1)
 				return
 			}
@@ -385,14 +468,23 @@ func (p *HttpProxy) Handler() http.Handler {
 	})
 }
 
+// routingMetrics contains metrics captured at routing time
+type routingMetrics struct {
+	PredictedPrefillTimeMs float64
+	QueuedTokens           int
+	RunningTokens          int
+	ServerCosts            map[string]float64
+}
+
 // selectServer chooses the best server using GORGO cost calculation
 // Returns nil if no healthy servers are available
-func (p *HttpProxy) selectServer(prompt string, requestTokens int) *SGLangServer {
+// Also returns routing metrics for tracking
+func (p *HttpProxy) selectServer(prompt string, requestTokens int) (*SGLangServer, *routingMetrics) {
 	p.serversMu.RLock()
 	defer p.serversMu.RUnlock()
 
 	if len(p.servers) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	p.tuningMu.RLock()
@@ -404,25 +496,25 @@ func (p *HttpProxy) selectServer(prompt string, requestTokens int) *SGLangServer
 	matchedServers := p.findPrefixMatches(prompt)
 
 	type serverCost struct {
-		server      *SGLangServer
-		cost        float64
-		matchedLen  int
+		server        *SGLangServer
+		cost          float64
+		matchedLen    int
+		queuedTokens  int
+		runningTokens int
 	}
 
 	candidates := make([]serverCost, 0, len(p.servers))
+	allServerCosts := make(map[string]float64) // Track costs for all servers
 
-	// Calculate cost for each healthy server
+	// Calculate cost for each server
 	for _, server := range p.servers {
-		if !server.Metrics.Healthy {
+		// Check capacity (healthy + GPU cache + optional running limit)
+		if !p.serverHasCapacity(server) {
+			allServerCosts[server.ID] = -1 // Mark unavailable
 			continue
 		}
 
-		// Check capacity
-		if server.Metrics.GPUCacheUsage >= p.config.GPUCacheThreshold {
-			continue
-		}
-
-		cost := p.calculateServerCost(server, prompt, requestTokens, msPerToken, runningCostFactor)
+		cost, queuedTokens, runningTokens := p.calculateServerCost(server, prompt, requestTokens, msPerToken, runningCostFactor)
 
 		// Check if this server has a prefix match
 		matchedLen := 0
@@ -438,15 +530,19 @@ func (p *HttpProxy) selectServer(prompt string, requestTokens int) *SGLangServer
 			cost -= float64(matchedTokens) * msPerToken
 		}
 
+		allServerCosts[server.ID] = cost
+
 		candidates = append(candidates, serverCost{
-			server:     server,
-			cost:       cost,
-			matchedLen: matchedLen,
+			server:        server,
+			cost:          cost,
+			matchedLen:    matchedLen,
+			queuedTokens:  queuedTokens,
+			runningTokens: runningTokens,
 		})
 	}
 
 	if len(candidates) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	// Sort by cost (ascending)
@@ -454,41 +550,107 @@ func (p *HttpProxy) selectServer(prompt string, requestTokens int) *SGLangServer
 		return candidates[i].cost < candidates[j].cost
 	})
 
-	return candidates[0].server
+	// Best candidate
+	best := candidates[0]
+
+	// Calculate predicted prefill time for the selected server (GORGO-style)
+	// = (queued_tokens * ms_per_token) + (running_tokens * ms_per_token * running_cost_factor) + (incoming_request_tokens * ms_per_token) - (matched_prefix_tokens * ms_per_token)
+	//
+	// Components:
+	// 1. Queued requests: full prefill cost
+	// 2. Running requests: weighted by running_cost_factor (qhat)
+	// 3. Incoming request: full prefill cost
+	// 4. Prefix match: subtract cached portion
+	queuedCost := float64(best.queuedTokens) * msPerToken
+	runningCost := float64(best.runningTokens) * msPerToken * runningCostFactor
+	incomingCost := float64(requestTokens) * msPerToken
+
+	// Subtract prefix match (already cached)
+	prefixDiscount := 0.0
+	if best.matchedLen > 0 {
+		matchedTokens := estimateTokenCount(prompt[:best.matchedLen])
+		prefixDiscount = float64(matchedTokens) * msPerToken
+	}
+
+	predictedPrefillTime := queuedCost + runningCost + incomingCost - prefixDiscount
+
+	metrics := &routingMetrics{
+		PredictedPrefillTimeMs: predictedPrefillTime,
+		QueuedTokens:           best.queuedTokens,
+		RunningTokens:          best.runningTokens,
+		ServerCosts:            allServerCosts,
+	}
+
+	return best.server, metrics
+}
+
+// serverHasCapacity checks if a server can accept a new request
+// Similar to loadbalancer.go's localHasCapacity()
+func (p *HttpProxy) serverHasCapacity(server *SGLangServer) bool {
+	// Must be healthy
+	if !server.Metrics.Healthy {
+		return false
+	}
+
+	// Check GPU cache threshold
+	if server.Metrics.GPUCacheUsage >= p.config.GPUCacheThreshold {
+		return false
+	}
+
+	// If capacity gating is enabled, check running requests
+	if p.config.CapacityGatingEnabled {
+		server.runningRequestsMu.RLock()
+		runningCount := len(server.runningRequests)
+		server.runningRequestsMu.RUnlock()
+
+		// Check against our configured max
+		if p.config.MaxRunningPerServer > 0 && runningCount >= p.config.MaxRunningPerServer {
+			return false
+		}
+	}
+
+	return true
 }
 
 // calculateServerCost computes the GORGO cost for a server
 // Cost = (queued_tokens * msPerToken) + (running_tokens * msPerToken * runningCostFactor) + (request_tokens * msPerToken) + latency
-func (p *HttpProxy) calculateServerCost(server *SGLangServer, prompt string, requestTokens int, msPerToken, runningCostFactor float64) float64 {
+// Also returns queuedTokens and runningTokens for metrics
+// NOTE: When capacity gating is enabled, queuedTokens will be 0 (we gate at proxy level)
+func (p *HttpProxy) calculateServerCost(server *SGLangServer, prompt string, requestTokens int, msPerToken, runningCostFactor float64) (float64, int, int) {
 	var cost float64
 
-	// Cost from running requests (tracked by proxy)
+	// Cost from running requests (tracked by proxy - EXACT counts)
+	// Note: TokenCount is character-based estimation (~4 chars per token)
+	// since proxy doesn't have access to tokenizer
 	server.runningRequestsMu.RLock()
+	runningTokens := 0
 	for _, req := range server.runningRequests {
+		runningTokens += req.TokenCount
 		cost += float64(req.TokenCount) * msPerToken * runningCostFactor
 	}
 	runningCount := len(server.runningRequests)
 	server.runningRequestsMu.RUnlock()
 
-	// Cost from queued requests at the server (from SGLang metrics)
-	// We use the difference between SGLang's reported running and our tracked running
-	// to estimate the actual server-side state
-	queuedAtServer := server.Metrics.NumWaitingReqs
-
-	// Estimate tokens for queued requests (we don't have exact counts)
-	// Use average token count based on running requests or default
-	avgTokens := 500 // default estimate
-	if runningCount > 0 {
-		server.runningRequestsMu.RLock()
-		totalTokens := 0
-		for _, req := range server.runningRequests {
-			totalTokens += req.TokenCount
+	// Cost from queued requests
+	queuedTokens := 0
+	if p.config.CapacityGatingEnabled {
+		// With capacity gating: we queue at proxy level, so SGLang has no queue
+		// The proxy's global queue is shared across servers, so we don't add it per-server
+		// (it's added once we select the best server)
+		queuedTokens = 0
+	} else {
+		// Without capacity gating: use SGLang's internal queue count
+		// We have to estimate since we don't know what's in SGLang's queue
+		// Use average of running requests (character-based token counts)
+		queuedAtServer := server.Metrics.NumWaitingReqs
+		avgTokens := 500 // default estimate (~2000 chars)
+		if runningCount > 0 {
+			avgTokens = runningTokens / runningCount
 		}
-		server.runningRequestsMu.RUnlock()
-		avgTokens = totalTokens / runningCount
+		queuedTokens = queuedAtServer * avgTokens
 	}
 
-	cost += float64(queuedAtServer*avgTokens) * msPerToken
+	cost += float64(queuedTokens) * msPerToken
 
 	// Cost for the incoming request itself (full prefill)
 	cost += float64(requestTokens) * msPerToken
@@ -502,11 +664,22 @@ func (p *HttpProxy) calculateServerCost(server *SGLangServer, prompt string, req
 	server.latencyMu.RUnlock()
 	cost += float64(latencyToUse.Milliseconds())
 
-	return cost
+	return cost, queuedTokens, runningTokens
 }
 
 // forwardToServer forwards a request to a specific server
-func (p *HttpProxy) forwardToServer(w http.ResponseWriter, r *http.Request, requestID string, server *SGLangServer, bodyBytes []byte, tokenCount int, prompt string) bool {
+func (p *HttpProxy) forwardToServer(w http.ResponseWriter, r *http.Request, requestID string, server *SGLangServer, bodyBytes []byte, tokenCount int, prompt string, routing *routingMetrics) bool {
+	// Start timing for metrics
+	startTime := time.Now()
+	var networkLatencyMs, ttftMs float64
+	var prefixHitRatios map[string]float64
+	var prefixMatchedLengths map[string]int
+
+	// Calculate prefix cache hit ratios if metrics collection is enabled
+	if p.metricsCollectionEnabled && prompt != "" {
+		prefixHitRatios, prefixMatchedLengths = p.calculatePrefixCacheHitRatios(prompt)
+	}
+
 	// Build target URL
 	targetURL := fmt.Sprintf("http://%s:%d%s", server.IP, server.Port, r.URL.Path)
 	if r.URL.RawQuery != "" {
@@ -514,12 +687,32 @@ func (p *HttpProxy) forwardToServer(w http.ResponseWriter, r *http.Request, requ
 	}
 
 	// Create forwarded request
-	ctx, cancel := context.WithTimeout(r.Context(), p.config.RequestTimeout)
-	defer cancel()
-
-	forwardReq, err := http.NewRequestWithContext(ctx, r.Method, targetURL, bytes.NewReader(bodyBytes))
+	forwardReq, err := http.NewRequest(r.Method, targetURL, bytes.NewReader(bodyBytes))
 	if err != nil {
 		log.Printf("[Proxy] Failed to create forward request %s: %v", requestID, err)
+		if p.metricsCollectionEnabled {
+			metrics := RequestMetrics{
+				RequestID:            requestID,
+				Timestamp:            startTime,
+				Prompt:               prompt,
+				PromptLength:         len(prompt),
+				TokenCount:           tokenCount,
+				SelectedServer:       server.IP,
+				SelectedServerID:     server.ID,
+				PrefixCacheHitRatios: prefixHitRatios,
+				MatchedPrefixLengths: prefixMatchedLengths,
+				StatusCode:           0,
+				Success:              false,
+				ErrorMsg:             err.Error(),
+			}
+			if routing != nil {
+				metrics.PredictedPrefillTimeMs = routing.PredictedPrefillTimeMs
+				metrics.QueuedTokensAtRouting = routing.QueuedTokens
+				metrics.RunningTokensAtRouting = routing.RunningTokens
+				metrics.ServerCostsAtRouting = routing.ServerCosts
+			}
+			p.recordRequestMetrics(metrics)
+		}
 		return false
 	}
 
@@ -544,8 +737,10 @@ func (p *HttpProxy) forwardToServer(w http.ResponseWriter, r *http.Request, requ
 	server.runningRequests[requestID] = tracked
 	server.runningRequestsMu.Unlock()
 
-	// Execute request
+	// Execute request and measure network latency
+	networkStart := time.Now()
 	resp, err := p.httpClient.Do(forwardReq)
+	networkLatencyMs = float64(time.Since(networkStart).Milliseconds())
 
 	// Untrack request when done
 	server.runningRequestsMu.Lock()
@@ -554,6 +749,30 @@ func (p *HttpProxy) forwardToServer(w http.ResponseWriter, r *http.Request, requ
 
 	if err != nil {
 		log.Printf("[Proxy] Failed to forward request %s to %s: %v", requestID, server.IP, err)
+		if p.metricsCollectionEnabled {
+			metrics := RequestMetrics{
+				RequestID:            requestID,
+				Timestamp:            startTime,
+				Prompt:               prompt,
+				PromptLength:         len(prompt),
+				TokenCount:           tokenCount,
+				NetworkLatencyMs:     networkLatencyMs,
+				SelectedServer:       server.IP,
+				SelectedServerID:     server.ID,
+				PrefixCacheHitRatios: prefixHitRatios,
+				MatchedPrefixLengths: prefixMatchedLengths,
+				StatusCode:           0,
+				Success:              false,
+				ErrorMsg:             err.Error(),
+			}
+			if routing != nil {
+				metrics.PredictedPrefillTimeMs = routing.PredictedPrefillTimeMs
+				metrics.QueuedTokensAtRouting = routing.QueuedTokens
+				metrics.RunningTokensAtRouting = routing.RunningTokens
+				metrics.ServerCostsAtRouting = routing.ServerCosts
+			}
+			p.recordRequestMetrics(metrics)
+		}
 		return false
 	}
 	defer resp.Body.Close()
@@ -570,10 +789,316 @@ func (p *HttpProxy) forwardToServer(w http.ResponseWriter, r *http.Request, requ
 		}
 	}
 	w.WriteHeader(resp.StatusCode)
+
+	// Copy body and track TTFT (time to first byte)
+	firstByteTime := time.Now()
+	ttftMs = float64(firstByteTime.Sub(startTime).Milliseconds())
 	io.Copy(w, resp.Body)
 
-	log.Printf("[Proxy] Forwarded request %s to %s (status: %d)", requestID, server.IP, resp.StatusCode)
+	totalLatencyMs := float64(time.Since(startTime).Milliseconds())
+
+	// Record metrics
+	if p.metricsCollectionEnabled {
+		metrics := RequestMetrics{
+			RequestID:            requestID,
+			Timestamp:            startTime,
+			Prompt:               prompt,
+			PromptLength:         len(prompt),
+			TokenCount:           tokenCount,
+			NetworkLatencyMs:     networkLatencyMs,
+			TTFTMs:               ttftMs,
+			TotalLatencyMs:       totalLatencyMs,
+			QueueTimeMs:          0, // Will be set by queue processor if queued
+			SelectedServer:       server.IP,
+			SelectedServerID:     server.ID,
+			PrefixCacheHitRatios: prefixHitRatios,
+			MatchedPrefixLengths: prefixMatchedLengths,
+			StatusCode:           resp.StatusCode,
+			Success:              resp.StatusCode >= 200 && resp.StatusCode < 300,
+		}
+		if routing != nil {
+			metrics.PredictedPrefillTimeMs = routing.PredictedPrefillTimeMs
+			metrics.QueuedTokensAtRouting = routing.QueuedTokens
+			metrics.RunningTokensAtRouting = routing.RunningTokens
+			metrics.ServerCostsAtRouting = routing.ServerCosts
+		}
+		p.recordRequestMetrics(metrics)
+	}
+
+	log.Printf("[Proxy] Forwarded request %s to %s (status: %d, latency: %.0fms)", requestID, server.IP, resp.StatusCode, totalLatencyMs)
 	return true
+}
+
+// recordRequestMetrics stores a request metric in memory
+func (p *HttpProxy) recordRequestMetrics(metric RequestMetrics) {
+	p.requestMetricsMu.Lock()
+	defer p.requestMetricsMu.Unlock()
+	p.requestMetrics = append(p.requestMetrics, metric)
+}
+
+// exportMetricsToCSV exports collected metrics to CSV format
+// Returns CSV data as bytes
+func (p *HttpProxy) exportMetricsToCSV() ([]byte, error) {
+	p.requestMetricsMu.RLock()
+	defer p.requestMetricsMu.RUnlock()
+
+	if len(p.requestMetrics) == 0 {
+		return nil, fmt.Errorf("no metrics collected")
+	}
+
+	var buf bytes.Buffer
+	writer := csv.NewWriter(&buf)
+
+	// Get all unique server IDs for column headers
+	serverIDs := make(map[string]bool)
+	for _, metric := range p.requestMetrics {
+		for serverID := range metric.PrefixCacheHitRatios {
+			serverIDs[serverID] = true
+		}
+	}
+
+	// Convert to sorted slice for consistent ordering
+	sortedServerIDs := make([]string, 0, len(serverIDs))
+	for serverID := range serverIDs {
+		sortedServerIDs = append(sortedServerIDs, serverID)
+	}
+	sort.Strings(sortedServerIDs)
+
+	// Write CSV header
+	header := []string{
+		"request_id",
+		"timestamp",
+		"prompt_length",
+		"tokens",
+		"network_latency_ms",
+		"ttft_ms",
+		"total_latency_ms",
+		"queue_time_ms",
+		"predicted_prefill_time_ms",
+		"queued_tokens_at_routing",
+		"running_tokens_at_routing",
+		"selected_server",
+		"selected_server_id",
+	}
+
+	// Add columns for each server's prefix hit ratio and matched length
+	for _, serverID := range sortedServerIDs {
+		header = append(header, fmt.Sprintf("%s_prefix_hit", serverID))
+		header = append(header, fmt.Sprintf("%s_matched_len", serverID))
+	}
+
+	// Add columns for each server's GORGO cost at routing time
+	for _, serverID := range sortedServerIDs {
+		header = append(header, fmt.Sprintf("%s_cost", serverID))
+	}
+
+	header = append(header, "status_code", "success", "error")
+
+	if err := writer.Write(header); err != nil {
+		return nil, fmt.Errorf("failed to write CSV header: %w", err)
+	}
+
+	// Write data rows
+	for _, metric := range p.requestMetrics {
+		row := []string{
+			metric.RequestID,
+			metric.Timestamp.Format(time.RFC3339),
+			strconv.Itoa(metric.PromptLength),
+			strconv.Itoa(metric.TokenCount),
+			fmt.Sprintf("%.2f", metric.NetworkLatencyMs),
+			fmt.Sprintf("%.2f", metric.TTFTMs),
+			fmt.Sprintf("%.2f", metric.TotalLatencyMs),
+			fmt.Sprintf("%.2f", metric.QueueTimeMs),
+			fmt.Sprintf("%.2f", metric.PredictedPrefillTimeMs),
+			strconv.Itoa(metric.QueuedTokensAtRouting),
+			strconv.Itoa(metric.RunningTokensAtRouting),
+			metric.SelectedServer,
+			metric.SelectedServerID,
+		}
+
+		// Add prefix cache hit ratios and matched lengths for each server
+		for _, serverID := range sortedServerIDs {
+			hitRatio := metric.PrefixCacheHitRatios[serverID]
+			matchedLen := metric.MatchedPrefixLengths[serverID]
+			row = append(row, fmt.Sprintf("%.4f", hitRatio))
+			row = append(row, strconv.Itoa(matchedLen))
+		}
+
+		// Add server costs at routing time for each server
+		for _, serverID := range sortedServerIDs {
+			cost := metric.ServerCostsAtRouting[serverID]
+			row = append(row, fmt.Sprintf("%.2f", cost))
+		}
+
+		successStr := "false"
+		if metric.Success {
+			successStr = "true"
+		}
+
+		row = append(row, strconv.Itoa(metric.StatusCode), successStr, metric.ErrorMsg)
+
+		if err := writer.Write(row); err != nil {
+			return nil, fmt.Errorf("failed to write CSV row: %w", err)
+		}
+	}
+
+	writer.Flush()
+	if err := writer.Error(); err != nil {
+		return nil, fmt.Errorf("CSV writer error: %w", err)
+	}
+
+	return buf.Bytes(), nil
+}
+
+// getMetricsCount returns the number of collected metrics
+func (p *HttpProxy) getMetricsCount() int {
+	p.requestMetricsMu.RLock()
+	defer p.requestMetricsMu.RUnlock()
+	return len(p.requestMetrics)
+}
+
+// clearMetrics clears all collected metrics
+func (p *HttpProxy) clearMetrics() int {
+	p.requestMetricsMu.Lock()
+	defer p.requestMetricsMu.Unlock()
+	count := len(p.requestMetrics)
+	p.requestMetrics = []RequestMetrics{}
+	return count
+}
+
+// enableMetricsCollection enables/disables metrics collection
+func (p *HttpProxy) enableMetricsCollection(enabled bool) {
+	p.metricsCollectionEnabled = enabled
+	if enabled {
+		log.Printf("[Proxy] Metrics collection enabled")
+	} else {
+		log.Printf("[Proxy] Metrics collection disabled")
+	}
+}
+
+// =============================================================================
+// METRICS MANAGEMENT ENDPOINTS
+// =============================================================================
+
+func (p *HttpProxy) handleMetricsExportEndpoint(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "GET required", http.StatusMethodNotAllowed)
+		return
+	}
+
+	csvData, err := p.exportMetricsToCSV()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/csv")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=proxy_metrics_%s.csv", time.Now().Format("20060102_150405")))
+	w.Write(csvData)
+
+	log.Printf("[Proxy] Exported %d metrics to CSV", p.getMetricsCount())
+}
+
+func (p *HttpProxy) handleMetricsSummaryEndpoint(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "GET required", http.StatusMethodNotAllowed)
+		return
+	}
+
+	p.requestMetricsMu.RLock()
+	defer p.requestMetricsMu.RUnlock()
+
+	if len(p.requestMetrics) == 0 {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"count":   0,
+			"message": "No metrics collected",
+		})
+		return
+	}
+
+	// Calculate summary statistics
+	var totalLatency, totalTTFT, totalNetworkLatency float64
+	var successCount, failCount int
+	prefixHitSums := make(map[string]float64)
+	prefixHitCounts := make(map[string]int)
+
+	for _, metric := range p.requestMetrics {
+		totalLatency += metric.TotalLatencyMs
+		totalTTFT += metric.TTFTMs
+		totalNetworkLatency += metric.NetworkLatencyMs
+
+		if metric.Success {
+			successCount++
+		} else {
+			failCount++
+		}
+
+		// Aggregate prefix cache hit ratios
+		for serverID, hitRatio := range metric.PrefixCacheHitRatios {
+			prefixHitSums[serverID] += hitRatio
+			prefixHitCounts[serverID]++
+		}
+	}
+
+	count := len(p.requestMetrics)
+	avgPrefixHitRatios := make(map[string]float64)
+	for serverID, sum := range prefixHitSums {
+		avgPrefixHitRatios[serverID] = sum / float64(prefixHitCounts[serverID])
+	}
+
+	summary := map[string]interface{}{
+		"count":                       count,
+		"success_count":               successCount,
+		"fail_count":                  failCount,
+		"avg_total_latency_ms":        totalLatency / float64(count),
+		"avg_ttft_ms":                 totalTTFT / float64(count),
+		"avg_network_latency_ms":      totalNetworkLatency / float64(count),
+		"avg_prefix_cache_hit_ratios": avgPrefixHitRatios,
+		"metrics_collection_enabled":  p.metricsCollectionEnabled,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(summary)
+}
+
+func (p *HttpProxy) handleMetricsClearEndpoint(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST required", http.StatusMethodNotAllowed)
+		return
+	}
+
+	count := p.clearMetrics()
+	log.Printf("[Proxy] Cleared %d metrics", count)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"cleared": count,
+	})
+}
+
+func (p *HttpProxy) handleMetricsEnableEndpoint(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST required", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	p.enableMetricsCollection(req.Enabled)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"enabled": p.metricsCollectionEnabled,
+	})
 }
 
 // enqueueRequest adds a request to the proxy's global queue
@@ -645,7 +1170,7 @@ func (p *HttpProxy) processQueuedRequests() {
 		p.queueMu.Unlock()
 
 		// Try to select a server
-		server := p.selectServer(qr.prompt, qr.tokenCount)
+		server, routing := p.selectServer(qr.prompt, qr.tokenCount)
 		if server == nil {
 			// No server available, stop processing queue
 			return
@@ -659,16 +1184,16 @@ func (p *HttpProxy) processQueuedRequests() {
 		p.queueMu.Unlock()
 
 		// Forward the request
-		go func(qr *queuedRequest, server *SGLangServer) {
+		go func(qr *queuedRequest, server *SGLangServer, routing *routingMetrics) {
 			// Restore body for forwarding
 			qr.r.Body = io.NopCloser(bytes.NewReader(qr.bodyBytes))
 
-			success := p.forwardToServer(qr.w, qr.r, qr.requestID, server, qr.bodyBytes, qr.tokenCount, qr.prompt)
+			success := p.forwardToServer(qr.w, qr.r, qr.requestID, server, qr.bodyBytes, qr.tokenCount, qr.prompt, routing)
 			if !success {
 				qr.err = fmt.Errorf("forward failed")
 			}
 			close(qr.done)
-		}(qr, server)
+		}(qr, server, routing)
 	}
 }
 
@@ -1111,45 +1636,153 @@ func countNodes(n *GORGONode) int {
 	return count
 }
 
+// calculatePrefixCacheHitRatios calculates prefix cache hit ratios for ALL servers
+// Returns two maps: serverID -> hit_ratio and serverID -> matched_length
+func (p *HttpProxy) calculatePrefixCacheHitRatios(prompt string) (map[string]float64, map[string]int) {
+	hitRatios := make(map[string]float64)
+	matchedLengths := make(map[string]int)
+
+	if prompt == "" {
+		return hitRatios, matchedLengths
+	}
+
+	promptLen := len(prompt)
+
+	// Get all prefix matches from the tree
+	allMatches := p.findPrefixMatches(prompt)
+
+	// Build a map of server -> best matched length
+	bestMatches := make(map[string]int)
+	for _, match := range allMatches {
+		serverID := match.server.ID
+		if match.matchedLen > bestMatches[serverID] {
+			bestMatches[serverID] = match.matchedLen
+		}
+	}
+
+	// Calculate hit ratios for servers that have matches
+	for serverID, matchedLen := range bestMatches {
+		hitRatios[serverID] = float64(matchedLen) / float64(promptLen)
+		matchedLengths[serverID] = matchedLen
+	}
+
+	// For servers with no matches, explicitly set 0.0
+	p.serversMu.RLock()
+	for _, server := range p.servers {
+		if _, found := hitRatios[server.ID]; !found {
+			hitRatios[server.ID] = 0.0
+			matchedLengths[server.ID] = 0
+		}
+	}
+	p.serversMu.RUnlock()
+
+	return hitRatios, matchedLengths
+}
+
 // =============================================================================
 // HELPER FUNCTIONS
 // =============================================================================
 
-func extractPromptAndTokenCount(bodyBytes []byte) (int, string) {
+// extractPromptFromBody parses the request body to extract the prompt text
+// Supports OpenAI chat completions format (string and array content), legacy completions, and SGLang formats
+// Uses json.RawMessage to handle flexible content types
+func extractPromptFromBody(bodyBytes []byte) string {
 	if len(bodyBytes) == 0 {
-		return 0, ""
+		return ""
 	}
 
-	// Try chat completions format
+	// Try chat completions format with flexible content type
+	// Content can be either:
+	// - String: {"messages": [{"role": "user", "content": "text"}]}
+	// - Array: {"messages": [{"role": "user", "content": [{"type": "text", "text": "..."}]}]}
 	var chatReq struct {
 		Messages []struct {
-			Role    string `json:"role"`
-			Content string `json:"content"`
+			Role    string          `json:"role"`
+			Content json.RawMessage `json:"content"` // Use RawMessage to handle both string and array
 		} `json:"messages"`
 	}
+
 	if err := json.Unmarshal(bodyBytes, &chatReq); err == nil && len(chatReq.Messages) > 0 {
 		var builder strings.Builder
 		for _, msg := range chatReq.Messages {
-			builder.WriteString(msg.Content)
-			builder.WriteString(" ")
+			// Try to unmarshal as string first
+			var contentStr string
+			if err := json.Unmarshal(msg.Content, &contentStr); err == nil && contentStr != "" {
+				builder.WriteString(contentStr)
+				builder.WriteString(" ")
+				continue
+			}
+
+			// Try to unmarshal as array (Vision API format)
+			var contentArray []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			}
+			if err := json.Unmarshal(msg.Content, &contentArray); err == nil {
+				for _, part := range contentArray {
+					if part.Type == "text" && part.Text != "" {
+						builder.WriteString(part.Text)
+						builder.WriteString(" ")
+					}
+				}
+			}
 		}
-		prompt := strings.TrimSpace(builder.String())
-		return estimateTokenCount(prompt), prompt
+		result := strings.TrimSpace(builder.String())
+		if result != "" {
+			return result
+		}
 	}
 
-	// Try legacy completions format
+	// Try legacy completions format: {"prompt": "..."}
 	var legacyReq struct {
 		Prompt string `json:"prompt"`
 	}
 	if err := json.Unmarshal(bodyBytes, &legacyReq); err == nil && legacyReq.Prompt != "" {
-		return estimateTokenCount(legacyReq.Prompt), legacyReq.Prompt
+		return legacyReq.Prompt
 	}
 
-	return 0, ""
+	// Try SGLang native format: {"text": "..."}
+	var sglangReq struct {
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(bodyBytes, &sglangReq); err == nil && sglangReq.Text != "" {
+		return sglangReq.Text
+	}
+
+	// Log if we couldn't extract (for debugging)
+	if len(bodyBytes) > 0 {
+		preview := string(bodyBytes)
+		if len(preview) > 300 {
+			preview = preview[:300] + "..."
+		}
+		log.Printf("[Proxy] Warning: Could not extract prompt from request. Body preview: %s", preview)
+	}
+
+	return ""
+}
+
+// extractPromptAndTokenCount extracts prompt and computes token count
+// Returns the token count and the extracted prompt text
+func extractPromptAndTokenCount(bodyBytes []byte) (int, string) {
+	prompt := extractPromptFromBody(bodyBytes)
+	if prompt == "" {
+		return 0, ""
+	}
+	tokenCount := estimateTokenCount(prompt)
+	return tokenCount, prompt
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func estimateTokenCount(text string) int {
-	// Simple estimation: ~4 chars per token
+	// Character-based estimation: ~4 chars per token
+	// Note: The proxy doesn't have access to the tokenizer sidecar (that's only on loadbalancer nodes)
+	// So we use this simple heuristic for all token counting
 	return (len(text) + 3) / 4
 }
 
@@ -1193,15 +1826,15 @@ func (p *HttpProxy) handleStatusEndpoint(w http.ResponseWriter, r *http.Request)
 	p.queueMu.Unlock()
 
 	status := map[string]interface{}{
-		"running":            p.running.Load(),
-		"uptime_seconds":     time.Since(p.startTime).Seconds(),
-		"servers":            servers,
-		"queue_size":         queueSize,
-		"total_handled":      p.totalRequestsHandled.Load(),
-		"total_forwarded":    p.totalRequestsForwarded.Load(),
-		"total_queued":       p.totalRequestsQueued.Load(),
-		"total_rejected":     p.totalRequestsRejected.Load(),
-		"ms_per_token":       p.msPerToken,
+		"running":             p.running.Load(),
+		"uptime_seconds":      time.Since(p.startTime).Seconds(),
+		"servers":             servers,
+		"queue_size":          queueSize,
+		"total_handled":       p.totalRequestsHandled.Load(),
+		"total_forwarded":     p.totalRequestsForwarded.Load(),
+		"total_queued":        p.totalRequestsQueued.Load(),
+		"total_rejected":      p.totalRequestsRejected.Load(),
+		"ms_per_token":        p.msPerToken,
 		"running_cost_factor": p.runningCostFactor,
 	}
 
@@ -1315,6 +1948,17 @@ func (p *HttpProxy) handleCacheClearEndpoint(w http.ResponseWriter, r *http.Requ
 	fmt.Fprintf(w, "Cleared %d nodes from prefix cache", count)
 }
 
+func (p *HttpProxy) handlePrefixStatsEndpoint(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "GET required", http.StatusMethodNotAllowed)
+		return
+	}
+
+	stats := p.PrefixTreeStats()
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(stats)
+}
+
 func (p *HttpProxy) handleLatencyEndpoint(w http.ResponseWriter, r *http.Request) {
 	p.serversMu.RLock()
 	defer p.serversMu.RUnlock()
@@ -1351,4 +1995,77 @@ func (p *HttpProxy) GetTuningParams() (msPerToken, runningCostFactor float64) {
 	p.tuningMu.RLock()
 	defer p.tuningMu.RUnlock()
 	return p.msPerToken, p.runningCostFactor
+}
+
+// PrefixTreeStats returns summary statistics about the current prefix tree.
+func (p *HttpProxy) PrefixTreeStats() PrefixTreeStats {
+	p.prefixTreeMu.RLock()
+	defer p.prefixTreeMu.RUnlock()
+
+	stats := PrefixTreeStats{}
+	if p.prefixTree == nil {
+		return stats
+	}
+
+	uniqueServers := make(map[string]struct{})
+	var totalDepth int
+	var totalPrefixLen int
+	var totalChildren int
+	var internalNodes int
+
+	var walk func(node *GORGONode, depth int)
+	walk = func(node *GORGONode, depth int) {
+		if node == nil {
+			return
+		}
+		stats.Nodes++
+		totalPrefixLen += len(node.prefix)
+		stats.TotalServerRefs += len(node.servers)
+		for _, srv := range node.servers {
+			if srv != nil {
+				uniqueServers[srv.ID] = struct{}{}
+			}
+		}
+
+		if len(node.children) == 0 {
+			stats.Leaves++
+			totalDepth += depth
+			if depth > stats.MaxDepth {
+				stats.MaxDepth = depth
+			}
+			return
+		}
+
+		internalNodes++
+		totalChildren += len(node.children)
+		for _, child := range node.children {
+			walk(child, depth+len(child.prefix))
+		}
+	}
+
+	walk(p.prefixTree, 0)
+
+	if stats.Leaves > 0 {
+		stats.AvgDepth = float64(totalDepth) / float64(stats.Leaves)
+	}
+	if stats.Nodes > 0 {
+		stats.AvgPrefixLen = float64(totalPrefixLen) / float64(stats.Nodes)
+	}
+	if internalNodes > 0 {
+		stats.AvgBranching = float64(totalChildren) / float64(internalNodes)
+	}
+	stats.UniqueServerCount = len(uniqueServers)
+
+	log.Printf("[Proxy] Prefix tree stats: nodes=%d leaves=%d max_depth=%d avg_depth=%.2f avg_branching=%.2f avg_prefix_len=%.2f total_server_refs=%d unique_servers=%d",
+		stats.Nodes,
+		stats.Leaves,
+		stats.MaxDepth,
+		stats.AvgDepth,
+		stats.AvgBranching,
+		stats.AvgPrefixLen,
+		stats.TotalServerRefs,
+		stats.UniqueServerCount,
+	)
+
+	return stats
 }

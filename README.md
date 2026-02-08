@@ -133,3 +133,17 @@ guidellm benchmark --target http://146.235.219.131:9000/v1 --profile poisson --r
 ```
 
 Running this benchmark without the geo_proxy.py will send all requests to the proxy, which will then run the GORGO forwarding policy (cache + latency aware).
+
+### View PrefixTrie Stats
+```bash
+./gotoni proxy prefix-stats
+Prefix Tree Stats:
+  Nodes:               257
+  Leaves:              165
+  Max depth:           17374
+  Avg depth:           670.55
+  Avg branching:       2.78
+  Avg prefix length:   409.49
+  Total server refs:   173
+  Unique servers:      3
+```
