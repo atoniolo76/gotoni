@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/atoniolo76/gotoni/pkg/db"
 	"github.com/atoniolo76/gotoni/pkg/remote"
 
 	"github.com/spf13/cobra"
@@ -268,6 +269,31 @@ Examples:
 				if err == nil && details.IP != "" {
 					if err := remote.UpdateSSHConfig(instanceName, details.IP, instance.SSHKeyFile); err != nil {
 						fmt.Printf("Warning: Failed to update SSH config: %v\n", err)
+					}
+				}
+			}
+		}
+
+		// Save SSH key to database (so we can look up file paths later)
+		// Note: Instance state is managed by Lambda API, not local DB
+		if launchErr == nil {
+			database, dbErr := db.InitDB()
+			if dbErr != nil {
+				fmt.Printf("Warning: Failed to initialize database: %v\n", dbErr)
+			} else {
+				defer database.Close()
+				for _, instance := range launchedInstances {
+					// Save SSH key to database (maps key name -> file path)
+					if instance.SSHKeyName != "" && instance.SSHKeyFile != "" {
+						sshKey := &db.SSHKey{
+							Name:       instance.SSHKeyName,
+							PrivateKey: instance.SSHKeyFile,
+						}
+						if saveErr := database.SaveSSHKey(sshKey); saveErr != nil {
+							fmt.Printf("Warning: Failed to save SSH key to database: %v\n", saveErr)
+						} else {
+							fmt.Printf("SSH key %s registered in local database\n", instance.SSHKeyName)
+						}
 					}
 				}
 			}

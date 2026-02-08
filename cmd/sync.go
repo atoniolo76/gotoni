@@ -8,7 +8,6 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"time"
 
 	"github.com/atoniolo76/gotoni/pkg/db"
 	"github.com/atoniolo76/gotoni/pkg/remote"
@@ -19,9 +18,11 @@ import (
 // syncCmd represents the sync command
 var syncCmd = &cobra.Command{
 	Use:   "sync",
-	Short: "Sync running instances and SSH keys from cloud provider to local database",
-	Long: `Sync your running instances and associated SSH keys from your cloud provider to the local gotoni database.
-This command fetches currently running instances from the API and updates the local database.
+	Short: "Sync SSH keys from running instances to local database",
+	Long: `Sync SSH keys used by your running instances to the local gotoni database.
+This command fetches running instances from Lambda API and registers their SSH keys locally.
+Instance state is managed by Lambda API - only SSH key file paths are stored locally.
+
 SSH keys are expected to be present in the ~/.ssh/ directory and will be registered in the database if found.
 
 Examples:
@@ -63,7 +64,7 @@ Examples:
 			}
 		}
 
-		// List running instances
+		// List running instances from Lambda API (source of truth)
 		runningInstances, err := remote.ListRunningInstances(httpClient, apiToken)
 		if err != nil {
 			log.Fatalf("Error listing running instances: %v", err)
@@ -74,76 +75,81 @@ Examples:
 			return
 		}
 
-		// Get database
+		// Get database for SSH key storage
 		database, err := db.InitDB()
 		if err != nil {
 			log.Fatalf("Error initializing database: %v", err)
 		}
 		defer database.Close()
 
-		fmt.Printf("Syncing %d running instance(s)...\n", len(runningInstances))
+		fmt.Printf("Found %d running instance(s) from API...\n", len(runningInstances))
+		fmt.Println("Syncing SSH keys...")
 
-		syncedCount := 0
 		keyCount := 0
+		keysNotFound := 0
 
+		// Collect unique SSH key names
+		keyNames := make(map[string]bool)
 		for _, instance := range runningInstances {
-			// Determine SSH key name
-			var sshKeyName string
-			if len(instance.SSHKeyNames) > 0 {
-				sshKeyName = instance.SSHKeyNames[0] // Use the first SSH key
+			for _, keyName := range instance.SSHKeyNames {
+				keyNames[keyName] = true
 			}
-
-			// Create DB instance
-			dbInstance := &db.Instance{
-				ID:             instance.ID,
-				Name:           instance.Name,
-				Region:         instance.Region.Name,
-				Status:         instance.Status,
-				SSHKeyName:     sshKeyName,
-				InstanceType:   instance.InstanceType.Name,
-				IPAddress:      instance.IP,
-				CreatedAt:      time.Now(), // We don't have creation time from API, use current time
-			}
-
-			// Save instance to DB
-			if err := database.SaveInstance(dbInstance); err != nil {
-				log.Printf("Error saving instance %s: %v", instance.ID, err)
-				continue
-			}
-
-			fmt.Printf("Synced instance: %s (%s)\n", instance.ID, instance.Name)
-
-			// Sync SSH key if present
-			if sshKeyName != "" {
-				// Check if SSH key file exists
-				homeDir, err := os.UserHomeDir()
-				if err != nil {
-					log.Printf("Error getting home directory: %v", err)
-					continue
-				}
-				keyPath := filepath.Join(homeDir, ".ssh", sshKeyName+".pem")
-
-				if _, err := os.Stat(keyPath); err == nil {
-					// Key exists, save to DB
-					sshKey := &db.SSHKey{
-						Name:       sshKeyName,
-						PrivateKey: keyPath,
-					}
-					if err := database.SaveSSHKey(sshKey); err != nil {
-						log.Printf("Error saving SSH key %s: %v", sshKeyName, err)
-					} else {
-						fmt.Printf("  Registered SSH key: %s\n", sshKeyName)
-						keyCount++
-					}
-				} else {
-					fmt.Printf("  Warning: SSH key file not found: %s\n", keyPath)
-				}
-			}
-
-			syncedCount++
 		}
 
-		fmt.Printf("\nSync complete: %d instance(s) synced, %d SSH key(s) registered.\n", syncedCount, keyCount)
+		// Get home directory
+		homeDir, err := os.UserHomeDir()
+		if err != nil {
+			log.Fatalf("Error getting home directory: %v", err)
+		}
+		sshDir := filepath.Join(homeDir, ".ssh")
+
+		// Register each SSH key if the file exists locally
+		for keyName := range keyNames {
+			// Try common file naming patterns
+			possiblePaths := []string{
+				filepath.Join(sshDir, keyName+".pem"),
+				filepath.Join(sshDir, keyName),
+			}
+
+			var foundPath string
+			for _, path := range possiblePaths {
+				if _, err := os.Stat(path); err == nil {
+					foundPath = path
+					break
+				}
+			}
+
+			if foundPath != "" {
+				// Key file exists, save to DB
+				sshKey := &db.SSHKey{
+					Name:       keyName,
+					PrivateKey: foundPath,
+				}
+				if err := database.SaveSSHKey(sshKey); err != nil {
+					log.Printf("Error saving SSH key %s: %v", keyName, err)
+				} else {
+					fmt.Printf("  ✅ Registered SSH key: %s -> %s\n", keyName, foundPath)
+					keyCount++
+				}
+			} else {
+				fmt.Printf("  ⚠️  SSH key file not found locally: %s\n", keyName)
+				fmt.Printf("     Expected at: %s.pem or %s\n", filepath.Join(sshDir, keyName), filepath.Join(sshDir, keyName))
+				keysNotFound++
+			}
+		}
+
+		fmt.Printf("\nSync complete: %d SSH key(s) registered", keyCount)
+		if keysNotFound > 0 {
+			fmt.Printf(", %d key(s) not found locally", keysNotFound)
+		}
+		fmt.Println()
+
+		if keysNotFound > 0 {
+			fmt.Println("\nTo add missing keys:")
+			fmt.Println("  1. Download the private key file from Lambda Cloud dashboard")
+			fmt.Println("  2. Save it to ~/.ssh/<key-name>.pem")
+			fmt.Println("  3. Run 'gotoni sync' again")
+		}
 	},
 }
 

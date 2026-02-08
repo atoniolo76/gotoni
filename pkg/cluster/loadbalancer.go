@@ -1,9 +1,11 @@
 /*
 Copyright © 2025 ALESSIO TONIOLO
 
-loadbalancer.go implements a distributed load balancer that runs on each node.
+load_balancer.go implements a distributed load balancer that runs on each node.
 When a node reaches its max concurrent requests threshold, it forwards
 requests to other healthy nodes in the cluster.
+
+Metrics polling is handled in sglang_metrics.go
 */
 package serve
 
@@ -17,114 +19,795 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/atoniolo76/gotoni/pkg/config"
 	"github.com/atoniolo76/gotoni/pkg/remote"
 )
 
-// LoadBalancerConfig configures the distributed load balancer
-type LoadBalancerConfig struct {
-	// MaxConcurrentRequests is the threshold before forwarding to peers
-	MaxConcurrentRequests int `json:"max_concurrent_requests"`
-
-	// LocalPort is the port the local backend service listens on
-	LocalPort int `json:"local_port"`
-
-	// ListenPort is the port the load balancer listens on
-	ListenPort int `json:"listen_port"`
-
-	// PeerPort is the port other nodes' load balancers listen on (usually same as ListenPort)
-	PeerPort int `json:"peer_port"`
-
-	// HealthCheckInterval is how often to check peer health
-	HealthCheckInterval time.Duration `json:"health_check_interval"`
-
-	// HealthCheckTimeout is the timeout for health check requests
-	HealthCheckTimeout time.Duration `json:"health_check_timeout"`
-
-	// RequestTimeout is the timeout for forwarded requests
-	RequestTimeout time.Duration `json:"request_timeout"`
-
-	// Strategy is the load balancing strategy: "round-robin", "least-loaded", "random"
-	Strategy string `json:"strategy"`
-
-	// QueueEnabled enables request queuing when all nodes are at capacity
-	QueueEnabled bool `json:"queue_enabled"`
-
-	// MaxQueueSize is the maximum number of requests to queue
-	MaxQueueSize int `json:"max_queue_size"`
-
-	// QueueTimeout is how long a request can wait in queue
-	QueueTimeout time.Duration `json:"queue_timeout"`
-
-	// NodeID is a unique identifier for this node
-	NodeID string `json:"node_id"`
-
-	// HealthEndpoint is the path to check for health (default: /health)
-	HealthEndpoint string `json:"health_endpoint"`
-
-	// MetricsEnabled enables metrics collection
-	MetricsEnabled bool `json:"metrics_enabled"`
+// LoadBalancingStrategy defines the interface for load balancing algorithms
+type LoadBalancingStrategy interface {
+	Select(peers []*PeerNode, availabilityMap map[*PeerNode]AvailabilityStatus, requestPath string) *PeerNode
 }
 
-// DefaultLoadBalancerConfig returns sensible defaults
+// LoadBalancerConfig configures the distributed load balancer
+type LoadBalancerConfig struct {
+	MaxConcurrentRequests int                   `json:"max_concurrent_requests"`
+	ApplicationPort       int                   `json:"application_port"`
+	LoadBalancerPort      int                   `json:"load_balancer_port"`
+	RequestTimeout        time.Duration         `json:"request_timeout"`
+	QueueEnabled          bool                  `json:"queue_enabled"`
+	QueueTimeout          time.Duration         `json:"queue_timeout"`
+	MaxQueueSize          int                   `json:"max_queue_size"` // Max requests in queue before rejecting (0 = unlimited)
+	Strategy              LoadBalancingStrategy `json:"-"`              // Not serializable
+
+	// SGLang metrics polling (see sglang_metrics.go for polling logic)
+	MetricsEnabled      bool          `json:"metrics_enabled"`
+	MetricsPollInterval time.Duration `json:"metrics_poll_interval"`
+	MetricsEndpoint     string        `json:"metrics_endpoint"`
+	MetricsTimeout      time.Duration `json:"metrics_timeout"`
+	UnhealthyThreshold  int           `json:"unhealthy_threshold"`
+	GPUCacheThreshold   float64       `json:"gpu_cache_threshold"`
+
+	// SkyServe-style inference engine queue indicator
+	// When true: forward requests when SGLang's internal queue > 0
+	// When false: forward when total requests >= MaxConcurrentRequests
+	UseIEQueueIndicator bool `json:"use_ie_queue_indicator"`
+
+	// If > 0: forward when running_reqs exceeds this (overrides IE queue)
+	RunningReqsThreshold int `json:"running_reqs_threshold"`
+
+	// GORGO tuning parameters (runtime adjustable)
+	GORGOMsPerToken        float64 `json:"gorgo_ms_per_token"`
+	GORGORunningCostFactor float64 `json:"gorgo_running_cost_factor"`
+
+	// Node identity for tracing
+	NodeID      string `json:"node_id"`
+	ClusterName string `json:"cluster_name"`
+}
+
+// DefaultLoadBalancerConfig returns sensible defaults from pkg/config/constants.go
 func DefaultLoadBalancerConfig() *LoadBalancerConfig {
+	metricsConfig := DefaultMetricsConfig()
 	return &LoadBalancerConfig{
-		MaxConcurrentRequests: 10,
-		LocalPort:             8080,
-		ListenPort:            8000,
-		PeerPort:              8000,
-		HealthCheckInterval:   5 * time.Second,
-		HealthCheckTimeout:    2 * time.Second,
-		RequestTimeout:        30 * time.Second,
-		Strategy:              "least-loaded",
-		QueueEnabled:          true,
-		MaxQueueSize:          100,
-		QueueTimeout:          30 * time.Second,
-		NodeID:                "",
-		HealthEndpoint:        "/health",
-		MetricsEnabled:        true,
+		MaxConcurrentRequests: config.DefaultMaxConcurrentRequests,
+		ApplicationPort:       config.DefaultApplicationPort,
+		LoadBalancerPort:      config.DefaultLoadBalancerPort,
+		RequestTimeout:        config.DefaultRequestTimeout,
+		QueueEnabled:          config.DefaultQueueEnabled,
+		QueueTimeout:          config.DefaultQueueTimeout,
+		MaxQueueSize:          config.DefaultMaxQueueSize,
+		Strategy:              &LeastLoadedPolicy{},
+
+		// SGLang metrics config
+		MetricsEnabled:      metricsConfig.Enabled,
+		MetricsPollInterval: metricsConfig.PollInterval,
+		MetricsEndpoint:     metricsConfig.Endpoint,
+		MetricsTimeout:      metricsConfig.Timeout,
+		UnhealthyThreshold:  metricsConfig.UnhealthyThreshold,
+		GPUCacheThreshold:   metricsConfig.GPUCacheThreshold,
+
+		// Running threshold takes priority over IE queue indicator
+		RunningReqsThreshold: config.DefaultRunningReqsThreshold,
+		UseIEQueueIndicator:  config.DefaultUseIEQueueIndicator,
+
+		// GORGO tuning parameters
+		GORGOMsPerToken:        config.DefaultGORGOMsPerToken,
+		GORGORunningCostFactor: config.DefaultGORGORunningCostFactor,
 	}
 }
 
-// LoadBalancerPolicy defines the interface for peer selection strategies
-type LoadBalancerPolicy interface {
-	// Select chooses a peer from the available peers
-	Select(peers []*PeerNode) *PeerNode
-	// Name returns the name of the policy
-	Name() string
-}
-
-// LeastLoadedPolicy selects the peer with the lowest current load
 type LeastLoadedPolicy struct{}
 
-func (p *LeastLoadedPolicy) Name() string {
-	return "least-loaded"
+type PrefixTreePolicy struct {
+	mu   sync.RWMutex
+	root *prefixNode
 }
 
-func (p *LeastLoadedPolicy) Select(peers []*PeerNode) *PeerNode {
+type prefixNode struct {
+	children map[byte]*prefixNode
+	peers    []*PeerNode
+	prefix   string // variable length
+}
+
+type GORGONode struct {
+	children map[byte]*GORGONode
+	peers    []*PeerNode
+	prefix   string // variable length
+}
+
+// GORGOPolicy compares local queue cost vs peer costs to make routing decisions
+type GORGOPolicy struct {
+	mu        sync.RWMutex
+	root      *GORGONode    // Prefix tree for peer KV cache locations
+	localRoot *GORGONode    // Prefix tree for local KV cache (nil peer marker)
+	lb        *LoadBalancer // Reference to access running/queued request data
+}
+
+// runningRequest tracks a request currently being processed locally
+type runningRequest struct {
+	requestID  string
+	tokenCount int
+	startedAt  time.Time
+}
+
+// prefixMatch represents a matched prefix in the tree with available peers
+type prefixMatch struct {
+	matchedPrefix string
+	peers         []*PeerNode
+}
+
+type AvailabilityStatus struct {
+	Available       bool
+	RunningRequests int     // Actual requests in GPU batch (from SGLang)
+	WaitingRequests int     // Actual queued requests (from SGLang)
+	TotalRequests   int     // Running + Waiting
+	GPUCacheUsage   float64 // KV cache utilization
+	Healthy         bool    // Whether the peer is responding
+}
+
+type MatchedPrefixNodes struct {
+	node      prefixNode
+	matchRate float64
+}
+
+func NewPrefixTreePolicy() *PrefixTreePolicy {
+	return &PrefixTreePolicy{
+		root: &prefixNode{
+			children: make(map[byte]*prefixNode),
+			peers:    []*PeerNode{},
+			prefix:   "",
+		},
+	}
+}
+
+// ClearCache resets the prefix tree to empty
+func (p *PrefixTreePolicy) ClearCache() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	count := countNodes(p.root)
+	p.root = &prefixNode{
+		children: make(map[byte]*prefixNode),
+		peers:    []*PeerNode{},
+		prefix:   "",
+	}
+	return count
+}
+
+func countNodes(n *prefixNode) int {
+	if n == nil {
+		return 0
+	}
+	count := 1
+	for _, child := range n.children {
+		count += countNodes(child)
+	}
+	return count
+}
+
+func countGORGONodes(n *GORGONode) int {
+	if n == nil {
+		return 0
+	}
+	count := 1
+	for _, child := range n.children {
+		count += countGORGONodes(child)
+	}
+	return count
+}
+
+// =====================================================
+// GORGO HELPER FUNCTIONS
+// =====================================================
+
+// extractPromptFromBody parses the request body to extract the prompt text
+// Supports OpenAI chat completions format and legacy completions format
+func extractPromptFromBody(bodyBytes []byte) string {
+	if len(bodyBytes) == 0 {
+		return ""
+	}
+
+	// Try chat completions format: {"messages": [{"role": "user", "content": "..."}]}
+	var chatReq struct {
+		Messages []struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(bodyBytes, &chatReq); err == nil && len(chatReq.Messages) > 0 {
+		var builder strings.Builder
+		for _, msg := range chatReq.Messages {
+			builder.WriteString(msg.Content)
+			builder.WriteString(" ")
+		}
+		return strings.TrimSpace(builder.String())
+	}
+
+	// Try legacy completions format: {"prompt": "..."}
+	var legacyReq struct {
+		Prompt string `json:"prompt"`
+	}
+	if err := json.Unmarshal(bodyBytes, &legacyReq); err == nil && legacyReq.Prompt != "" {
+		return legacyReq.Prompt
+	}
+
+	// Fallback: return empty (can't parse)
+	return ""
+}
+
+// preCalculateTokenCount extracts prompt and computes token count
+// Returns the token count and the extracted prompt text
+func preCalculateTokenCount(bodyBytes []byte) (int, string) {
+	prompt := extractPromptFromBody(bodyBytes)
+	if prompt == "" {
+		return 0, ""
+	}
+	tokenCount := GetTokenCount(prompt)
+	return tokenCount, prompt
+}
+
+// trackRunningRequest adds a request to running tracking (for GORGO)
+func (lb *LoadBalancer) trackRunningRequest(requestID string, tokenCount int) {
+	lb.runningRequestsMu.Lock()
+	defer lb.runningRequestsMu.Unlock()
+	if lb.runningRequests == nil {
+		lb.runningRequests = make(map[string]*runningRequest)
+	}
+	lb.runningRequests[requestID] = &runningRequest{
+		requestID:  requestID,
+		tokenCount: tokenCount,
+		startedAt:  time.Now(),
+	}
+}
+
+// untrackRunningRequest removes a request from running tracking (for GORGO)
+func (lb *LoadBalancer) untrackRunningRequest(requestID string) {
+	lb.runningRequestsMu.Lock()
+	defer lb.runningRequestsMu.Unlock()
+	if lb.runningRequests != nil {
+		delete(lb.runningRequests, requestID)
+	}
+}
+
+// =====================================================
+// GORGO POLICY IMPLEMENTATION
+// =====================================================
+
+// NewGORGOPolicy creates a new GORGO policy with a reference to the load balancer
+func NewGORGOPolicy(lb *LoadBalancer) *GORGOPolicy {
+	return &GORGOPolicy{
+		root: &GORGONode{
+			children: make(map[byte]*GORGONode),
+			peers:    []*PeerNode{},
+			prefix:   "",
+		},
+		localRoot: &GORGONode{
+			children: make(map[byte]*GORGONode),
+			peers:    []*PeerNode{},
+			prefix:   "",
+		},
+		lb: lb,
+	}
+}
+
+// ClearCache resets the GORGO prefix trees to empty
+func (p *GORGOPolicy) ClearCache() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	count := countGORGONodes(p.root) + countGORGONodes(p.localRoot)
+	p.root = &GORGONode{
+		children: make(map[byte]*GORGONode),
+		peers:    []*PeerNode{},
+		prefix:   "",
+	}
+	p.localRoot = &GORGONode{
+		children: make(map[byte]*GORGONode),
+		peers:    []*PeerNode{},
+		prefix:   "",
+	}
+	return count
+}
+
+// Insert adds a prefix to the peer tree, associating it with a peer
+func (p *GORGOPolicy) Insert(prefix string, peer *PeerNode) {
+	if len(prefix) == 0 || peer == nil {
+		return
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	insertIntoGORGOTree(p.root, prefix, peer)
+}
+
+// InsertLocal adds a prefix to the local tree (for KV cache on this node)
+func (p *GORGOPolicy) InsertLocal(prefix string) {
+	if len(prefix) == 0 {
+		return
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	// Use nil peer as marker for local
+	insertIntoGORGOTree(p.localRoot, prefix, nil)
+}
+
+// insertIntoGORGOTree is a helper to insert a prefix into a GORGONode tree
+func insertIntoGORGOTree(root *GORGONode, prefix string, peer *PeerNode) {
+	if root == nil {
+		return
+	}
+
+	currentNode := root
+	i := 0
+
+	for i < len(prefix) {
+		currentChar := prefix[i]
+		remainingText := prefix[i:]
+		lookup, ok := currentNode.children[currentChar]
+
+		if !ok {
+			// No child exists — create new node with entire remaining string
+			newNode := &GORGONode{
+				children: make(map[byte]*GORGONode),
+				peers:    []*PeerNode{peer},
+				prefix:   remainingText,
+			}
+			currentNode.children[currentChar] = newNode
+			return
+		}
+
+		sharedLen := sharedPrefixLength(remainingText, lookup.prefix)
+
+		if sharedLen < len(lookup.prefix) {
+			// Need to split the node
+			matchingPart := lookup.prefix[:sharedLen]
+			oldRemainingPart := lookup.prefix[sharedLen:]
+
+			// Create intermediate node
+			newNode := &GORGONode{
+				children: make(map[byte]*GORGONode),
+				peers:    []*PeerNode{},
+				prefix:   matchingPart,
+			}
+
+			// Move old node as child of new node
+			lookup.prefix = oldRemainingPart
+			newNode.children[oldRemainingPart[0]] = lookup
+			currentNode.children[currentChar] = newNode
+
+			i += sharedLen
+
+			if i < len(prefix) {
+				// Create leaf for remaining input
+				finalNode := &GORGONode{
+					children: make(map[byte]*GORGONode),
+					peers:    []*PeerNode{peer},
+					prefix:   prefix[i:],
+				}
+				newNode.children[prefix[i]] = finalNode
+			} else {
+				// Exact match at split point
+				newNode.peers = append(newNode.peers, peer)
+			}
+			return
+		}
+
+		i += sharedLen
+		if i >= len(prefix) {
+			// Exact match - add peer to this node (avoid duplicates)
+			for _, existingPeer := range lookup.peers {
+				if existingPeer == peer {
+					return
+				}
+			}
+			lookup.peers = append(lookup.peers, peer)
+			return
+		}
+		currentNode = lookup
+	}
+}
+
+// findLocalPrefixMatch finds the longest matching prefix in the local tree
+// Returns the length of matched prefix (0 if no match)
+func (p *GORGOPolicy) findLocalPrefixMatch(requestPath string) int {
+	if p.localRoot == nil || len(requestPath) == 0 {
+		return 0
+	}
+
+	// Note: caller should hold at least read lock
+	currentNode := p.localRoot
+	matchedLen := 0
+	i := 0
+
+	for i < len(requestPath) {
+		currentChar := requestPath[i]
+		remainingText := requestPath[i:]
+		lookup, ok := currentNode.children[currentChar]
+		if !ok {
+			break
+		}
+
+		sharedLen := sharedPrefixLength(remainingText, lookup.prefix)
+		i += sharedLen
+
+		// If this node has the local marker (nil peer), record the match
+		for _, peer := range lookup.peers {
+			if peer == nil {
+				matchedLen = i
+				break
+			}
+		}
+
+		if sharedLen < len(lookup.prefix) {
+			break // partial match within node
+		}
+		currentNode = lookup
+	}
+
+	return matchedLen
+}
+
+// Select implements LoadBalancingStrategy for GORGO
+// Compares local cost (running + queued requests) vs peer costs
+// Returns nil if local is cheaper (keep locally), otherwise returns best peer
+func (p *GORGOPolicy) Select(peers []*PeerNode, availabilityMap map[*PeerNode]AvailabilityStatus, requestPath string) *PeerNode {
+	if len(requestPath) == 0 {
+		return nil
+	}
+
+	// Calculate total token count for this request
+	totalTokens := GetTokenCount(requestPath)
+
+	// Get tuning parameters from lb
+	msPerToken := config.DefaultGORGOMsPerToken
+	if p.lb != nil {
+		p.lb.tuningMu.RLock()
+		msPerToken = p.lb.msPerToken
+		p.lb.tuningMu.RUnlock()
+	}
+
+	// 1. Calculate local node cost
+	localCost := p.calculateLocalCost(requestPath, totalTokens)
+
+	// 2. Calculate peer costs using GORGO logic (latency + unmatched prefill)
+	lowestPeerCost := float64(1 << 62) // Large initial value
+	var bestPeer *PeerNode
+
+	// Find prefix matches in the tree
+	matches := p.findPrefixMatches(requestPath, availabilityMap)
+
+	for _, match := range matches {
+		unmatchedText := requestPath[len(match.matchedPrefix):]
+		unmatchedTokens := GetTokenCount(unmatchedText)
+
+		for _, peer := range match.peers {
+			prefillCost := float64(unmatchedTokens) * msPerToken
+			totalPeerCost := float64(peer.Metrics.Latency) + prefillCost
+
+			if totalPeerCost < lowestPeerCost {
+				lowestPeerCost = totalPeerCost
+				bestPeer = peer
+			}
+		}
+	}
+
+	// 3. If no peers in tree, evaluate all available peers with cold-start cost
+	if bestPeer == nil && len(peers) > 0 {
+		for _, peer := range peers {
+			status, ok := availabilityMap[peer]
+			if !ok || !status.Available || !status.Healthy {
+				continue
+			}
+			// Cold-start: full prefill cost
+			prefillCost := float64(totalTokens) * msPerToken
+			totalPeerCost := float64(peer.Metrics.Latency) + prefillCost
+
+			if totalPeerCost < lowestPeerCost {
+				lowestPeerCost = totalPeerCost
+				bestPeer = peer
+			}
+		}
+	}
+
+	// 4. Compare local vs best peer
+	// Return nil means "keep locally" (process or queue)
+	if bestPeer == nil || localCost <= lowestPeerCost {
+		return nil // Local is cheaper or equal - process/queue locally
+	}
+
+	return bestPeer // Peer is cheaper - forward to peer
+}
+
+// calculateLocalCost computes the estimated cost of processing this request locally
+// Cost = sum(running request costs) + sum(queued request costs) + incoming request cost
+func (p *GORGOPolicy) calculateLocalCost(requestPath string, requestTokens int) float64 {
+	if p.lb == nil {
+		return 0
+	}
+
+	// Get tuning parameters from lb
+	p.lb.tuningMu.RLock()
+	msPerToken := p.lb.msPerToken
+	runningCostFactor := p.lb.runningCostFactor
+	p.lb.tuningMu.RUnlock()
+
+	var totalCost float64
+
+	// Cost from running requests: runningCostFactor * msPerToken * tokens
+	// Lower factor because running requests are already partially processed
+	p.lb.runningRequestsMu.RLock()
+	for _, running := range p.lb.runningRequests {
+		totalCost += runningCostFactor * msPerToken * float64(running.tokenCount)
+	}
+	p.lb.runningRequestsMu.RUnlock()
+
+	// Cost from queued requests: msPerToken * tokens
+	// Use pre-calculated token counts to avoid expensive operations under lock
+	// Copy queue length and aggregate token count quickly, then release lock
+	p.lb.queueMu.Lock()
+	queuedTokens := 0
+	for _, qr := range p.lb.queue {
+		// Use pre-calculated token count (stored when request was enqueued)
+		if qr.tokenCount > 0 {
+			queuedTokens += qr.tokenCount
+		} else {
+			// Fallback: estimate based on body size (4 chars/token)
+			queuedTokens += (len(qr.bodyBytes) + 3) / 4
+		}
+	}
+	p.lb.queueMu.Unlock()
+
+	totalCost += msPerToken * float64(queuedTokens)
+
+	// Add cost for the incoming request itself
+	// Check if we have a local prefix match - if so, only unmatched tokens need prefill
+	localMatchLen := p.findLocalPrefixMatch(requestPath)
+	if localMatchLen > 0 && localMatchLen < len(requestPath) {
+		// Calculate tokens for unmatched portion only
+		unmatchedText := requestPath[localMatchLen:]
+		unmatchedTokens := GetTokenCount(unmatchedText)
+		totalCost += msPerToken * float64(unmatchedTokens)
+	} else {
+		// No local prefix match - full prefill cost
+		totalCost += msPerToken * float64(requestTokens)
+	}
+
+	return totalCost
+}
+
+// findPrefixMatches finds all prefix matches for a request path in the tree
+func (p *GORGOPolicy) findPrefixMatches(requestPath string, availabilityMap map[*PeerNode]AvailabilityStatus) []prefixMatch {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	matches := []prefixMatch{}
+	if p.root == nil {
+		return matches
+	}
+
+	currentNode := p.root
+	i := 0
+	matchedSoFar := ""
+
+	for i < len(requestPath) {
+		currentChar := requestPath[i]
+		remainingText := requestPath[i:]
+		lookup, ok := currentNode.children[currentChar]
+		if !ok {
+			break
+		}
+
+		currentNode = lookup
+		sharedLen := sharedPrefixLength(remainingText, lookup.prefix)
+		if sharedLen > len(lookup.prefix) {
+			sharedLen = len(lookup.prefix)
+		}
+		matchedSoFar += lookup.prefix[:sharedLen]
+		i += sharedLen
+
+		// Check for available peers at this node
+		availablePeers := []*PeerNode{}
+		for _, peerNode := range lookup.peers {
+			if status, ok := availabilityMap[peerNode]; ok && status.Available && status.Healthy {
+				availablePeers = append(availablePeers, peerNode)
+			}
+		}
+
+		if len(availablePeers) > 0 {
+			matches = append(matches, prefixMatch{
+				matchedPrefix: matchedSoFar,
+				peers:         availablePeers,
+			})
+		}
+
+		if sharedLen < len(lookup.prefix) {
+			break
+		}
+	}
+
+	return matches
+}
+
+func (p *PrefixTreePolicy) Select(peers []*PeerNode, availabilityMap map[*PeerNode]AvailabilityStatus, requestPath string) *PeerNode {
+	if p.root == nil {
+		// No existing prefix trie (first request), fall back to least-loaded
+		return (&LeastLoadedPolicy{}).Select(peers, availabilityMap, requestPath)
+	}
+
+	if len(requestPath) == 0 {
+		return nil
+	}
+
+	matches := []MatchedPrefixNodes{}
+	currentNode := p.root
+
+	i := 0
+	for i < len(requestPath) {
+		currentChar := requestPath[i]
+		remainingText := requestPath[i:]
+		lookup, ok := currentNode.children[currentChar]
+		if !ok {
+			break
+		}
+
+		currentNode = lookup
+		sharedLen := sharedPrefixLength(remainingText, lookup.prefix)
+		i += sharedLen
+
+		// Check if this node has available replicas
+		availablePeers := []*PeerNode{}
+		for _, peerNode := range lookup.peers {
+			if status, ok := availabilityMap[peerNode]; ok && status.Available && status.Healthy {
+				availablePeers = append(availablePeers, peerNode)
+			}
+		}
+
+		if len(availablePeers) > 0 {
+			matchRate := float64(i) / float64(len(requestPath))
+			node := prefixNode{
+				prefix: lookup.prefix,
+				peers:  availablePeers,
+			}
+			matches = append(matches, MatchedPrefixNodes{
+				node:      node,
+				matchRate: matchRate,
+			})
+		}
+
+		if sharedLen < len(lookup.prefix) {
+			// partial match, no need to search further
+			break
+		}
+	}
+	sort.Slice(matches, func(i2, j int) bool {
+		return matches[i2].matchRate > matches[j].matchRate
+	})
+
+	if len(matches) > 0 {
+		bestPeer := matches[0].node.peers[0]
+		bestPeer.CurrentLoad++
+		return bestPeer
+	}
+
+	return nil
+}
+
+func (p *PrefixTreePolicy) Insert(prefix string, peer *PeerNode) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if len(prefix) == 0 {
+		return
+	}
+
+	currentNode := p.root
+
+	i := 0
+
+	// TODO note this for loop never hits its own exit condition bc of :262
+	for i < len(prefix) {
+		currentChar := prefix[i]
+		remainingText := prefix[i:]
+		lookup, ok := currentNode.children[currentChar]
+
+		if !ok {
+			// No child exists — create new node with entire remaining string
+			newNode := &prefixNode{
+				children: make(map[byte]*prefixNode),
+				peers:    []*PeerNode{peer},
+				prefix:   remainingText,
+			}
+			currentNode.children[currentChar] = newNode
+			return
+		}
+
+		sharedLen := sharedPrefixLength(remainingText, lookup.prefix)
+
+		if sharedLen < len(lookup.prefix) {
+			matchingPart := lookup.prefix[:sharedLen]
+			oldRemainingPart := lookup.prefix[sharedLen:]
+
+			newNode := &prefixNode{
+				children: make(map[byte]*prefixNode),
+				peers:    []*PeerNode{peer},
+				prefix:   matchingPart,
+			}
+
+			lookup.prefix = oldRemainingPart
+			lookup.children[oldRemainingPart[0]] = lookup
+			currentNode.children[currentChar] = newNode
+
+			i += sharedLen
+
+			if len(remainingText[i:]) > 0 {
+				finalNode := &prefixNode{
+					children: make(map[byte]*prefixNode),
+					peers:    []*PeerNode{peer},
+					prefix:   remainingText[i:],
+				}
+				newNode.children[finalNode.prefix[0]] = finalNode
+			}
+			return
+		}
+
+		i += sharedLen
+		if i >= len(prefix) {
+			lookup.peers = append(lookup.peers, peer)
+			return
+		}
+		currentNode = lookup
+	}
+}
+
+func sharedPrefixLength(a, b string) int {
+	minLength := len(a)
+	if len(b) < minLength {
+		minLength = len(b)
+	}
+	for i := 0; i < minLength; i++ {
+		if a[i] != b[i] {
+			return i
+		}
+	}
+	return minLength
+}
+
+func (p *LeastLoadedPolicy) Select(peers []*PeerNode, availabilityMap map[*PeerNode]AvailabilityStatus, requestPath string) *PeerNode {
 	if len(peers) == 0 {
 		return nil
 	}
 
 	var best *PeerNode
-	var lowestLoad int64 = -1
+	lowestLoad := -1
 
 	for _, peer := range peers {
-		// Skip unhealthy peers
-		if !peer.Healthy {
+		status, exists := availabilityMap[peer]
+
+		// Skip unavailable/unhealthy peers
+		if !exists || !status.Available || !status.Healthy {
 			continue
 		}
 
-		// Skip peers at capacity
-		if peer.CurrentLoad >= int64(peer.MaxLoad) {
+		// Use real SGLang metrics: total requests = running + waiting
+		totalLoad := status.TotalRequests
+
+		// Skip peers at capacity (use MaxRunningReqs from SGLang if available)
+		maxLoad := peer.MaxLoad
+		if peer.Metrics.MaxRunningReqs > 0 {
+			maxLoad = peer.Metrics.MaxRunningReqs
+		}
+		if totalLoad >= maxLoad {
 			continue
 		}
 
-		if lowestLoad == -1 || peer.CurrentLoad < lowestLoad {
-			lowestLoad = peer.CurrentLoad
+		if lowestLoad == -1 || totalLoad < lowestLoad {
+			lowestLoad = totalLoad
 			best = peer
 		}
 	}
@@ -132,52 +815,15 @@ func (p *LeastLoadedPolicy) Select(peers []*PeerNode) *PeerNode {
 	return best
 }
 
-// NewLoadBalancerPolicy creates a new load balancer policy based on the strategy name
-func NewLoadBalancerPolicy(strategy string) LoadBalancerPolicy {
-	switch strategy {
-	case "least-loaded":
-		return &LeastLoadedPolicy{}
-	default:
-		// Default to least-loaded
-		return &LeastLoadedPolicy{}
-	}
-}
-
 // PeerNode represents a peer node in the cluster
 type PeerNode struct {
-	Instance         *remote.RunningInstance `json:"instance"`
-	Port             int                     `json:"port"`
-	Healthy          bool                    `json:"healthy"`
-	LastHealthCheck  time.Time               `json:"last_health_check"`
-	CurrentLoad      int64                   `json:"current_load"`
-	MaxLoad          int                     `json:"max_load"`
-	ResponseTimeMs   int64                   `json:"response_time_ms"`
-	ConsecutiveFails int                     `json:"consecutive_fails"`
-	TotalRequests    int64                   `json:"total_requests"`
-	FailedRequests   int64                   `json:"failed_requests"`
-}
+	Instance    *remote.RunningInstance `json:"instance"`
+	Port        int                     `json:"port"`
+	CurrentLoad int64                   `json:"current_load"` // Deprecated: use Metrics instead
+	MaxLoad     int                     `json:"max_load"`
 
-// PeerStatus is the status response from a peer's /lb/status endpoint
-type PeerStatus struct {
-	NodeID      string `json:"node_id"`
-	CurrentLoad int64  `json:"current_load"`
-	MaxLoad     int    `json:"max_load"`
-	QueueSize   int    `json:"queue_size"`
-	Healthy     bool   `json:"healthy"`
-}
-
-// LoadBalancerMetrics tracks load balancer performance
-type LoadBalancerMetrics struct {
-	TotalRequests     int64     `json:"total_requests"`
-	LocalRequests     int64     `json:"local_requests"`
-	ForwardedRequests int64     `json:"forwarded_requests"`
-	QueuedRequests    int64     `json:"queued_requests"`
-	DroppedRequests   int64     `json:"dropped_requests"`
-	FailedForwards    int64     `json:"failed_forwards"`
-	AvgResponseTimeMs float64   `json:"avg_response_time_ms"`
-	CurrentConcurrent int64     `json:"current_concurrent"`
-	PeakConcurrent    int64     `json:"peak_concurrent"`
-	LastUpdated       time.Time `json:"last_updated"`
+	// Real-time metrics from SGLang
+	Metrics SGLangMetrics `json:"metrics"`
 }
 
 // queuedRequest represents a request waiting in the queue
@@ -187,34 +833,49 @@ type queuedRequest struct {
 	done       chan struct{}
 	err        error
 	enqueuedAt time.Time
+	requestID  string // For tracing
+	bodyBytes  []byte // Cached body for potential forwarding
+	tokenCount int    // Pre-calculated token count for GORGO
+	prompt     string // Extracted prompt text for GORGO prefix matching
 }
 
-// NodeLoadBalancer is a distributed load balancer instance for a single node
-type NodeLoadBalancer struct {
+// LoadBalancer is a distributed load balancer instance for a single node
+type LoadBalancer struct {
 	config *LoadBalancerConfig
 
-	// Peer management
-	peers   map[string]*PeerNode
+	// Self reference for peer exclusion
+	self *remote.RunningInstance
+
+	// Peer management - maps peer nodes to their availability status
+	peers   map[*PeerNode]AvailabilityStatus
 	peersMu sync.RWMutex
 
-	// Load balancing policy
-	policy LoadBalancerPolicy
+	// Load balancing strategy (used when forwarding to peers)
+	strategy LoadBalancingStrategy
 
-	// Request tracking
-	currentRequests atomic.Int64
-	peakRequests    atomic.Int64
+	// Local SGLang metrics (polled from local backend)
+	localMetrics   SGLangMetrics
+	localMetricsMu sync.RWMutex
 
-	// Metrics
-	metrics   LoadBalancerMetrics
-	metricsMu sync.RWMutex
+	// Request queue (unbounded slice-based queue)
+	queue   []*queuedRequest
+	queueMu sync.Mutex
 
-	// Request queue
-	queue     chan *queuedRequest
-	queueSize atomic.Int64
+	// Running request tracking for GORGO
+	runningRequests   map[string]*runningRequest
+	runningRequestsMu sync.RWMutex
+
+	// GORGO tuning parameters (runtime adjustable)
+	msPerToken        float64
+	runningCostFactor float64
+	tuningMu          sync.RWMutex
 
 	// HTTP clients
 	httpClient *http.Client
 	localProxy *httputil.ReverseProxy
+
+	// Event-driven tracing (Perfetto output)
+	tracer *Tracer
 
 	// Control
 	ctx     context.Context
@@ -222,20 +883,37 @@ type NodeLoadBalancer struct {
 	wg      sync.WaitGroup
 	running atomic.Bool
 
-	// Response time tracking (exponential moving average)
-	avgResponseTime atomic.Int64
+	// Aggregate metrics
+	startTime              time.Time
+	totalRequestsHandled   atomic.Int64 // Total requests received
+	totalRequestsLocal     atomic.Int64 // Requests processed locally
+	totalRequestsForwarded atomic.Int64 // Requests forwarded to peers
+	totalRequestsQueued    atomic.Int64 // Requests that were queued
+	totalRequestsRejected  atomic.Int64 // Requests rejected (queue full, no peers, etc.)
+
+	// Downtime tracking
+	downtimeIntervals   []downtimeInterval
+	downtimeMu          sync.RWMutex
+	lastHealthyState    bool
+	lastHealthCheckTime time.Time
 }
 
-// NewNodeLoadBalancer creates a new load balancer for this node
-func NewNodeLoadBalancer(config *LoadBalancerConfig) *NodeLoadBalancer {
-	if config == nil {
-		config = DefaultLoadBalancerConfig()
+// downtimeInterval tracks a period when the local backend was unhealthy
+type downtimeInterval struct {
+	Start time.Time `json:"start"`
+	End   time.Time `json:"end,omitempty"` // Zero if still in downtime
+}
+
+// NewLoadBalancer creates a new load balancer for this node
+func NewLoadBalancer(cfg *LoadBalancerConfig, self *remote.RunningInstance) *LoadBalancer {
+	if cfg == nil {
+		cfg = DefaultLoadBalancerConfig()
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 
 	// Create local backend proxy
-	localURL, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", config.LocalPort))
+	localURL, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", cfg.ApplicationPort))
 	localProxy := httputil.NewSingleHostReverseProxy(localURL)
 
 	// Customize proxy error handler
@@ -244,76 +922,142 @@ func NewNodeLoadBalancer(config *LoadBalancerConfig) *NodeLoadBalancer {
 		http.Error(w, "Backend unavailable", http.StatusBadGateway)
 	}
 
-	lb := &NodeLoadBalancer{
-		config: config,
-		peers:  make(map[string]*PeerNode),
-		policy: NewLoadBalancerPolicy(config.Strategy),
-		httpClient: &http.Client{
-			Timeout: config.RequestTimeout,
-			Transport: &http.Transport{
-				MaxIdleConnsPerHost: 100,
-				IdleConnTimeout:     90 * time.Second,
-			},
-		},
-		localProxy: localProxy,
-		ctx:        ctx,
-		cancel:     cancel,
+	// Use default strategy if none provided
+	if cfg.Strategy == nil {
+		cfg.Strategy = &LeastLoadedPolicy{}
 	}
 
-	if config.QueueEnabled {
-		lb.queue = make(chan *queuedRequest, config.MaxQueueSize)
+	// Initialize tracer for event-driven tracing
+	nodeID := cfg.NodeID
+	if nodeID == "" && self != nil {
+		nodeID = self.ID[:16]
+	}
+	tracer := NewTracer(nodeID)
+
+	lb := &LoadBalancer{
+		config:   cfg,
+		self:     self,
+		peers:    make(map[*PeerNode]AvailabilityStatus),
+		strategy: cfg.Strategy,
+		httpClient: &http.Client{
+			Timeout: cfg.RequestTimeout,
+			Transport: &http.Transport{
+				MaxIdleConnsPerHost: config.DefaultMaxIdleConnsPerHost,
+				IdleConnTimeout:     config.DefaultIdleConnTimeout,
+			},
+		},
+		localProxy:        localProxy,
+		tracer:            tracer,
+		ctx:               ctx,
+		cancel:            cancel,
+		runningRequests:   make(map[string]*runningRequest), // For GORGO
+		msPerToken:        cfg.GORGOMsPerToken,
+		runningCostFactor: cfg.GORGORunningCostFactor,
+		// Aggregate metrics
+		startTime:         time.Now(),
+		downtimeIntervals: make([]downtimeInterval, 0),
+		lastHealthyState:  true, // Assume healthy at start
+	}
+
+	if cfg.QueueEnabled {
+		lb.queue = make([]*queuedRequest, 0)
 	}
 
 	return lb
 }
 
 // AddPeer adds a peer node to the load balancer
-func (lb *NodeLoadBalancer) AddPeer(instance *remote.RunningInstance, port int) {
+func (lb *LoadBalancer) AddPeer(instance *remote.RunningInstance, port int) {
 	lb.peersMu.Lock()
 	defer lb.peersMu.Unlock()
 
-	lb.peers[instance.ID] = &PeerNode{
+	peerNode := &PeerNode{
 		Instance: instance,
 		Port:     port,
-		Healthy:  true, // Assume healthy until proven otherwise
 		MaxLoad:  lb.config.MaxConcurrentRequests,
+		Metrics: SGLangMetrics{
+			Healthy:     true, // Assume healthy initially until first poll
+			LastUpdated: time.Now(),
+		},
+	}
+
+	lb.peers[peerNode] = AvailabilityStatus{
+		Available: true, // Assume available initially until first metrics poll
+		Healthy:   true,
 	}
 
 	log.Printf("[LB] Added peer: %s (%s:%d)", instance.ID, instance.IP, port)
 }
 
 // RemovePeer removes a peer node from the load balancer
-func (lb *NodeLoadBalancer) RemovePeer(id string) {
+func (lb *LoadBalancer) RemovePeer(id string) {
 	lb.peersMu.Lock()
 	defer lb.peersMu.Unlock()
 
-	delete(lb.peers, id)
-	log.Printf("[LB] Removed peer: %s", id)
-}
-
-// AddPeersFromCluster adds all instances from a cluster as peers
-func (lb *NodeLoadBalancer) AddPeersFromCluster(cluster *Cluster) {
-	for i := range cluster.Instances {
-		inst := &cluster.Instances[i]
-		// Skip self
-		if inst.ID == lb.config.NodeID {
-			continue
+	// Find and remove the peer with matching ID
+	for peerNode := range lb.peers {
+		if peerNode.Instance.ID == id {
+			delete(lb.peers, peerNode)
+			log.Printf("[LB] Removed peer: %s", id)
+			break
 		}
-		lb.AddPeer(inst, lb.config.PeerPort)
 	}
 }
 
+// AddPeersFromCluster adds all instances from a cluster as peers
+func (lb *LoadBalancer) AddPeersFromCluster(cluster *Cluster) {
+	for i := range cluster.Instances {
+		inst := &cluster.Instances[i]
+		// Skip self by comparing pointers
+		if inst == lb.self {
+			continue
+		}
+		lb.AddPeer(inst, lb.config.LoadBalancerPort)
+	}
+}
+
+// AddPeerByIP adds a peer by IP address and port (for standalone/CLI usage)
+func (lb *LoadBalancer) AddPeerByIP(ip string, port int) {
+	lb.peersMu.Lock()
+	defer lb.peersMu.Unlock()
+
+	// Check if already exists
+	for peerNode := range lb.peers {
+		if peerNode.Instance != nil && peerNode.Instance.IP == ip && peerNode.Port == port {
+			log.Printf("[LB] Peer %s:%d already registered", ip, port)
+			return
+		}
+	}
+
+	// Create minimal instance for the peer
+	peerNode := &PeerNode{
+		Instance: &remote.RunningInstance{IP: ip},
+		Port:     port,
+		MaxLoad:  lb.config.MaxConcurrentRequests,
+	}
+
+	lb.peers[peerNode] = AvailabilityStatus{
+		Available: true,
+		Healthy:   true,
+	}
+	log.Printf("[LB] Added peer: %s:%d", ip, port)
+}
+
 // Start starts the load balancer
-func (lb *NodeLoadBalancer) Start() error {
+func (lb *LoadBalancer) Start() error {
 	if lb.running.Load() {
 		return fmt.Errorf("load balancer already running")
 	}
 
 	lb.running.Store(true)
 
-	// Start health checker
-	lb.wg.Add(1)
-	go lb.healthCheckLoop()
+	// Warn if no peers configured - this is likely a misconfiguration
+	lb.peersMu.RLock()
+	peerCount := len(lb.peers)
+	lb.peersMu.RUnlock()
+	if peerCount == 0 {
+		log.Printf("[LB] ⚠️  WARNING: No peers configured! When at capacity, requests will queue locally instead of being forwarded. This can cause resource exhaustion under heavy load.")
+	}
 
 	// Start queue processor if enabled
 	if lb.config.QueueEnabled {
@@ -321,20 +1065,20 @@ func (lb *NodeLoadBalancer) Start() error {
 		go lb.processQueue()
 	}
 
-	// Start metrics collector if enabled
+	// Start metrics poller if enabled
 	if lb.config.MetricsEnabled {
 		lb.wg.Add(1)
-		go lb.collectMetrics()
+		go lb.pollMetricsLoop()
 	}
 
-	log.Printf("[LB] Load balancer started (node: %s, max concurrent: %d, strategy: %s)",
-		lb.config.NodeID, lb.config.MaxConcurrentRequests, lb.config.Strategy)
+	log.Printf("[LB] Load balancer started (max concurrent: %d, peers: %d, max queue: %d, metrics polling: %v)",
+		lb.config.MaxConcurrentRequests, peerCount, lb.config.MaxQueueSize, lb.config.MetricsEnabled)
 
 	return nil
 }
 
 // Stop stops the load balancer
-func (lb *NodeLoadBalancer) Stop() {
+func (lb *LoadBalancer) Stop() {
 	if !lb.running.Load() {
 		return
 	}
@@ -346,242 +1090,376 @@ func (lb *NodeLoadBalancer) Stop() {
 	log.Printf("[LB] Load balancer stopped")
 }
 
-// Handler returns an HTTP handler that implements the load balancing logic
-func (lb *NodeLoadBalancer) Handler(next http.Handler) http.Handler {
+func (lb *LoadBalancer) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Handle internal LB endpoints
-		if lb.handleInternalEndpoint(w, r) {
+		// Route management endpoints first
+		switch r.URL.Path {
+		case "/lb/status":
+			lb.handleStatusEndpoint(w, r)
+			return
+		case "/lb/health":
+			lb.handleHealthEndpoint(w, r)
+			return
+		case "/lb/metrics":
+			lb.handleMetricsEndpoint(w, r)
+			return
+		case "/lb/config":
+			lb.handleConfigEndpoint(w, r)
+			return
+		case "/lb/policy":
+			lb.handlePolicyEndpoint(w, r)
+			return
+		case "/lb/tokenizer":
+			lb.handleTokenizerEndpoint(w, r)
+			return
+		case "/lb/peers":
+			lb.handlePeersEndpoint(w, r)
+			return
+		case "/lb/trace/start":
+			lb.handleTraceStartEndpoint(w, r)
+			return
+		case "/lb/trace/stop":
+			lb.handleTraceStopEndpoint(w, r)
+			return
+		case "/lb/trace/status":
+			lb.handleTraceStatusEndpoint(w, r)
+			return
+		case "/lb/cache/clear":
+			lb.handleCacheClearEndpoint(w, r)
 			return
 		}
 
-		startTime := time.Now()
-		atomic.AddInt64(&lb.metrics.TotalRequests, 1)
+		// Regular request processing
+		requestID := fmt.Sprintf("%d", time.Now().UnixNano())
+		wrappedWriter := &responseWriterWrapper{ResponseWriter: w, statusCode: 200}
 
-		// Try to handle locally first
-		currentLoad := lb.currentRequests.Load()
+		// Increment total requests handled
+		lb.totalRequestsHandled.Add(1)
 
-		if currentLoad < int64(lb.config.MaxConcurrentRequests) {
-			// Handle locally
-			lb.handleLocal(w, r, next, startTime)
+		// Parse Hop Count
+		hops := 0
+		if hopStr := r.Header.Get("X-LB-Hop"); hopStr != "" {
+			fmt.Sscanf(hopStr, "%d", &hops)
+		}
+
+		// Pre-calculate token count for GORGO (read body early)
+		var bodyBytes []byte
+		var tokenCount int
+		var prompt string
+		if r.Body != nil {
+			bodyBytes, _ = io.ReadAll(r.Body)
+			r.Body.Close()
+			r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+			tokenCount, prompt = preCalculateTokenCount(bodyBytes)
+		}
+
+		lb.tracer.TraceRequestReceived(requestID, r.Method, r.URL.Path, r.RemoteAddr)
+
+		// For GORGO: use prompt for routing decision instead of URL path
+		requestPath := r.URL.Path
+		if _, isGORGO := lb.strategy.(*GORGOPolicy); isGORGO && prompt != "" {
+			requestPath = prompt
+		}
+
+		hasCapacity := lb.localHasCapacity()
+
+		// A: Process locally if we have capacity
+		if hasCapacity {
+			lb.totalRequestsLocal.Add(1)
+			lb.trackRunningRequest(requestID, tokenCount)
+			lb.tracer.TraceLocalProcessStart(requestID)
+			lb.localProxy.ServeHTTP(wrappedWriter, r)
+			lb.untrackRunningRequest(requestID)
+			lb.tracer.TraceRequestComplete(requestID, wrappedWriter.statusCode, "local")
+			// Record local prefix in tree for future routing decisions
+			if wrappedWriter.statusCode >= 200 && wrappedWriter.statusCode < 300 && requestPath != "" {
+				if gorgo, ok := lb.strategy.(*GORGOPolicy); ok {
+					gorgo.InsertLocal(requestPath)
+				}
+			}
 			return
 		}
 
-		// Local capacity exceeded - try to forward to a peer
-		log.Printf("[LB] Local capacity exceeded (%d/%d), attempting forward",
-			currentLoad, lb.config.MaxConcurrentRequests)
+		// B: Try to forward ONLY if we haven't exceeded MaxHops
+		if hops < config.MaxHops {
+			log.Printf("[LB] Request %s: local full, forwarding (current hops: %d)", requestID, hops)
+			// For GORGO: consult strategy with prompt-based requestPath
+			targetPeer := lb.selectPeer(requestPath)
+			if targetPeer != nil {
+				// Pass pre-selected peer to avoid double selection
+				if lb.forwardToTargetPeer(wrappedWriter, r, requestID, hops+1, targetPeer, bodyBytes) {
+					lb.totalRequestsForwarded.Add(1)
+					lb.tracer.TraceRequestComplete(requestID, wrappedWriter.statusCode, "peer")
+					// Record peer prefix in tree for future routing decisions
+					if wrappedWriter.statusCode >= 200 && wrappedWriter.statusCode < 300 && requestPath != "" {
+						if gorgo, ok := lb.strategy.(*GORGOPolicy); ok {
+							gorgo.Insert(requestPath, targetPeer)
+						}
+					}
+					return
+				}
+			}
+			// For GORGO: nil from selectPeer means "keep locally"
+		}
 
-		if lb.forwardToPeer(w, r, startTime) {
+		// C: Queue locally (Mandatory if already pushed or no peers available)
+		if lb.config.QueueEnabled {
+			if lb.enqueueRequestWithTokens(wrappedWriter, r, requestID, bodyBytes, tokenCount, prompt) {
+				lb.totalRequestsQueued.Add(1)
+				lb.tracer.TraceRequestComplete(requestID, wrappedWriter.statusCode, "queue")
+			} else {
+				lb.totalRequestsRejected.Add(1)
+			}
 			return
 		}
 
-		// No healthy peers available - try queue or reject
-		if lb.config.QueueEnabled && lb.queueSize.Load() < int64(lb.config.MaxQueueSize) {
-			lb.enqueueRequest(w, r)
-			return
-		}
-
-		// All options exhausted
-		atomic.AddInt64(&lb.metrics.DroppedRequests, 1)
+		lb.totalRequestsRejected.Add(1)
 		http.Error(w, "Service at capacity", http.StatusServiceUnavailable)
 	})
 }
 
-// handleLocal processes the request locally
-func (lb *NodeLoadBalancer) handleLocal(w http.ResponseWriter, r *http.Request, next http.Handler, startTime time.Time) {
-	// Increment concurrent request counter
-	current := lb.currentRequests.Add(1)
-	defer lb.currentRequests.Add(-1)
-
-	// Track peak
-	for {
-		peak := lb.peakRequests.Load()
-		if current <= peak || lb.peakRequests.CompareAndSwap(peak, current) {
-			break
-		}
-	}
-
-	atomic.AddInt64(&lb.metrics.LocalRequests, 1)
-
-	// Process with the actual handler
-	if next != nil {
-		next.ServeHTTP(w, r)
-	} else {
-		lb.localProxy.ServeHTTP(w, r)
-	}
-
-	// Update response time (EMA with alpha=0.1)
-	elapsed := time.Since(startTime).Milliseconds()
-	lb.updateResponseTime(elapsed)
+// responseWriterWrapper wraps http.ResponseWriter to capture status code
+type responseWriterWrapper struct {
+	http.ResponseWriter
+	statusCode    int
+	headerWritten bool
 }
 
-// forwardToPeer attempts to forward the request to a healthy peer
-func (lb *NodeLoadBalancer) forwardToPeer(w http.ResponseWriter, r *http.Request, startTime time.Time) bool {
-	peer := lb.selectPeer()
-	if peer == nil {
+func (w *responseWriterWrapper) WriteHeader(code int) {
+	if w.headerWritten {
+		return // Prevent duplicate WriteHeader calls
+	}
+	w.headerWritten = true
+	w.statusCode = code
+	w.ResponseWriter.WriteHeader(code)
+}
+
+// localHasCapacity checks if the local SGLang backend has capacity
+// Returns true if we should process locally
+//
+// Uses SkyServe-style inference engine queue indicator:
+// - If UseIEQueueIndicator is true: forward when SGLang's internal queue > 0
+// - Otherwise: forward when total requests >= max concurrent
+func (lb *LoadBalancer) localHasCapacity() bool {
+	lb.localMetricsMu.RLock()
+	defer lb.localMetricsMu.RUnlock()
+
+	// If we haven't polled yet, assume we have capacity
+	if lb.localMetrics.LastUpdated.IsZero() {
+		return true
+	}
+
+	// Must be healthy
+	if !lb.localMetrics.Healthy {
 		return false
 	}
 
-	// Build forward URL
+	// Check GPU cache threshold
+	if lb.localMetrics.GPUCacheUsage >= lb.config.GPUCacheThreshold {
+		return false
+	}
+
+	// Check running requests threshold first (if set)
+	// This allows forcing forwarding when running_reqs exceeds a limit
+	if lb.config.RunningReqsThreshold > 0 {
+		hasCapacity := lb.localMetrics.NumRunningReqs < lb.config.RunningReqsThreshold
+		if !hasCapacity {
+			log.Printf("[LB] Running threshold: %d >= %d, forwarding",
+				lb.localMetrics.NumRunningReqs, lb.config.RunningReqsThreshold)
+		}
+		return hasCapacity
+	}
+
+	// SkyServe-style: use inference engine queue as indicator
+	// If SGLang has ANY waiting requests, local is "at capacity"
+	// This is more responsive than counting concurrent requests
+	if lb.config.UseIEQueueIndicator {
+		// Forward if SGLang's internal queue has waiting requests
+		hasCapacity := lb.localMetrics.NumWaitingReqs == 0
+		if !hasCapacity {
+			log.Printf("[LB] IE queue indicator: SGLang has %d waiting requests, forwarding",
+				lb.localMetrics.NumWaitingReqs)
+		}
+		return hasCapacity
+	}
+
+	// Fallback: traditional max concurrent check
+	maxLoad := lb.config.MaxConcurrentRequests
+	if lb.localMetrics.MaxRunningReqs > 0 {
+		maxLoad = lb.localMetrics.MaxRunningReqs
+	}
+
+	return lb.localMetrics.NumTotalReqs < maxLoad
+}
+
+func (lb *LoadBalancer) forwardToPeer(w http.ResponseWriter, r *http.Request, requestID string, nextHop int) bool {
+	// Select peer using strategy (uses URL path for non-GORGO)
+	peer := lb.selectPeer(r.URL.Path)
+	if peer == nil {
+		log.Printf("[LB] No available peer for request %s", requestID)
+		return false
+	}
+	return lb.forwardToTargetPeer(w, r, requestID, nextHop, peer, nil)
+}
+
+// forwardToTargetPeer forwards a request to a specific pre-selected peer
+// If bodyBytes is nil, it will read from r.Body
+func (lb *LoadBalancer) forwardToTargetPeer(w http.ResponseWriter, r *http.Request, requestID string, nextHop int, peer *PeerNode, bodyBytes []byte) bool {
+	if peer == nil {
+		log.Printf("[LB] No peer provided for request %s", requestID)
+		return false
+	}
+
+	// Build target URL
 	targetURL := fmt.Sprintf("http://%s:%d%s", peer.Instance.IP, peer.Port, r.URL.Path)
 	if r.URL.RawQuery != "" {
 		targetURL += "?" + r.URL.RawQuery
 	}
 
-	// Create forwarded request
+	// Read and cache body for forwarding (if not already provided)
+	if bodyBytes == nil && r.Body != nil {
+		bodyBytes, _ = io.ReadAll(r.Body)
+		r.Body.Close()
+		r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+	}
+
+	// Create forwarded request with timeout
 	ctx, cancel := context.WithTimeout(r.Context(), lb.config.RequestTimeout)
 	defer cancel()
 
-	// Read and buffer the body so we can forward it
-	var bodyBytes []byte
-	if r.Body != nil {
-		bodyBytes, _ = io.ReadAll(r.Body)
-		r.Body.Close()
-	}
-
 	forwardReq, err := http.NewRequestWithContext(ctx, r.Method, targetURL, bytes.NewReader(bodyBytes))
 	if err != nil {
-		log.Printf("[LB] Failed to create forward request: %v", err)
-		atomic.AddInt64(&lb.metrics.FailedForwards, 1)
+		log.Printf("[LB] Failed to create forward request for %s: %v", requestID, err)
 		return false
 	}
 
-	// Copy headers
+	// Copy original headers
 	for key, values := range r.Header {
 		for _, value := range values {
 			forwardReq.Header.Add(key, value)
 		}
 	}
 
-	// Add forwarding headers
+	// Set routing headers
 	forwardReq.Header.Set("X-Forwarded-For", r.RemoteAddr)
-	forwardReq.Header.Set("X-Forwarded-By", lb.config.NodeID)
-	forwardReq.Header.Set("X-LB-Hop", "1")
+	forwardReq.Header.Set("X-LB-Hop", fmt.Sprintf("%d", nextHop))
+	forwardReq.Header.Set("X-Request-ID", requestID)
 
-	// Execute forward
+	// Trace forward start
+	lb.tracer.TraceForwardStart(requestID, peer.Instance.ID, peer.Instance.IP)
+
+	// Execute request
+	forwardStart := time.Now()
 	resp, err := lb.httpClient.Do(forwardReq)
+	forwardDuration := time.Since(forwardStart)
+
 	if err != nil {
-		log.Printf("[LB] Forward to %s failed: %v", peer.Instance.ID, err)
-		atomic.AddInt64(&lb.metrics.FailedForwards, 1)
-		atomic.AddInt64(&peer.FailedRequests, 1)
-		peer.ConsecutiveFails++
+		log.Printf("[LB] Failed to forward request %s to peer: %v", requestID, err)
+		lb.tracer.TraceForwardEnd(requestID, 0, float64(forwardDuration.Milliseconds()))
 		return false
 	}
 	defer resp.Body.Close()
 
-	// Copy response
+	// Trace forward completion
+	lb.tracer.TraceForwardEnd(requestID, resp.StatusCode, float64(forwardDuration.Milliseconds()))
+
+	// Copy response back to original writer
 	for key, values := range resp.Header {
 		for _, value := range values {
 			w.Header().Add(key, value)
 		}
 	}
-	w.Header().Set("X-Served-By", peer.Instance.ID)
 	w.WriteHeader(resp.StatusCode)
 	io.Copy(w, resp.Body)
 
-	atomic.AddInt64(&lb.metrics.ForwardedRequests, 1)
-	atomic.AddInt64(&peer.TotalRequests, 1)
-	peer.ConsecutiveFails = 0
-
-	// Update peer response time
-	elapsed := time.Since(startTime).Milliseconds()
-	atomic.StoreInt64(&peer.ResponseTimeMs, elapsed)
-
-	log.Printf("[LB] Forwarded request to %s (took %dms)", peer.Instance.ID, elapsed)
+	log.Printf("[LB] Successfully forwarded request %s to %s (status: %d, duration: %v)",
+		requestID, peer.Instance.IP, resp.StatusCode, forwardDuration)
 	return true
 }
 
-// selectPeer selects a peer based on the configured policy
-func (lb *NodeLoadBalancer) selectPeer() *PeerNode {
+// selectPeer selects a peer using the configured strategy
+func (lb *LoadBalancer) selectPeer(requestPath string) *PeerNode {
 	lb.peersMu.RLock()
 	defer lb.peersMu.RUnlock()
 
-	// Use the configured policy to select a peer (policy handles filtering)
-	return lb.policy.Select(lb.getPeerSlice())
-}
-
-// getPeerSlice returns a slice of all peer nodes (internal helper)
-func (lb *NodeLoadBalancer) getPeerSlice() []*PeerNode {
 	peers := make([]*PeerNode, 0, len(lb.peers))
-	for _, peer := range lb.peers {
+	for peer := range lb.peers {
 		peers = append(peers, peer)
 	}
-	return peers
-}
 
-// SetPolicy changes the load balancing policy at runtime
-func (lb *NodeLoadBalancer) SetPolicy(policy LoadBalancerPolicy) {
-	lb.peersMu.Lock()
-	defer lb.peersMu.Unlock()
-	lb.policy = policy
-	log.Printf("[LB] Policy changed to: %s", policy.Name())
-}
-
-// GetPolicy returns the current load balancing policy
-func (lb *NodeLoadBalancer) GetPolicy() LoadBalancerPolicy {
-	lb.peersMu.RLock()
-	defer lb.peersMu.RUnlock()
-	return lb.policy
-}
-
-// GetPeerCount returns the number of peers
-func (lb *NodeLoadBalancer) GetPeerCount() int {
-	lb.peersMu.RLock()
-	defer lb.peersMu.RUnlock()
-	return len(lb.peers)
-}
-
-// GetHealthyPeerCount returns the number of healthy peers
-func (lb *NodeLoadBalancer) GetHealthyPeerCount() int {
-	lb.peersMu.RLock()
-	defer lb.peersMu.RUnlock()
-
-	count := 0
-	for _, peer := range lb.peers {
-		if peer.Healthy {
-			count++
-		}
-	}
-	return count
+	return lb.strategy.Select(peers, lb.peers, requestPath)
 }
 
 // enqueueRequest adds a request to the queue
-func (lb *NodeLoadBalancer) enqueueRequest(w http.ResponseWriter, r *http.Request) {
+// Returns false if the queue is full (all cluster capacity exhausted)
+func (lb *LoadBalancer) enqueueRequest(w http.ResponseWriter, r *http.Request, requestID string) bool {
+	return lb.enqueueRequestWithTokens(w, r, requestID, nil, 0, "")
+}
+
+// enqueueRequestWithTokens adds a request to the queue with pre-calculated token count (for GORGO)
+func (lb *LoadBalancer) enqueueRequestWithTokens(w http.ResponseWriter, r *http.Request, requestID string, bodyBytes []byte, tokenCount int, prompt string) bool {
+	// Check max queue size before adding
+	lb.queueMu.Lock()
+	if lb.config.MaxQueueSize > 0 && len(lb.queue) >= lb.config.MaxQueueSize {
+		lb.queueMu.Unlock()
+		log.Printf("[LB] Queue full (%d/%d) - all cluster capacity exhausted, rejecting request",
+			len(lb.queue), lb.config.MaxQueueSize)
+		http.Error(w, "Cluster at capacity - queue full", http.StatusServiceUnavailable)
+		return false
+	}
+
+	// Read and cache body for potential forwarding later (if not already provided)
+	if bodyBytes == nil && r.Body != nil {
+		bodyBytes, _ = io.ReadAll(r.Body)
+		r.Body.Close()
+		// Replace body so local proxy can still read it
+		r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+	}
+
 	qr := &queuedRequest{
 		w:          w,
 		r:          r,
 		done:       make(chan struct{}),
 		enqueuedAt: time.Now(),
+		requestID:  requestID,
+		bodyBytes:  bodyBytes,
+		tokenCount: tokenCount, // Pre-calculated for GORGO
+		prompt:     prompt,     // Extracted prompt for GORGO
 	}
 
+	lb.queue = append(lb.queue, qr)
+	queueSize := len(lb.queue)
+	lb.queueMu.Unlock()
+
+	log.Printf("[LB] Request %s queued (queue size: %d/%d, tokens: %d)", requestID, queueSize, lb.config.MaxQueueSize, tokenCount)
+
+	// Wait for processing or timeout
 	select {
-	case lb.queue <- qr:
-		lb.queueSize.Add(1)
-		atomic.AddInt64(&lb.metrics.QueuedRequests, 1)
-		log.Printf("[LB] Request queued (queue size: %d)", lb.queueSize.Load())
-
-		// Wait for processing or timeout
-		select {
-		case <-qr.done:
-			if qr.err != nil {
-				http.Error(w, qr.err.Error(), http.StatusServiceUnavailable)
-			}
-		case <-time.After(lb.config.QueueTimeout):
-			http.Error(w, "Queue timeout", http.StatusGatewayTimeout)
-		case <-r.Context().Done():
-			http.Error(w, "Request cancelled", http.StatusRequestTimeout)
+	case <-qr.done:
+		if qr.err != nil {
+			http.Error(w, qr.err.Error(), http.StatusServiceUnavailable)
 		}
-
-	default:
-		atomic.AddInt64(&lb.metrics.DroppedRequests, 1)
-		http.Error(w, "Queue full", http.StatusServiceUnavailable)
+	case <-time.After(lb.config.QueueTimeout):
+		// Trace queue exit with timeout
+		lb.tracer.TraceQueueExit(requestID, float64(time.Since(qr.enqueuedAt).Microseconds())/1000.0, "timeout")
+		http.Error(w, "Queue timeout", http.StatusGatewayTimeout)
+	case <-r.Context().Done():
+		// Trace queue exit with cancellation
+		lb.tracer.TraceQueueExit(requestID, float64(time.Since(qr.enqueuedAt).Microseconds())/1000.0, "cancelled")
+		http.Error(w, "Request cancelled", http.StatusRequestTimeout)
 	}
+	return true
 }
 
-// processQueue processes queued requests when capacity becomes available
-func (lb *NodeLoadBalancer) processQueue() {
+// processQueue probes the queue and processes requests by:
+// 1. First trying to forward to available peers (priority)
+// 2. Falling back to local processing if local has capacity
+// This ensures queued requests get distributed across the cluster.
+func (lb *LoadBalancer) processQueue() {
 	defer lb.wg.Done()
 
-	ticker := time.NewTicker(10 * time.Millisecond)
+	// Probe frequently to minimize queue latency
+	ticker := time.NewTicker(config.DefaultQueueProbeInterval)
 	defer ticker.Stop()
 
 	for {
@@ -589,299 +1467,894 @@ func (lb *NodeLoadBalancer) processQueue() {
 		case <-lb.ctx.Done():
 			return
 		case <-ticker.C:
-			// Check if we have capacity
-			if lb.currentRequests.Load() >= int64(lb.config.MaxConcurrentRequests) {
+			lb.processQueuedRequests()
+		}
+	}
+}
+
+func (lb *LoadBalancer) processQueuedRequests() {
+	for {
+		lb.queueMu.Lock()
+		if len(lb.queue) == 0 {
+			lb.queueMu.Unlock()
+			break
+		}
+		qr := lb.queue[0]
+
+		// Parse Hops for this specific queued request
+		hops := 0
+		if hopStr := qr.r.Header.Get("X-LB-Hop"); hopStr != "" {
+			fmt.Sscanf(hopStr, "%d", &hops)
+		}
+
+		// For GORGO: use prompt for peer selection
+		requestPath := qr.r.URL.Path
+		if _, isGORGO := lb.strategy.(*GORGOPolicy); isGORGO && qr.prompt != "" {
+			requestPath = qr.prompt
+		}
+
+		// Try to forward (only if below MaxHops)
+		if hops < config.MaxHops {
+			peer := lb.selectPeer(requestPath)
+			if peer != nil {
+				lb.queue = lb.queue[1:]
+				lb.queueMu.Unlock()
+
+				if lb.forwardQueuedRequest(qr, peer, hops+1) {
+					// Record peer prefix in tree for future routing decisions
+					if requestPath != "" {
+						if gorgo, ok := lb.strategy.(*GORGOPolicy); ok {
+							gorgo.Insert(requestPath, peer)
+						}
+					}
+					close(qr.done)
+				} else {
+					// Forward failed, re-queue at the back
+					lb.queueMu.Lock()
+					lb.queue = append(lb.queue, qr)
+					lb.queueMu.Unlock()
+				}
 				continue
 			}
+		}
 
-			// Try to dequeue
-			select {
-			case qr := <-lb.queue:
-				lb.queueSize.Add(-1)
+		// Try local if forwarding isn't an option
+		if lb.localHasCapacity() {
+			lb.queue = lb.queue[1:]
+			lb.queueMu.Unlock()
 
-				// Check if request is still valid
-				if time.Since(qr.enqueuedAt) > lb.config.QueueTimeout {
-					qr.err = fmt.Errorf("queue timeout")
-					close(qr.done)
-					continue
+			// Track running request for GORGO
+			lb.trackRunningRequest(qr.requestID, qr.tokenCount)
+
+			// Process locally
+			lb.tracer.TraceLocalProcessStart(qr.requestID)
+			lb.localProxy.ServeHTTP(qr.w, qr.r)
+			lb.tracer.TraceLocalProcessEnd(qr.requestID, 200) // Assume success
+
+			lb.untrackRunningRequest(qr.requestID)
+
+			// Record local prefix in tree for future routing decisions
+			if requestPath != "" {
+				if gorgo, ok := lb.strategy.(*GORGOPolicy); ok {
+					gorgo.InsertLocal(requestPath)
 				}
-
-				// Process the request
-				startTime := time.Now()
-				lb.handleLocal(qr.w, qr.r, nil, startTime)
-				close(qr.done)
-
-			default:
-				// No requests in queue
 			}
+
+			close(qr.done)
+			continue
 		}
+
+		lb.queueMu.Unlock()
+		break
 	}
 }
 
-// healthCheckLoop periodically checks peer health
-func (lb *NodeLoadBalancer) healthCheckLoop() {
-	defer lb.wg.Done()
-
-	ticker := time.NewTicker(lb.config.HealthCheckInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-lb.ctx.Done():
-			return
-		case <-ticker.C:
-			lb.checkAllPeers()
-		}
+// forwardQueuedRequest forwards a queued request to a peer
+// Now accepts nextHop to maintain the hop count integrity
+func (lb *LoadBalancer) forwardQueuedRequest(qr *queuedRequest, peer *PeerNode, nextHop int) bool {
+	// Build forward URL
+	targetURL := fmt.Sprintf("http://%s:%d%s", peer.Instance.IP, peer.Port, qr.r.URL.Path)
+	if qr.r.URL.RawQuery != "" {
+		targetURL += "?" + qr.r.URL.RawQuery
 	}
-}
 
-// checkAllPeers checks the health of all peers
-func (lb *NodeLoadBalancer) checkAllPeers() {
-	lb.peersMu.RLock()
-	peers := make([]*PeerNode, 0, len(lb.peers))
-	for _, peer := range lb.peers {
-		peers = append(peers, peer)
-	}
-	lb.peersMu.RUnlock()
-
-	var wg sync.WaitGroup
-	for _, peer := range peers {
-		wg.Add(1)
-		go func(p *PeerNode) {
-			defer wg.Done()
-			lb.checkPeerHealth(p)
-		}(peer)
-	}
-	wg.Wait()
-}
-
-// checkPeerHealth checks a single peer's health
-func (lb *NodeLoadBalancer) checkPeerHealth(peer *PeerNode) {
-	ctx, cancel := context.WithTimeout(lb.ctx, lb.config.HealthCheckTimeout)
+	// Create forwarded request with timeout
+	ctx, cancel := context.WithTimeout(qr.r.Context(), lb.config.RequestTimeout)
 	defer cancel()
 
-	// Check the peer's load balancer status endpoint
-	statusURL := fmt.Sprintf("http://%s:%d/lb/status", peer.Instance.IP, peer.Port)
-	req, err := http.NewRequestWithContext(ctx, "GET", statusURL, nil)
+	forwardReq, err := http.NewRequestWithContext(ctx, qr.r.Method, targetURL, bytes.NewReader(qr.bodyBytes))
 	if err != nil {
-		lb.markPeerUnhealthy(peer)
-		return
+		log.Printf("[LB] Failed to create forward request for %s: %v", qr.requestID, err)
+		return false
 	}
 
-	startTime := time.Now()
-	resp, err := lb.httpClient.Do(req)
+	// Copy original headers
+	for key, values := range qr.r.Header {
+		for _, value := range values {
+			forwardReq.Header.Add(key, value)
+		}
+	}
+
+	// Update/Set routing headers
+	forwardReq.Header.Set("X-Forwarded-For", qr.r.RemoteAddr)
+	forwardReq.Header.Set("X-LB-Hop", fmt.Sprintf("%d", nextHop)) // Propagate integer hop
+	forwardReq.Header.Set("X-Request-ID", qr.requestID)
+
+	waitDuration := time.Since(qr.enqueuedAt)
+	forwardReq.Header.Set("X-Queue-Wait-Ms", fmt.Sprintf("%.2f", float64(waitDuration.Microseconds())/1000.0))
+
+	// Trace forward start
+	lb.tracer.TraceForwardStart(qr.requestID, peer.Instance.ID, peer.Instance.IP)
+
+	forwardStart := time.Now()
+	resp, err := lb.httpClient.Do(forwardReq)
+	forwardDuration := time.Since(forwardStart)
+
 	if err != nil {
-		lb.markPeerUnhealthy(peer)
-		return
+		log.Printf("[LB] Failed to forward queued request %s to peer: %v", qr.requestID, err)
+		lb.tracer.TraceForwardEnd(qr.requestID, 0, float64(forwardDuration.Milliseconds()))
+		return false
 	}
 	defer resp.Body.Close()
 
-	responseTime := time.Since(startTime).Milliseconds()
+	// Trace forward completion
+	lb.tracer.TraceForwardEnd(qr.requestID, resp.StatusCode, float64(forwardDuration.Milliseconds()))
 
-	if resp.StatusCode != http.StatusOK {
-		lb.markPeerUnhealthy(peer)
-		return
-	}
-
-	// Parse peer status
-	var status PeerStatus
-	if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
-		lb.markPeerUnhealthy(peer)
-		return
-	}
-
-	// Update peer info
-	lb.peersMu.Lock()
-	peer.Healthy = status.Healthy
-	peer.CurrentLoad = status.CurrentLoad
-	peer.MaxLoad = status.MaxLoad
-	peer.ResponseTimeMs = responseTime
-	peer.LastHealthCheck = time.Now()
-	peer.ConsecutiveFails = 0
-	lb.peersMu.Unlock()
-}
-
-// markPeerUnhealthy marks a peer as unhealthy
-func (lb *NodeLoadBalancer) markPeerUnhealthy(peer *PeerNode) {
-	lb.peersMu.Lock()
-	defer lb.peersMu.Unlock()
-
-	peer.ConsecutiveFails++
-	if peer.ConsecutiveFails >= 3 {
-		if peer.Healthy {
-			log.Printf("[LB] Peer %s marked unhealthy after %d consecutive failures",
-				peer.Instance.ID, peer.ConsecutiveFails)
+	// Copy response back to original writer
+	for key, values := range resp.Header {
+		for _, value := range values {
+			qr.w.Header().Add(key, value)
 		}
-		peer.Healthy = false
 	}
-	peer.LastHealthCheck = time.Now()
+	qr.w.WriteHeader(resp.StatusCode)
+	io.Copy(qr.w, resp.Body)
+
+	log.Printf("[LB] Successfully forwarded queued request %s to %s (status: %d, duration: %v)",
+		qr.requestID, peer.Instance.IP, resp.StatusCode, forwardDuration)
+	return true
 }
 
-// handleInternalEndpoint handles internal load balancer endpoints
-func (lb *NodeLoadBalancer) handleInternalEndpoint(w http.ResponseWriter, r *http.Request) bool {
-	switch r.URL.Path {
-	case "/lb/status":
-		lb.handleStatus(w, r)
-		return true
-	case "/lb/metrics":
-		lb.handleMetrics(w, r)
-		return true
-	case "/lb/peers":
-		lb.handlePeers(w, r)
-		return true
-	}
-	return false
-}
+// handleStatusEndpoint returns the load balancer status as JSON
+func (lb *LoadBalancer) handleStatusEndpoint(w http.ResponseWriter, r *http.Request) {
+	lb.localMetricsMu.RLock()
+	localMetrics := lb.localMetrics
+	lb.localMetricsMu.RUnlock()
 
-// handleStatus returns the current status of this node's load balancer
-func (lb *NodeLoadBalancer) handleStatus(w http.ResponseWriter, r *http.Request) {
-	status := PeerStatus{
-		NodeID:      lb.config.NodeID,
-		CurrentLoad: lb.currentRequests.Load(),
-		MaxLoad:     lb.config.MaxConcurrentRequests,
-		QueueSize:   int(lb.queueSize.Load()),
-		Healthy:     lb.running.Load(),
+	lb.peersMu.RLock()
+	peerCount := len(lb.peers)
+	healthyPeers := 0
+	for _, status := range lb.peers {
+		if status.Healthy && status.Available {
+			healthyPeers++
+		}
+	}
+	lb.peersMu.RUnlock()
+
+	// Get queue size (instantaneous queue depth)
+	lb.queueMu.Lock()
+	queueSize := len(lb.queue)
+	lb.queueMu.Unlock()
+
+	// Get downtime intervals
+	lb.downtimeMu.RLock()
+	downtimeIntervals := make([]downtimeInterval, len(lb.downtimeIntervals))
+	copy(downtimeIntervals, lb.downtimeIntervals)
+	lb.downtimeMu.RUnlock()
+
+	// Calculate total downtime
+	var totalDowntime time.Duration
+	for _, interval := range downtimeIntervals {
+		if interval.End.IsZero() {
+			// Still in downtime
+			totalDowntime += time.Since(interval.Start)
+		} else {
+			totalDowntime += interval.End.Sub(interval.Start)
+		}
+	}
+
+	// Calculate uptime
+	uptime := time.Since(lb.startTime)
+
+	status := map[string]interface{}{
+		"running":         lb.running.Load(),
+		"current_load":    localMetrics.NumTotalReqs,
+		"max_load":        lb.config.MaxConcurrentRequests,
+		"running_reqs":    localMetrics.NumRunningReqs,
+		"waiting_reqs":    localMetrics.NumWaitingReqs,
+		"gpu_cache":       localMetrics.GPUCacheUsage,
+		"healthy":         localMetrics.Healthy,
+		"peer_count":      peerCount,
+		"healthy_peers":   healthyPeers,
+		"queue_size":      queueSize,
+		"queue_enabled":   lb.config.QueueEnabled,
+		"listen_port":     lb.config.LoadBalancerPort,
+		"backend_port":    lb.config.ApplicationPort,
+		"metrics_enabled": lb.config.MetricsEnabled,
+		// Aggregate metrics
+		"aggregate": map[string]interface{}{
+			"total_requests":     lb.totalRequestsHandled.Load(),
+			"requests_local":     lb.totalRequestsLocal.Load(),
+			"requests_forwarded": lb.totalRequestsForwarded.Load(),
+			"requests_queued":    lb.totalRequestsQueued.Load(),
+			"requests_rejected":  lb.totalRequestsRejected.Load(),
+			"start_time":         lb.startTime.Format(time.RFC3339),
+			"uptime_seconds":     uptime.Seconds(),
+			"downtime_seconds":   totalDowntime.Seconds(),
+			"downtime_intervals": len(downtimeIntervals),
+		},
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(status)
 }
 
-// handleMetrics returns detailed metrics
-func (lb *NodeLoadBalancer) handleMetrics(w http.ResponseWriter, r *http.Request) {
-	lb.metricsMu.RLock()
-	metrics := lb.metrics
-	lb.metricsMu.RUnlock()
+// handleHealthEndpoint returns a simple health check
+func (lb *LoadBalancer) handleHealthEndpoint(w http.ResponseWriter, r *http.Request) {
+	if !lb.running.Load() {
+		http.Error(w, "Load balancer not running", http.StatusServiceUnavailable)
+		return
+	}
 
-	metrics.CurrentConcurrent = lb.currentRequests.Load()
-	metrics.PeakConcurrent = lb.peakRequests.Load()
-	metrics.LastUpdated = time.Now()
+	lb.localMetricsMu.RLock()
+	healthy := lb.localMetrics.Healthy
+	lb.localMetricsMu.RUnlock()
+
+	if !healthy {
+		http.Error(w, "Backend unhealthy", http.StatusServiceUnavailable)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":  "healthy",
+		"running": true,
+	})
+}
+
+// handleMetricsEndpoint returns detailed metrics for all peers
+func (lb *LoadBalancer) handleMetricsEndpoint(w http.ResponseWriter, r *http.Request) {
+	lb.localMetricsMu.RLock()
+	localMetrics := lb.localMetrics
+	lb.localMetricsMu.RUnlock()
+
+	lb.peersMu.RLock()
+	peers := make(map[string]interface{})
+	for peer, status := range lb.peers {
+		peers[peer.Instance.ID] = map[string]interface{}{
+			"ip":           peer.Instance.IP,
+			"port":         peer.Port,
+			"available":    status.Available,
+			"healthy":      status.Healthy,
+			"running_reqs": status.RunningRequests,
+			"waiting_reqs": status.WaitingRequests,
+			"total_reqs":   status.TotalRequests,
+			"gpu_cache":    status.GPUCacheUsage,
+			"max_running":  peer.Metrics.MaxRunningReqs,
+			"latency_ms":   peer.Metrics.Latency,
+		}
+	}
+	lb.peersMu.RUnlock()
+
+	// Get queue depth
+	lb.queueMu.Lock()
+	queueDepth := len(lb.queue)
+	lb.queueMu.Unlock()
+
+	// Get downtime intervals
+	lb.downtimeMu.RLock()
+	downtimeIntervals := make([]map[string]interface{}, 0, len(lb.downtimeIntervals))
+	var totalDowntime time.Duration
+	for _, interval := range lb.downtimeIntervals {
+		di := map[string]interface{}{
+			"start": interval.Start.Format(time.RFC3339),
+		}
+		if interval.End.IsZero() {
+			di["end"] = nil
+			di["duration_seconds"] = time.Since(interval.Start).Seconds()
+			totalDowntime += time.Since(interval.Start)
+		} else {
+			di["end"] = interval.End.Format(time.RFC3339)
+			di["duration_seconds"] = interval.End.Sub(interval.Start).Seconds()
+			totalDowntime += interval.End.Sub(interval.Start)
+		}
+		downtimeIntervals = append(downtimeIntervals, di)
+	}
+	lb.downtimeMu.RUnlock()
+
+	uptime := time.Since(lb.startTime)
+
+	metrics := map[string]interface{}{
+		"local": map[string]interface{}{
+			"running_reqs": localMetrics.NumRunningReqs,
+			"waiting_reqs": localMetrics.NumWaitingReqs,
+			"total_reqs":   localMetrics.NumTotalReqs,
+			"gpu_cache":    localMetrics.GPUCacheUsage,
+			"max_running":  localMetrics.MaxRunningReqs,
+			"healthy":      localMetrics.Healthy,
+			"last_updated": localMetrics.LastUpdated,
+		},
+		"peers": peers,
+		"config": map[string]interface{}{
+			"max_concurrent":  lb.config.MaxConcurrentRequests,
+			"queue_enabled":   lb.config.QueueEnabled,
+			"queue_timeout":   lb.config.QueueTimeout.String(),
+			"request_timeout": lb.config.RequestTimeout.String(),
+			"gpu_threshold":   lb.config.GPUCacheThreshold,
+		},
+		"aggregate": map[string]interface{}{
+			"total_requests":     lb.totalRequestsHandled.Load(),
+			"requests_local":     lb.totalRequestsLocal.Load(),
+			"requests_forwarded": lb.totalRequestsForwarded.Load(),
+			"requests_queued":    lb.totalRequestsQueued.Load(),
+			"requests_rejected":  lb.totalRequestsRejected.Load(),
+			"queue_depth":        queueDepth,
+			"start_time":         lb.startTime.Format(time.RFC3339),
+			"uptime_seconds":     uptime.Seconds(),
+			"downtime_seconds":   totalDowntime.Seconds(),
+			"downtime_intervals": downtimeIntervals,
+		},
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(metrics)
 }
 
-// handlePeers returns information about peer nodes
-func (lb *NodeLoadBalancer) handlePeers(w http.ResponseWriter, r *http.Request) {
-	lb.peersMu.RLock()
-	peers := make([]*PeerNode, 0, len(lb.peers))
-	for _, peer := range lb.peers {
-		peers = append(peers, peer)
+// getStrategyName returns the name of the current strategy
+func (lb *LoadBalancer) getStrategyName() string {
+	switch lb.strategy.(type) {
+	case *LeastLoadedPolicy:
+		return "least-loaded"
+	case *PrefixTreePolicy:
+		return "prefix-tree"
+	case *GORGOPolicy:
+		return "gorgo"
+	default:
+		return "unknown"
 	}
-	lb.peersMu.RUnlock()
+}
+
+// handleConfigEndpoint handles runtime configuration changes
+// GET: returns current config
+// POST/PUT: updates config (supports {"policy": "gorgo|least-loaded|prefix-tree"})
+func (lb *LoadBalancer) handleConfigEndpoint(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	if r.Method == http.MethodGet {
+		// Get tuning parameters
+		lb.tuningMu.RLock()
+		msPerToken := lb.msPerToken
+		runningCostFactor := lb.runningCostFactor
+		lb.tuningMu.RUnlock()
+
+		// Return current config
+		config := map[string]interface{}{
+			"policy":              lb.getStrategyName(),
+			"max_concurrent":      lb.config.MaxConcurrentRequests,
+			"queue_enabled":       lb.config.QueueEnabled,
+			"queue_timeout":       lb.config.QueueTimeout.String(),
+			"request_timeout":     lb.config.RequestTimeout.String(),
+			"metrics_enabled":     lb.config.MetricsEnabled,
+			"gpu_cache_threshold": lb.config.GPUCacheThreshold,
+			"listen_port":         lb.config.LoadBalancerPort,
+			"backend_port":        lb.config.ApplicationPort,
+			// GORGO tuning parameters
+			"ms_per_token":        msPerToken,
+			"running_cost_factor": runningCostFactor,
+		}
+		json.NewEncoder(w).Encode(config)
+		return
+	}
+
+	if r.Method == http.MethodPost || r.Method == http.MethodPut {
+		// Parse request body
+		var req struct {
+			Policy            string   `json:"policy"`
+			MaxConcurrent     *int     `json:"max_concurrent"`
+			QueueEnabled      *bool    `json:"queue_enabled"`
+			GPUCacheThreshold *float64 `json:"gpu_cache_threshold"`
+			// GORGO tuning parameters
+			MsPerToken        *float64 `json:"ms_per_token"`
+			RunningCostFactor *float64 `json:"running_cost_factor"`
+		}
+
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, fmt.Sprintf(`{"error": "invalid JSON: %v"}`, err), http.StatusBadRequest)
+			return
+		}
+
+		changes := []string{}
+
+		// Update policy if specified
+		if req.Policy != "" {
+			oldPolicy := lb.getStrategyName()
+			if err := lb.SetStrategy(req.Policy); err != nil {
+				http.Error(w, fmt.Sprintf(`{"error": "%v"}`, err), http.StatusBadRequest)
+				return
+			}
+			changes = append(changes, fmt.Sprintf("policy: %s -> %s", oldPolicy, req.Policy))
+			log.Printf("[LB] Policy changed: %s -> %s", oldPolicy, req.Policy)
+		}
+
+		// Update max concurrent if specified
+		if req.MaxConcurrent != nil {
+			old := lb.config.MaxConcurrentRequests
+			lb.config.MaxConcurrentRequests = *req.MaxConcurrent
+			changes = append(changes, fmt.Sprintf("max_concurrent: %d -> %d", old, *req.MaxConcurrent))
+		}
+
+		// Update queue enabled if specified
+		if req.QueueEnabled != nil {
+			old := lb.config.QueueEnabled
+			lb.config.QueueEnabled = *req.QueueEnabled
+			changes = append(changes, fmt.Sprintf("queue_enabled: %v -> %v", old, *req.QueueEnabled))
+		}
+
+		// Update GPU cache threshold if specified
+		if req.GPUCacheThreshold != nil {
+			old := lb.config.GPUCacheThreshold
+			lb.config.GPUCacheThreshold = *req.GPUCacheThreshold
+			changes = append(changes, fmt.Sprintf("gpu_cache_threshold: %.2f -> %.2f", old, *req.GPUCacheThreshold))
+		}
+
+		// Update GORGO ms_per_token if specified
+		if req.MsPerToken != nil {
+			lb.tuningMu.Lock()
+			old := lb.msPerToken
+			lb.msPerToken = *req.MsPerToken
+			lb.config.GORGOMsPerToken = *req.MsPerToken
+			lb.tuningMu.Unlock()
+			changes = append(changes, fmt.Sprintf("ms_per_token: %.4f -> %.4f", old, *req.MsPerToken))
+			log.Printf("[LB] ms_per_token changed: %.4f -> %.4f", old, *req.MsPerToken)
+		}
+
+		// Update GORGO running_cost_factor if specified
+		if req.RunningCostFactor != nil {
+			lb.tuningMu.Lock()
+			old := lb.runningCostFactor
+			lb.runningCostFactor = *req.RunningCostFactor
+			lb.config.GORGORunningCostFactor = *req.RunningCostFactor
+			lb.tuningMu.Unlock()
+			changes = append(changes, fmt.Sprintf("running_cost_factor: %.2f -> %.2f", old, *req.RunningCostFactor))
+			log.Printf("[LB] running_cost_factor changed: %.2f -> %.2f", old, *req.RunningCostFactor)
+		}
+
+		// Get current tuning params for response
+		lb.tuningMu.RLock()
+		currentMsPerToken := lb.msPerToken
+		currentRunningCostFactor := lb.runningCostFactor
+		lb.tuningMu.RUnlock()
+
+		response := map[string]interface{}{
+			"success": true,
+			"changes": changes,
+			"config": map[string]interface{}{
+				"policy":              lb.getStrategyName(),
+				"max_concurrent":      lb.config.MaxConcurrentRequests,
+				"queue_enabled":       lb.config.QueueEnabled,
+				"gpu_cache_threshold": lb.config.GPUCacheThreshold,
+				"ms_per_token":        currentMsPerToken,
+				"running_cost_factor": currentRunningCostFactor,
+			},
+		}
+		json.NewEncoder(w).Encode(response)
+		return
+	}
+
+	http.Error(w, `{"error": "method not allowed, use GET or POST"}`, http.StatusMethodNotAllowed)
+}
+
+// handlePolicyEndpoint is a convenience endpoint for switching policies
+// GET: returns available policies and current policy
+// POST: switches policy (body: {"policy": "gorgo"} or just the policy name as plain text)
+func (lb *LoadBalancer) handlePolicyEndpoint(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	availablePolicies := []string{"least-loaded", "prefix-tree", "gorgo"}
+
+	if r.Method == http.MethodGet {
+		// Also check query parameter for quick switching: /lb/policy?set=gorgo
+		if newPolicy := r.URL.Query().Get("set"); newPolicy != "" {
+			oldPolicy := lb.getStrategyName()
+			if err := lb.SetStrategy(newPolicy); err != nil {
+				http.Error(w, fmt.Sprintf(`{"error": "%v", "available": %v}`, err, availablePolicies), http.StatusBadRequest)
+				return
+			}
+			log.Printf("[LB] Policy changed via query param: %s -> %s", oldPolicy, newPolicy)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success":    true,
+				"old_policy": oldPolicy,
+				"new_policy": newPolicy,
+				"available":  availablePolicies,
+			})
+			return
+		}
+
+		// Return current policy info
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"current":   lb.getStrategyName(),
+			"available": availablePolicies,
+			"hint":      "POST with {\"policy\": \"gorgo\"} or GET /lb/policy?set=gorgo to switch",
+		})
+		return
+	}
+
+	if r.Method == http.MethodPost || r.Method == http.MethodPut {
+		// Try to parse as JSON first
+		var req struct {
+			Policy string `json:"policy"`
+		}
+
+		body, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(body, &req); err != nil {
+			// Try plain text (just the policy name)
+			req.Policy = strings.TrimSpace(string(body))
+		}
+
+		if req.Policy == "" {
+			http.Error(w, fmt.Sprintf(`{"error": "policy required", "available": %v}`, availablePolicies), http.StatusBadRequest)
+			return
+		}
+
+		oldPolicy := lb.getStrategyName()
+		if err := lb.SetStrategy(req.Policy); err != nil {
+			http.Error(w, fmt.Sprintf(`{"error": "%v", "available": %v}`, err, availablePolicies), http.StatusBadRequest)
+			return
+		}
+
+		log.Printf("[LB] Policy changed: %s -> %s", oldPolicy, req.Policy)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":    true,
+			"old_policy": oldPolicy,
+			"new_policy": req.Policy,
+		})
+		return
+	}
+
+	http.Error(w, `{"error": "method not allowed, use GET or POST"}`, http.StatusMethodNotAllowed)
+}
+
+// SetStrategy changes the load balancing strategy at runtime
+func (lb *LoadBalancer) SetStrategy(name string) error {
+	var newStrategy LoadBalancingStrategy
+
+	switch strings.ToLower(name) {
+	case "least-loaded", "leastloaded", "least_loaded":
+		newStrategy = &LeastLoadedPolicy{}
+	case "prefix-tree", "prefixtree", "prefix_tree", "prefix":
+		newStrategy = NewPrefixTreePolicy()
+	case "gorgo":
+		newStrategy = NewGORGOPolicy(lb)
+	default:
+		return fmt.Errorf("unknown policy: %s (available: least-loaded, prefix-tree, gorgo)", name)
+	}
+
+	lb.peersMu.Lock()
+	lb.strategy = newStrategy
+	lb.config.Strategy = newStrategy
+	lb.peersMu.Unlock()
+
+	return nil
+}
+
+// handleTokenizerEndpoint tests the tokenizer and returns results
+// GET: test with default phrases
+// POST: test with custom text (body: {"text": "your text here"})
+func (lb *LoadBalancer) handleTokenizerEndpoint(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	// Default test phrases
+	testPhrases := []string{
+		"Hello, world!",
+		"The quick brown fox jumps over the lazy dog.",
+	}
+
+	// Check for custom text in POST body or query param
+	customText := r.URL.Query().Get("text")
+	if r.Method == http.MethodPost {
+		var req struct {
+			Text string `json:"text"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err == nil && req.Text != "" {
+			customText = req.Text
+		}
+	}
+
+	if customText != "" {
+		testPhrases = append(testPhrases, customText)
+	}
+
+	// Run tokenizer tests
+	results := make([]map[string]interface{}, 0, len(testPhrases))
+	allPassed := true
+	isCGO := false
+
+	for _, phrase := range testPhrases {
+		tokenCount := GetTokenCount(phrase)
+		charCount := len(phrase)
+
+		// Estimate what we'd get with fallback (chars/4)
+		fallbackEstimate := charCount / 4
+
+		// If token count differs significantly from fallback, CGO tokenizer is working
+		// CGO tokenizer gives more accurate counts (usually different from simple char/4)
+		likelyCGO := tokenCount != fallbackEstimate
+		if likelyCGO {
+			isCGO = true
+		}
+
+		// Sanity check: tokens should be reasonable (1-50% of char count, roughly)
+		reasonable := tokenCount >= 1 && tokenCount <= charCount
+		if !reasonable {
+			allPassed = false
+		}
+
+		results = append(results, map[string]interface{}{
+			"text":              phrase,
+			"token_count":       tokenCount,
+			"char_count":        charCount,
+			"fallback_estimate": fallbackEstimate,
+			"likely_cgo":        likelyCGO,
+			"reasonable":        reasonable,
+		})
+	}
+
+	// Summary
+	response := map[string]interface{}{
+		"success":     allPassed,
+		"cgo_enabled": isCGO,
+		"results":     results,
+		"message":     "",
+	}
+
+	if isCGO {
+		response["message"] = "CGO tokenizer is working correctly (token counts differ from char/4 fallback)"
+	} else {
+		response["message"] = "WARNING: Likely using fallback tokenizer (char/4). CGO may not be enabled."
+	}
+
+	if !allPassed {
+		w.WriteHeader(http.StatusInternalServerError)
+		response["message"] = "Tokenizer test failed: unreasonable token counts detected"
+	}
+
+	json.NewEncoder(w).Encode(response)
+}
+
+// handlePeersEndpoint manages peer registration
+// GET /lb/peers - list all peers
+// POST /lb/peers - add a new peer {"ip": "1.2.3.4", "port": 8000}
+// DELETE /lb/peers - remove a peer {"ip": "1.2.3.4", "port": 8000}
+func (lb *LoadBalancer) handlePeersEndpoint(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	switch r.Method {
+	case http.MethodGet:
+		// List all peers
+		lb.peersMu.RLock()
+		peers := make([]map[string]interface{}, 0, len(lb.peers))
+		for peer, status := range lb.peers {
+			ip := ""
+			if peer.Instance != nil {
+				ip = peer.Instance.IP
+			}
+			peerInfo := map[string]interface{}{
+				"ip":           ip,
+				"port":         peer.Port,
+				"available":    status.Available,
+				"healthy":      status.Healthy,
+				"running_reqs": status.RunningRequests,
+				"waiting_reqs": status.WaitingRequests,
+				"total_reqs":   status.TotalRequests,
+				"gpu_cache":    status.GPUCacheUsage,
+				"max_load":     peer.MaxLoad,
+			}
+			peers = append(peers, peerInfo)
+		}
+		lb.peersMu.RUnlock()
+
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"count": len(peers),
+			"peers": peers,
+		})
+
+	case http.MethodPost:
+		// Add a new peer
+		var req struct {
+			IP   string `json:"ip"`
+			Port int    `json:"port"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, `{"error": "invalid JSON"}`, http.StatusBadRequest)
+			return
+		}
+		if req.IP == "" || req.Port == 0 {
+			http.Error(w, `{"error": "ip and port are required"}`, http.StatusBadRequest)
+			return
+		}
+
+		// Check if peer already exists
+		lb.peersMu.Lock()
+		for peer := range lb.peers {
+			if peer.Instance != nil && peer.Instance.IP == req.IP && peer.Port == req.Port {
+				lb.peersMu.Unlock()
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"status":  "exists",
+					"message": fmt.Sprintf("peer %s:%d already registered", req.IP, req.Port),
+				})
+				return
+			}
+		}
+
+		// Create a minimal peer instance
+		peer := &PeerNode{
+			Instance: &remote.RunningInstance{IP: req.IP},
+			Port:     req.Port,
+			MaxLoad:  10, // Default max load
+		}
+		lb.peers[peer] = AvailabilityStatus{Available: true, Healthy: true}
+		lb.peersMu.Unlock()
+
+		log.Printf("[LB] Added peer: %s:%d", req.IP, req.Port)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":  "added",
+			"message": fmt.Sprintf("peer %s:%d added successfully", req.IP, req.Port),
+			"peers":   len(lb.peers),
+		})
+
+	case http.MethodDelete:
+		// Remove a peer
+		var req struct {
+			IP   string `json:"ip"`
+			Port int    `json:"port"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, `{"error": "invalid JSON"}`, http.StatusBadRequest)
+			return
+		}
+
+		lb.peersMu.Lock()
+		var toDelete *PeerNode
+		for peer := range lb.peers {
+			if peer.Instance != nil && peer.Instance.IP == req.IP && (req.Port == 0 || peer.Port == req.Port) {
+				toDelete = peer
+				break
+			}
+		}
+		if toDelete != nil {
+			delete(lb.peers, toDelete)
+		}
+		lb.peersMu.Unlock()
+
+		if toDelete != nil {
+			log.Printf("[LB] Removed peer: %s:%d", req.IP, req.Port)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"status":  "removed",
+				"message": fmt.Sprintf("peer %s:%d removed", req.IP, req.Port),
+			})
+		} else {
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"status":  "not_found",
+				"message": fmt.Sprintf("peer %s:%d not found", req.IP, req.Port),
+			})
+		}
+
+	default:
+		http.Error(w, `{"error": "method not allowed"}`, http.StatusMethodNotAllowed)
+	}
+}
+
+// =====================================================
+// TRACE ENDPOINTS - Perfetto-compatible tracing
+// =====================================================
+
+// handleTraceStartEndpoint starts a new tracing session
+func (lb *LoadBalancer) handleTraceStartEndpoint(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost && r.Method != http.MethodGet {
+		http.Error(w, `{"error": "method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	sessionID := lb.tracer.Start()
+	log.Printf("[LB] Trace session started: %s", sessionID)
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(peers)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":     "started",
+		"session_id": sessionID,
+		"node_id":    lb.config.NodeID,
+		"hint":       "Run your workload, then call /lb/trace/stop to get the Perfetto trace",
+	})
 }
 
-// collectMetrics periodically updates aggregate metrics
-func (lb *NodeLoadBalancer) collectMetrics() {
-	defer lb.wg.Done()
-
-	ticker := time.NewTicker(1 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-lb.ctx.Done():
-			return
-		case <-ticker.C:
-			lb.metricsMu.Lock()
-			lb.metrics.CurrentConcurrent = lb.currentRequests.Load()
-			lb.metrics.PeakConcurrent = lb.peakRequests.Load()
-			lb.metrics.AvgResponseTimeMs = float64(lb.avgResponseTime.Load())
-			lb.metrics.LastUpdated = time.Now()
-			lb.metricsMu.Unlock()
-		}
+// handleTraceStopEndpoint stops tracing and returns the Perfetto JSON
+func (lb *LoadBalancer) handleTraceStopEndpoint(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost && r.Method != http.MethodGet {
+		http.Error(w, `{"error": "method not allowed"}`, http.StatusMethodNotAllowed)
+		return
 	}
-}
 
-// updateResponseTime updates the exponential moving average of response time
-func (lb *NodeLoadBalancer) updateResponseTime(elapsed int64) {
-	// EMA with alpha = 0.1
-	for {
-		current := lb.avgResponseTime.Load()
-		if current == 0 {
-			if lb.avgResponseTime.CompareAndSwap(0, elapsed) {
-				break
-			}
-		} else {
-			newAvg := int64(float64(current)*0.9 + float64(elapsed)*0.1)
-			if lb.avgResponseTime.CompareAndSwap(current, newAvg) {
-				break
-			}
-		}
+	traceData, err := lb.tracer.Stop()
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error": "%s"}`, err.Error()), http.StatusBadRequest)
+		return
 	}
+
+	log.Printf("[LB] Trace session stopped, returning %d bytes", len(traceData))
+
+	// Return as downloadable JSON file
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Disposition", "attachment; filename=trace.json")
+	w.Write(traceData)
 }
 
-// GetMetrics returns current metrics
-func (lb *NodeLoadBalancer) GetMetrics() LoadBalancerMetrics {
-	lb.metricsMu.RLock()
-	defer lb.metricsMu.RUnlock()
-
-	metrics := lb.metrics
-	metrics.CurrentConcurrent = lb.currentRequests.Load()
-	metrics.PeakConcurrent = lb.peakRequests.Load()
-	return metrics
+// handleTraceStatusEndpoint returns current trace status
+func (lb *LoadBalancer) handleTraceStatusEndpoint(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(lb.tracer.GetStatus())
 }
 
-// GetPeers returns current peer information
-func (lb *NodeLoadBalancer) GetPeers() []*PeerNode {
-	lb.peersMu.RLock()
-	defer lb.peersMu.RUnlock()
-
-	peers := make([]*PeerNode, 0, len(lb.peers))
-	for _, peer := range lb.peers {
-		peerCopy := *peer
-		peers = append(peers, &peerCopy)
+// handleCacheClearEndpoint clears the prefix tree cache
+func (lb *LoadBalancer) handleCacheClearEndpoint(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost && r.Method != http.MethodGet {
+		http.Error(w, `{"error": "method not allowed"}`, http.StatusMethodNotAllowed)
+		return
 	}
-	return peers
-}
 
-// GetHealthyPeers returns only healthy peers
-func (lb *NodeLoadBalancer) GetHealthyPeers() []*PeerNode {
-	lb.peersMu.RLock()
-	defer lb.peersMu.RUnlock()
+	w.Header().Set("Content-Type", "application/json")
 
-	var healthy []*PeerNode
-	for _, peer := range lb.peers {
-		if peer.Healthy {
-			peerCopy := *peer
-			healthy = append(healthy, &peerCopy)
-		}
+	var cleared int
+	strategyName := lb.getStrategyName()
+
+	switch strategy := lb.strategy.(type) {
+	case *PrefixTreePolicy:
+		cleared = strategy.ClearCache()
+	case *GORGOPolicy:
+		cleared = strategy.ClearCache()
+	default:
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":  false,
+			"strategy": strategyName,
+			"message":  "strategy does not use prefix tree cache",
+		})
+		return
 	}
-	return healthy
+
+	log.Printf("[LB] Cleared prefix tree cache: %d nodes removed", cleared)
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":       true,
+		"strategy":      strategyName,
+		"nodes_cleared": cleared,
+		"message":       "prefix tree cache cleared",
+	})
 }
 
-// CurrentLoad returns the current number of concurrent requests
-func (lb *NodeLoadBalancer) CurrentLoad() int64 {
-	return lb.currentRequests.Load()
+// CurrentLoad returns the current load from real SGLang metrics (running + waiting)
+func (lb *LoadBalancer) CurrentLoad() int {
+	lb.localMetricsMu.RLock()
+	defer lb.localMetricsMu.RUnlock()
+	return lb.localMetrics.NumTotalReqs
 }
 
-// IsAtCapacity returns true if the local node is at capacity
-func (lb *NodeLoadBalancer) IsAtCapacity() bool {
-	return lb.currentRequests.Load() >= int64(lb.config.MaxConcurrentRequests)
+// IsAtCapacity returns true if the local SGLang is at capacity
+func (lb *LoadBalancer) IsAtCapacity() bool {
+	return !lb.localHasCapacity()
 }
 
 // ListenAndServe starts the load balancer HTTP server
-func (lb *NodeLoadBalancer) ListenAndServe() error {
+func (lb *LoadBalancer) ListenAndServe() error {
 	if err := lb.Start(); err != nil {
 		return err
 	}
 
 	server := &http.Server{
-		Addr:         fmt.Sprintf(":%d", lb.config.ListenPort),
-		Handler:      lb.Handler(nil),
+		Addr:         fmt.Sprintf(":%d", lb.config.LoadBalancerPort),
+		Handler:      lb.Handler(),
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 30 * time.Second,
 		IdleTimeout:  120 * time.Second,
 	}
 
-	log.Printf("[LB] Starting HTTP server on port %d", lb.config.ListenPort)
+	log.Printf("[LB] Starting HTTP server on port %d", lb.config.LoadBalancerPort)
 	return server.ListenAndServe()
-}
-
-// WrapHandler wraps an existing handler with load balancing
-func (lb *NodeLoadBalancer) WrapHandler(handler http.Handler) http.Handler {
-	return lb.Handler(handler)
 }

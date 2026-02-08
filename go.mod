@@ -3,6 +3,7 @@ module github.com/atoniolo76/gotoni
 go 1.25.3
 
 require (
+	// github.com/daulet/tokenizers v1.24.0 // Temporarily commented out for CGO_ENABLED=0 builds
 	github.com/glebarez/go-sqlite v1.22.0
 	github.com/joho/godotenv v1.5.1
 	github.com/kirsle/configdir v0.0.0-20170128060238-e45d2f54772f
@@ -10,6 +11,8 @@ require (
 	github.com/spf13/cobra v1.10.1
 	golang.org/x/crypto v0.43.0
 )
+
+require github.com/daulet/tokenizers v1.24.0
 
 require (
 	github.com/dustin/go-humanize v1.0.1 // indirect

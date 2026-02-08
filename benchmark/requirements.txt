@@ -1,3 +1,5 @@
 datasets
 pandas
 openai
+aiohttp
+guidellm[recommended]
