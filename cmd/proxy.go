@@ -11,6 +11,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -21,6 +22,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/atoniolo76/gotoni/pkg/config"
 	"github.com/atoniolo76/gotoni/pkg/proxy"
 	"github.com/atoniolo76/gotoni/pkg/remote"
 	"github.com/spf13/cobra"
@@ -153,6 +155,20 @@ Latencies are measured via dedicated probing and include:
 	Run: runProxyLatency,
 }
 
+// proxyPrefixStatsCmd shows prefix tree stats
+var proxyPrefixStatsCmd = &cobra.Command{
+	Use:   "prefix-stats",
+	Short: "Show prefix tree stats from the proxy",
+	Long: `Display summary statistics for the prefix tree used in GORGO routing.
+
+Shows:
+- Node and leaf counts
+- Depth and branching statistics
+- Prefix length averages
+- Server reference counts`,
+	Run: runProxyPrefixStats,
+}
+
 // proxyDeployCmd deploys and starts proxy on a remote instance
 var proxyDeployCmd = &cobra.Command{
 	Use:   "deploy <instance-name>",
@@ -171,6 +187,83 @@ Example:
 	Run:  runProxyDeploy,
 }
 
+// proxyMetricsCmd manages metrics collection and export
+var proxyMetricsCmd = &cobra.Command{
+	Use:   "metrics",
+	Short: "Manage request metrics and prefix cache hit ratios",
+	Long: `Manage request-level metrics collection on the proxy.
+
+The proxy tracks detailed metrics for each request including:
+- Latency (network, TTFT, total)
+- Prefix cache hit ratios for all regions
+- Matched prefix lengths
+- Routing decisions
+
+Metrics are stored in-memory and can be exported to CSV for analysis.
+
+Subcommands:
+  export    - Download metrics as CSV file
+  summary   - Show summary statistics
+  clear     - Clear all collected metrics
+  enable    - Enable/disable metrics collection`,
+}
+
+// proxyMetricsExportCmd exports metrics to CSV
+var proxyMetricsExportCmd = &cobra.Command{
+	Use:   "export [output.csv]",
+	Short: "Export metrics to CSV file",
+	Long: `Download metrics from the proxy and save to a CSV file.
+
+The CSV will contain one row per request with columns for:
+- Request metadata (ID, timestamp, prompt length, tokens)
+- Latency metrics (network, TTFT, total, queue time)
+- Routing decision (selected server)
+- Prefix cache hit ratios for EACH region
+- Matched prefix lengths for EACH region
+
+Example:
+  gotoni proxy metrics export wildchat_metrics.csv`,
+	Run: runProxyMetricsExport,
+}
+
+// proxyMetricsSummaryCmd shows summary stats
+var proxyMetricsSummaryCmd = &cobra.Command{
+	Use:   "summary",
+	Short: "Show metrics summary",
+	Long: `Display summary statistics for collected metrics.
+
+Shows:
+- Number of requests tracked
+- Average latencies
+- Average prefix cache hit ratios per region
+- Success/failure counts`,
+	Run: runProxyMetricsSummary,
+}
+
+// proxyMetricsClearCmd clears metrics
+var proxyMetricsClearCmd = &cobra.Command{
+	Use:   "clear",
+	Short: "Clear all collected metrics",
+	Long:  `Delete all collected metrics from the proxy's memory.`,
+	Run:   runProxyMetricsClear,
+}
+
+// proxyMetricsEnableCmd enables/disables metrics
+var proxyMetricsEnableCmd = &cobra.Command{
+	Use:   "enable [true|false]",
+	Short: "Enable or disable metrics collection",
+	Long: `Enable or disable request-level metrics collection.
+
+When enabled, the proxy will track detailed metrics for every request.
+This adds minimal overhead but uses memory proportional to request count.
+
+Examples:
+  gotoni proxy metrics enable true
+  gotoni proxy metrics enable false`,
+	Args: cobra.ExactArgs(1),
+	Run:  runProxyMetricsEnable,
+}
+
 func init() {
 	rootCmd.AddCommand(proxyCmd)
 	proxyCmd.AddCommand(proxyStartCmd)
@@ -180,7 +273,15 @@ func init() {
 	proxyCmd.AddCommand(proxyTuneCmd)
 	proxyCmd.AddCommand(proxyClearCacheCmd)
 	proxyCmd.AddCommand(proxyLatencyCmd)
+	proxyCmd.AddCommand(proxyPrefixStatsCmd)
 	proxyCmd.AddCommand(proxyDeployCmd)
+	proxyCmd.AddCommand(proxyMetricsCmd)
+
+	// Metrics subcommands
+	proxyMetricsCmd.AddCommand(proxyMetricsExportCmd)
+	proxyMetricsCmd.AddCommand(proxyMetricsSummaryCmd)
+	proxyMetricsCmd.AddCommand(proxyMetricsClearCmd)
+	proxyMetricsCmd.AddCommand(proxyMetricsEnableCmd)
 
 	// Persistent flags for all proxy subcommands (except start/stop)
 	proxyCmd.PersistentFlags().String("remote", "", "Remote instance name or ID - resolves from Lambda API")
@@ -189,9 +290,9 @@ func init() {
 	proxyStartCmd.Flags().String("config", "", "Path to JSON config file")
 	proxyStartCmd.Flags().Int("listen-port", 8000, "Port for the proxy to listen on")
 	proxyStartCmd.Flags().Int("sglang-port", 8080, "SGLang server port on discovered instances")
-	proxyStartCmd.Flags().Duration("request-timeout", 60*time.Second, "Request timeout")
+	proxyStartCmd.Flags().Duration("request-timeout", config.DefaultRequestTimeout, "Request timeout")
 	proxyStartCmd.Flags().Bool("queue-enabled", true, "Enable request queuing")
-	proxyStartCmd.Flags().Duration("queue-timeout", 60*time.Second, "Queue timeout")
+	proxyStartCmd.Flags().Duration("queue-timeout", config.DefaultQueueTimeout, "Queue timeout")
 	proxyStartCmd.Flags().Int("max-queue", 10000, "Max requests in queue")
 	proxyStartCmd.Flags().StringSlice("servers", []string{}, "Server addresses in format ip:port")
 	proxyStartCmd.Flags().Bool("auto-discover", false, "Auto-discover servers from Lambda cloud API")
@@ -200,6 +301,10 @@ func init() {
 	// GORGO tuning parameters
 	proxyStartCmd.Flags().Float64("ms-per-token", 0.094, "Estimated prefill time per token in ms")
 	proxyStartCmd.Flags().Float64("running-cost-factor", 0.5, "Weight for running requests (qhat)")
+
+	// Capacity gating (like loadbalancer.go)
+	proxyStartCmd.Flags().Bool("capacity-gating", true, "Gate requests at proxy level for exact queue tracking")
+	proxyStartCmd.Flags().Int("max-running-per-server", 10, "Max running requests per server before queueing")
 
 	// Metrics/latency polling
 	proxyStartCmd.Flags().Duration("metrics-interval", 500*time.Millisecond, "Metrics polling interval")
@@ -231,6 +336,10 @@ func init() {
 	proxyLatencyCmd.Flags().String("host", "localhost", "Proxy host")
 	proxyLatencyCmd.Flags().Int("port", 8000, "Proxy port")
 
+	// Flags for prefix stats
+	proxyPrefixStatsCmd.Flags().String("host", "localhost", "Proxy host")
+	proxyPrefixStatsCmd.Flags().Int("port", 8000, "Proxy port")
+
 	// Flags for proxy deploy
 	proxyDeployCmd.Flags().Int("listen-port", 8000, "Port for the proxy to listen on")
 	proxyDeployCmd.Flags().Int("sglang-port", 8080, "SGLang server port on discovered instances")
@@ -238,6 +347,19 @@ func init() {
 	proxyDeployCmd.Flags().Float64("running-cost-factor", 0.5, "Weight for running requests (qhat)")
 	proxyDeployCmd.Flags().Bool("skip-build", false, "Skip building the binary (use existing /tmp/gotoni-linux)")
 	proxyDeployCmd.Flags().Bool("auto-add-servers", true, "Auto-discover and add SGLang servers from other instances")
+
+	// Flags for proxy metrics subcommands
+	proxyMetricsExportCmd.Flags().String("host", "localhost", "Proxy host")
+	proxyMetricsExportCmd.Flags().Int("port", 8000, "Proxy port")
+
+	proxyMetricsSummaryCmd.Flags().String("host", "localhost", "Proxy host")
+	proxyMetricsSummaryCmd.Flags().Int("port", 8000, "Proxy port")
+
+	proxyMetricsClearCmd.Flags().String("host", "localhost", "Proxy host")
+	proxyMetricsClearCmd.Flags().Int("port", 8000, "Proxy port")
+
+	proxyMetricsEnableCmd.Flags().String("host", "localhost", "Proxy host")
+	proxyMetricsEnableCmd.Flags().Int("port", 8000, "Proxy port")
 }
 
 // resolveProxyHost resolves the --remote flag to an actual IP address using Lambda API.
@@ -336,6 +458,12 @@ func runProxyStart(cmd *cobra.Command, args []string) {
 	if cmd.Flags().Changed("running-cost-factor") {
 		cfg.RunningCostFactor, _ = cmd.Flags().GetFloat64("running-cost-factor")
 	}
+	if cmd.Flags().Changed("capacity-gating") {
+		cfg.CapacityGatingEnabled, _ = cmd.Flags().GetBool("capacity-gating")
+	}
+	if cmd.Flags().Changed("max-running-per-server") {
+		cfg.MaxRunningPerServer, _ = cmd.Flags().GetInt("max-running-per-server")
+	}
 	if cmd.Flags().Changed("metrics-interval") {
 		cfg.MetricsPollInterval, _ = cmd.Flags().GetDuration("metrics-interval")
 	}
@@ -415,6 +543,10 @@ func runProxyStart(cmd *cobra.Command, args []string) {
 	fmt.Printf("  Max queue:            %d\n", cfg.MaxQueueSize)
 	fmt.Printf("  ms_per_token:         %.4f\n", cfg.MsPerToken)
 	fmt.Printf("  running_cost_factor:  %.2f\n", cfg.RunningCostFactor)
+	fmt.Printf("  Capacity gating:      %v\n", cfg.CapacityGatingEnabled)
+	if cfg.CapacityGatingEnabled {
+		fmt.Printf("  Max running/server:   %d (EXACT queue tracking!)\n", cfg.MaxRunningPerServer)
+	}
 	fmt.Printf("  Metrics interval:     %v\n", cfg.MetricsPollInterval)
 	fmt.Printf("  Latency interval:     %v\n", cfg.LatencyProbeInterval)
 	fmt.Printf("  PID file:             %s\n", pidFile)
@@ -702,6 +834,43 @@ func runProxyLatency(cmd *cobra.Command, args []string) {
 	}
 }
 
+func runProxyPrefixStats(cmd *cobra.Command, args []string) {
+	host, port := resolveProxyHost(cmd)
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	statsURL := fmt.Sprintf("http://%s:%d/proxy/prefix/stats", host, port)
+
+	resp, err := client.Get(statsURL)
+	if err != nil {
+		fmt.Printf("Failed to connect: %v\n", err)
+		os.Exit(1)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body := make([]byte, 1024)
+		n, _ := resp.Body.Read(body)
+		fmt.Printf("Failed to fetch prefix stats: %s\n", string(body[:n]))
+		os.Exit(1)
+	}
+
+	var stats map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&stats); err != nil {
+		fmt.Printf("Failed to parse response: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Println("Prefix Tree Stats:")
+	fmt.Printf("  Nodes:               %v\n", stats["nodes"])
+	fmt.Printf("  Leaves:              %v\n", stats["leaves"])
+	fmt.Printf("  Max depth:           %v\n", stats["max_depth"])
+	fmt.Printf("  Avg depth:           %.2f\n", stats["avg_depth"])
+	fmt.Printf("  Avg branching:       %.2f\n", stats["avg_branching"])
+	fmt.Printf("  Avg prefix length:   %.2f\n", stats["avg_prefix_len"])
+	fmt.Printf("  Total server refs:   %v\n", stats["total_server_refs"])
+	fmt.Printf("  Unique servers:      %v\n", stats["unique_server_count"])
+}
+
 func runProxyDeploy(cmd *cobra.Command, args []string) {
 	instanceName := args[0]
 	listenPort, _ := cmd.Flags().GetInt("listen-port")
@@ -746,39 +915,63 @@ func runProxyDeploy(cmd *cobra.Command, args []string) {
 		log.Fatalf("Failed to get SSH key: %v", err)
 	}
 
-	// Step 4: Upload binary using SCP
+	// Step 4: Upload binary using the same method as cluster upload (confirmed working)
 	fmt.Printf("\nUploading binary to %s...\n", proxyInstance.Name)
-	scpCmd := exec.Command("scp", "-i", keyFile, "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
-		binaryPath, fmt.Sprintf("ubuntu@%s:/home/ubuntu/gotoni", proxyInstance.IP))
-	scpCmd.Stdout = os.Stdout
-	scpCmd.Stderr = os.Stderr
-	if err := scpCmd.Run(); err != nil {
-		log.Fatalf("Failed to upload binary: %v", err)
-	}
-	fmt.Println("Upload complete")
 
-	// Step 5: Connect via SSH and start proxy
-	fmt.Printf("\nConnecting to %s...\n", proxyInstance.Name)
 	manager := remote.NewSSHClientManager()
 	if err := manager.ConnectToInstance(proxyInstance.IP, keyFile); err != nil {
 		log.Fatalf("Failed to connect: %v", err)
 	}
 	defer manager.CloseAllConnections()
 
-	// Kill any existing gotoni process
-	// Use base64 encoding to avoid self-matching
-	fmt.Println("Stopping any existing gotoni process...")
-	killScript := `#!/bin/bash
-for pid in $(pgrep -f "gotoni" 2>/dev/null | head -10); do kill -9 $pid 2>/dev/null || true; done
-exit 0
-`
-	encodedKill := base64.StdEncoding.EncodeToString([]byte(killScript))
-	manager.ExecuteCommand(proxyInstance.IP, fmt.Sprintf("echo %s | base64 -d | bash", encodedKill))
+	// Stop running processes and delete old binary before uploading (like cluster upload does)
+	cleanupScript := fmt.Sprintf(`#!/bin/bash
+# Kill tmux sessions
+tmux kill-session -t gotoni-proxy 2>/dev/null || true
+tmux kill-session -t gotoni-lb 2>/dev/null || true
+tmux kill-session -t gotoni-start_gotoni_load_balancer 2>/dev/null || true
+
+# Kill any gotoni processes
+for pid in $(pgrep -f "gotoni" 2>/dev/null | head -20); do kill -9 $pid 2>/dev/null || true; done
+
+# Kill anything listening on port %d (the proxy port)
+fuser -k %d/tcp 2>/dev/null || true
+
+# Remove old binary
+rm -f /home/ubuntu/gotoni
+
+echo "Cleanup complete"
+`, listenPort, listenPort)
+	encodedCleanup := base64.StdEncoding.EncodeToString([]byte(cleanupScript))
+	manager.ExecuteCommand(proxyInstance.IP, fmt.Sprintf("echo %s | base64 -d | bash", encodedCleanup))
+
+	// SCP upload (same as cluster upload)
+	scpCmd := exec.Command("scp",
+		"-i", keyFile,
+		"-o", "StrictHostKeyChecking=no",
+		"-o", "UserKnownHostsFile=/dev/null",
+		binaryPath,
+		fmt.Sprintf("ubuntu@%s:/home/ubuntu/gotoni", proxyInstance.IP),
+	)
+	scpCmd.Stdout = os.Stdout
+	scpCmd.Stderr = os.Stderr
+	if err := scpCmd.Run(); err != nil {
+		log.Fatalf("Failed to upload binary: %v", err)
+	}
+
+	// Verify upload and make executable
+	output, err := manager.ExecuteCommand(proxyInstance.IP, "ls -lh /home/ubuntu/gotoni && chmod +x /home/ubuntu/gotoni")
+	if err != nil {
+		log.Fatalf("Failed to verify upload: %v", err)
+	}
+	fmt.Printf("Upload complete: %s\n", output)
+
+	// Step 5: Start proxy (reuse the same SSH connection)
+	fmt.Println("\nStarting proxy...")
 	time.Sleep(1 * time.Second)
 
-	// Make binary executable and start proxy
-	fmt.Println("Starting proxy...")
-	startCmd := fmt.Sprintf("chmod +x ~/gotoni && nohup ~/gotoni proxy start --listen-port %d --ms-per-token %.4f --running-cost-factor %.2f > /tmp/proxy.log 2>&1 &",
+	// Start proxy (binary already executable from earlier step)
+	startCmd := fmt.Sprintf("nohup /home/ubuntu/gotoni proxy start --listen-port %d --ms-per-token %.4f --running-cost-factor %.2f > /tmp/proxy.log 2>&1 &",
 		listenPort, msPerToken, runningCostFactor)
 	if _, err := manager.ExecuteCommand(proxyInstance.IP, startCmd); err != nil {
 		log.Fatalf("Failed to start proxy: %v", err)
@@ -851,4 +1044,161 @@ exit 0
 
 	fmt.Printf("\nProxy endpoint: http://%s:%d\n", proxyInstance.IP, listenPort)
 	fmt.Printf("Use: gotoni proxy status --remote %s\n", instanceName)
+}
+
+func runProxyMetricsExport(cmd *cobra.Command, args []string) {
+	host, _ := cmd.Flags().GetString("host")
+	port, _ := cmd.Flags().GetInt("port")
+
+	// Default output filename
+	outputFile := fmt.Sprintf("proxy_metrics_%s.csv", time.Now().Format("20060102_150405"))
+	if len(args) > 0 {
+		outputFile = args[0]
+	}
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	exportURL := fmt.Sprintf("http://%s:%d/proxy/metrics/export", host, port)
+
+	fmt.Printf("Downloading metrics from %s:%d...\n", host, port)
+	resp, err := client.Get(exportURL)
+	if err != nil {
+		fmt.Printf("Failed to connect: %v\n", err)
+		os.Exit(1)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body := make([]byte, 1024)
+		n, _ := resp.Body.Read(body)
+		fmt.Printf("Failed to export metrics: %s\n", string(body[:n]))
+		os.Exit(1)
+	}
+
+	// Write CSV to file
+	csvData, err := io.ReadAll(resp.Body)
+	if err != nil {
+		fmt.Printf("Failed to read response: %v\n", err)
+		os.Exit(1)
+	}
+
+	if err := os.WriteFile(outputFile, csvData, 0644); err != nil {
+		fmt.Printf("Failed to write file: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("✅ Exported metrics to %s\n", outputFile)
+
+	// Count rows
+	lines := strings.Split(string(csvData), "\n")
+	rowCount := len(lines) - 2 // subtract header and trailing newline
+	if rowCount < 0 {
+		rowCount = 0
+	}
+	fmt.Printf("   %d requests\n", rowCount)
+}
+
+func runProxyMetricsSummary(cmd *cobra.Command, args []string) {
+	host, _ := cmd.Flags().GetString("host")
+	port, _ := cmd.Flags().GetInt("port")
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	summaryURL := fmt.Sprintf("http://%s:%d/proxy/metrics/summary", host, port)
+
+	resp, err := client.Get(summaryURL)
+	if err != nil {
+		fmt.Printf("Failed to connect: %v\n", err)
+		os.Exit(1)
+	}
+	defer resp.Body.Close()
+
+	var summary map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&summary); err != nil {
+		fmt.Printf("Failed to parse response: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Println("Metrics Summary:")
+	fmt.Printf("  Collection enabled:   %v\n", summary["metrics_collection_enabled"])
+	fmt.Printf("  Requests tracked:     %v\n", summary["count"])
+	fmt.Printf("  Success:              %v\n", summary["success_count"])
+	fmt.Printf("  Failed:               %v\n", summary["fail_count"])
+
+	if summary["count"] != nil && summary["count"].(float64) > 0 {
+		fmt.Printf("\nAverage Latencies:\n")
+		fmt.Printf("  Network:              %.2f ms\n", summary["avg_network_latency_ms"])
+		fmt.Printf("  TTFT:                 %.2f ms\n", summary["avg_ttft_ms"])
+		fmt.Printf("  Total:                %.2f ms\n", summary["avg_total_latency_ms"])
+
+		if hitRatios, ok := summary["avg_prefix_cache_hit_ratios"].(map[string]interface{}); ok && len(hitRatios) > 0 {
+			fmt.Printf("\nAverage Prefix Cache Hit Ratios:\n")
+			for serverID, ratio := range hitRatios {
+				fmt.Printf("  %-20s %.2f%% \n", serverID+":", ratio.(float64)*100)
+			}
+		}
+	}
+}
+
+func runProxyMetricsClear(cmd *cobra.Command, args []string) {
+	host, _ := cmd.Flags().GetString("host")
+	port, _ := cmd.Flags().GetInt("port")
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	clearURL := fmt.Sprintf("http://%s:%d/proxy/metrics/clear", host, port)
+
+	resp, err := client.Post(clearURL, "application/json", nil)
+	if err != nil {
+		fmt.Printf("Failed to connect: %v\n", err)
+		os.Exit(1)
+	}
+	defer resp.Body.Close()
+
+	var result map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		fmt.Printf("Failed to parse response: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("✅ Cleared %v metrics\n", result["cleared"])
+}
+
+func runProxyMetricsEnable(cmd *cobra.Command, args []string) {
+	host, _ := cmd.Flags().GetString("host")
+	port, _ := cmd.Flags().GetInt("port")
+	enabled := args[0] == "true"
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	enableURL := fmt.Sprintf("http://%s:%d/proxy/metrics/enable", host, port)
+
+	body := fmt.Sprintf(`{"enabled": %v}`, enabled)
+	resp, err := client.Post(enableURL, "application/json", strings.NewReader(body))
+	if err != nil {
+		fmt.Printf("Failed to connect: %v\n", err)
+		os.Exit(1)
+	}
+	defer resp.Body.Close()
+
+	var result map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		fmt.Printf("Failed to parse response: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Check if enabled field exists and is a boolean
+	enabledVal, ok := result["enabled"]
+	if !ok {
+		fmt.Printf("Unexpected response format: %v\n", result)
+		os.Exit(1)
+	}
+
+	enabledBool, ok := enabledVal.(bool)
+	if !ok {
+		fmt.Printf("Unexpected type for 'enabled' field: %T\n", enabledVal)
+		os.Exit(1)
+	}
+
+	if enabledBool {
+		fmt.Println("✅ Metrics collection enabled")
+	} else {
+		fmt.Println("✅ Metrics collection disabled")
+	}
 }
