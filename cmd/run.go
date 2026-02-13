@@ -6,6 +6,7 @@ package cmd
 import (
 	"fmt"
 	"log"
+	"os"
 	"strings"
 
 	"github.com/atoniolo76/gotoni/pkg/remote"
@@ -38,16 +39,31 @@ Examples:
 		if apiToken == "" {
 			if provider == "orgo" {
 				apiToken = remote.GetAPITokenForProvider(remote.CloudProviderOrgo)
+			} else if provider == "modal" {
+				apiToken = os.Getenv("MODAL_TOKEN_ID")
 			} else {
 				apiToken = remote.GetAPITokenForProvider(remote.CloudProviderLambda)
 			}
 			if apiToken == "" {
 				if provider == "orgo" {
 					log.Fatal("API token not provided via --api-token flag or ORGO_API_KEY environment variable")
+				} else if provider == "modal" {
+					log.Fatal("API token not provided via --api-token flag or MODAL_TOKEN_ID environment variable")
 				} else {
 					log.Fatal("API token not provided via --api-token flag or LAMBDA_API_KEY environment variable")
 				}
 			}
+		}
+
+		// Create provider based on flag
+		var cloudProvider remote.CloudProvider
+		switch provider {
+		case "modal":
+			cloudProvider = remote.NewModalProvider()
+		case "orgo":
+			cloudProvider = remote.NewOrgoProvider()
+		default:
+			cloudProvider = remote.NewLambdaProvider()
 		}
 
 		var instanceID string
@@ -59,7 +75,7 @@ Examples:
 			// Only command provided, use first running instance/computer
 			command = args[0]
 			httpClient := remote.NewHTTPClient()
-			runningInstances, err := remote.ListRunningInstances(httpClient, apiToken)
+			runningInstances, err := cloudProvider.ListRunningInstances(httpClient, apiToken)
 			if err != nil {
 				log.Fatalf("Failed to list running instances: %v", err)
 			}
@@ -67,14 +83,18 @@ Examples:
 				resourceType := "instances"
 				if provider == "orgo" {
 					resourceType = "computers"
+				} else if provider == "modal" {
+					resourceType = "sandboxes"
 				}
-				log.Fatalf("No running %s found. Please provide an instance/computer name or launch one first.", resourceType)
+				log.Fatalf("No running %s found. Please provide an instance/computer/sandbox name or launch one first.", resourceType)
 			}
 			instanceID = runningInstances[0].ID
 			instanceName = runningInstances[0].Name
 			resourceType := "instance"
 			if provider == "orgo" {
 				resourceType = "computer"
+			} else if provider == "modal" {
+				resourceType = "sandbox"
 			}
 			fmt.Printf("Using %s: %s\n", resourceType, instanceName)
 		} else {
@@ -84,27 +104,41 @@ Examples:
 
 			// Resolve instance/computer name/ID to instance details
 			httpClient := remote.NewHTTPClient()
-			instanceDetails, err := remote.ResolveInstance(httpClient, apiToken, instanceName)
+			instanceDetails, err := cloudProvider.GetInstance(httpClient, apiToken, instanceName)
 			if err != nil {
-				resourceType := "instance"
-				if provider == "orgo" {
-					resourceType = "computer"
+				// Try listing to find by name
+				instances, listErr := cloudProvider.ListRunningInstances(httpClient, apiToken)
+				if listErr == nil {
+					for _, inst := range instances {
+						if inst.Name == instanceName || inst.ID == instanceName {
+							instanceDetails = &inst
+							break
+						}
+					}
 				}
-				log.Fatalf("Failed to resolve %s '%s': %v", resourceType, instanceName, err)
+				if instanceDetails == nil {
+					resourceType := "instance"
+					if provider == "orgo" {
+						resourceType = "computer"
+					} else if provider == "modal" {
+						resourceType = "sandbox"
+					}
+					log.Fatalf("Failed to resolve %s '%s': %v", resourceType, instanceName, err)
+				}
 			}
 			instanceID = instanceDetails.ID
 		}
 
 		// Execute command based on provider
-		if provider == "orgo" {
-			// Use Orgo API for command execution
-			fmt.Printf("Executing on Orgo computer %s: %s\n\n", instanceName, command)
+		if provider == "orgo" || provider == "modal" {
+			// Use provider's ExecuteBashCommand
+			resourceType := "computer"
+			if provider == "modal" {
+				resourceType = "sandbox"
+			}
+			fmt.Printf("Executing on %s %s: %s\n\n", provider, resourceType, instanceName)
 
-			// Create Orgo provider instance
-			orgoProvider := remote.NewOrgoProvider()
-
-			// Execute command using Orgo API
-			output, err := orgoProvider.ExecuteBashCommand(instanceID, command)
+			output, err := cloudProvider.ExecuteBashCommand(instanceID, command)
 			if err != nil {
 				log.Fatalf("Command failed: %v", err)
 			}
@@ -152,6 +186,6 @@ Examples:
 
 func init() {
 	rootCmd.AddCommand(runCmd)
-	runCmd.Flags().StringP("provider", "p", "lambda", "Cloud provider to use (lambda or orgo)")
-	runCmd.Flags().StringP("api-token", "a", "", "API token for cloud provider (can also be set via LAMBDA_API_KEY or ORGO_API_KEY env var)")
+	runCmd.Flags().StringP("provider", "p", "lambda", "Cloud provider to use (lambda, orgo, or modal)")
+	runCmd.Flags().StringP("api-token", "a", "", "API token for cloud provider (can also be set via LAMBDA_API_KEY, ORGO_API_KEY, or MODAL_TOKEN_ID env vars)")
 }

@@ -6,6 +6,7 @@ package cmd
 import (
 	"fmt"
 	"log"
+	"os"
 	"strings"
 	"time"
 
@@ -102,13 +103,18 @@ Examples:
 		if apiToken == "" {
 			if provider == "orgo" {
 				apiToken = remote.GetAPITokenForProvider(remote.CloudProviderOrgo)
+				if apiToken == "" {
+					log.Fatal("API token not provided via --api-token flag or ORGO_API_KEY environment variable")
+				}
+			} else if provider == "modal" {
+				apiToken = os.Getenv("MODAL_TOKEN_ID")
+				secret := os.Getenv("MODAL_TOKEN_SECRET")
+				if apiToken == "" || secret == "" {
+					log.Fatal("API token not provided via --api-token flag or MODAL_TOKEN_ID and MODAL_TOKEN_SECRET environment variables")
+				}
 			} else {
 				apiToken = remote.GetAPITokenForProvider(remote.CloudProviderLambda)
-			}
-			if apiToken == "" {
-				if provider == "orgo" {
-					log.Fatal("API token not provided via --api-token flag or ORGO_API_KEY environment variable")
-				} else {
+				if apiToken == "" {
 					log.Fatal("API token not provided via --api-token flag or LAMBDA_API_KEY environment variable")
 				}
 			}
@@ -117,9 +123,26 @@ Examples:
 		// Create HTTP client
 		httpClient := remote.NewHTTPClient()
 
+		// Create provider based on flag
+		var cloudProvider remote.CloudProvider
+		switch provider {
+		case "modal":
+			cloudProvider = remote.NewModalProvider()
+		case "orgo":
+			cloudProvider = remote.NewOrgoProvider()
+		default:
+			cloudProvider = remote.NewLambdaProvider()
+		}
+
 		var launchedInstances []remote.LaunchedInstance
 		var launchErr error
 		var actualRegion = region
+
+		// For Modal provider, skip availability polling and launch directly
+		if wait && provider == "modal" {
+			fmt.Printf("Launching Modal sandbox (availability check skipped for Modal)...\n")
+			goto launchInstance
+		}
 
 		if wait {
 			// Wait for instance type to become available, then launch
@@ -233,36 +256,48 @@ Examples:
 			}
 		} else if filesystemName != "" && provider == "orgo" {
 			fmt.Println("Warning: Orgo provider does not support filesystems. Ignoring --filesystem flag.")
+		} else if filesystemName != "" && provider == "modal" {
+			fmt.Println("Note: Modal provider uses Volumes instead of filesystems. Use --volume flag for Modal.")
 		}
 
 		fmt.Printf("\nLaunching instance...\n")
 		if provider == "orgo" {
 			// Orgo provider - use project-based launch
-			launchedInstances, launchErr = remote.LaunchInstance(httpClient, apiToken, instanceType, actualRegion, 1, instanceName, "", filesystemName)
+			launchedInstances, launchErr = cloudProvider.LaunchInstance(httpClient, apiToken, instanceType, actualRegion, 1, instanceName, "", filesystemName)
 			if launchErr == nil && wait {
 				// For Orgo, wait for the computer to be ready
 				if len(launchedInstances) > 0 {
 					fmt.Printf("Waiting for Orgo computer to be ready...\n")
-					launchErr = remote.WaitForInstanceReady(httpClient, apiToken, launchedInstances[0].ID, waitTimeout)
+					launchErr = cloudProvider.WaitForInstanceReady(httpClient, apiToken, launchedInstances[0].ID, waitTimeout)
 					if launchErr == nil {
 						fmt.Printf("Orgo computer is ready!\n")
 					}
 				}
 			}
+		} else if provider == "modal" {
+			// Modal provider - use Modal Sandboxes
+			if wait {
+				launchedInstances, launchErr = cloudProvider.LaunchAndWait(httpClient, apiToken, instanceType, actualRegion, 1, instanceName, "", waitTimeout, filesystemName)
+			} else {
+				launchedInstances, launchErr = cloudProvider.LaunchInstance(httpClient, apiToken, instanceType, actualRegion, 1, instanceName, "", filesystemName)
+			}
+			if launchErr == nil {
+				fmt.Printf("Modal Sandbox launched: %s\n", launchedInstances[0].ID)
+			}
 		} else {
 			// Lambda provider - use region-based launch
 			if wait {
 				// Launch and wait for instances to be ready
-				launchedInstances, launchErr = remote.LaunchAndWait(httpClient, apiToken, instanceType, actualRegion, 1, instanceName, "", waitTimeout, filesystemName)
+				launchedInstances, launchErr = cloudProvider.LaunchAndWait(httpClient, apiToken, instanceType, actualRegion, 1, instanceName, "", waitTimeout, filesystemName)
 			} else {
 				// Launch the instance (this creates SSH key and saves to config)
-				launchedInstances, launchErr = remote.LaunchInstance(httpClient, apiToken, instanceType, actualRegion, 1, instanceName, "", filesystemName)
+				launchedInstances, launchErr = cloudProvider.LaunchInstance(httpClient, apiToken, instanceType, actualRegion, 1, instanceName, "", filesystemName)
 				fmt.Println("Note: SSH config not updated because IP is not yet available. Use --wait flag to update SSH config automatically.")
 			}
 		}
 
 		// If successful and we waited, update SSH config (only for Lambda)
-		if launchErr == nil && wait && provider != "orgo" {
+		if launchErr == nil && wait && provider != "orgo" && provider != "modal" {
 			for _, instance := range launchedInstances {
 				// Get instance details to get IP
 				details, err := remote.GetInstance(httpClient, apiToken, instance.ID)
@@ -305,24 +340,33 @@ Examples:
 
 		// Print instance info with SSH access details
 		for _, instance := range launchedInstances {
-			fmt.Printf("Launched instance: %s\n", instance.ID)
-			fmt.Printf("SSH Key: %s\n", instance.SSHKeyName)
-			fmt.Printf("SSH Key File: %s\n", instance.SSHKeyFile)
-
-			if wait {
-				fmt.Printf("\nInstance is ready!\n")
-				fmt.Printf("Connect via SSH: ssh %s\n", instanceName)
-				fmt.Printf("Open in VS Code: gotoni open %s\n", instanceName)
+			if provider == "modal" {
+				fmt.Printf("Modal Sandbox: %s\n", instance.ID)
+				fmt.Printf("Name: %s\n", instanceName)
+				if wait {
+					fmt.Printf("\nSandbox is ready!\n")
+					fmt.Printf("Execute commands with: gotoni run %s\n", instance.ID)
+				}
 			} else {
-				fmt.Printf("\nInstance is launching (SSH config not updated yet)\n")
-				fmt.Printf("Connect with: ssh -i %s ubuntu@<instance-ip>\n", instance.SSHKeyFile)
-				fmt.Printf("Or use: gotoni connect <instance-ip>\n")
+				fmt.Printf("Launched instance: %s\n", instance.ID)
+				fmt.Printf("SSH Key: %s\n", instance.SSHKeyName)
+				fmt.Printf("SSH Key File: %s\n", instance.SSHKeyFile)
+
+				if wait {
+					fmt.Printf("\nInstance is ready!\n")
+					fmt.Printf("Connect via SSH: ssh %s\n", instanceName)
+					fmt.Printf("Open in VS Code: gotoni open %s\n", instanceName)
+				} else {
+					fmt.Printf("\nInstance is launching (SSH config not updated yet)\n")
+					fmt.Printf("Connect with: ssh -i %s ubuntu@<instance-ip>\n", instance.SSHKeyFile)
+					fmt.Printf("Or use: gotoni connect <instance-ip>\n")
+				}
 			}
 			fmt.Println()
 		}
 
 		// Execute tasks if specified (only for Lambda provider)
-		if len(taskNames) > 0 && wait && provider != "orgo" {
+		if len(taskNames) > 0 && wait && provider != "orgo" && provider != "modal" {
 			if len(launchedInstances) == 0 {
 				log.Fatal("No instances launched, cannot execute tasks")
 			}
@@ -378,12 +422,14 @@ Examples:
 			}
 
 			fmt.Printf("\n✓ All tasks completed successfully!\n")
-		} else if len(taskNames) > 0 && (!wait || provider == "orgo") {
+		} else if len(taskNames) > 0 && (!wait || provider == "orgo" || provider == "modal") {
 			if !wait {
 				fmt.Println("\nWarning: Tasks specified but --wait flag not set. Tasks will not be executed.")
 				fmt.Println("Use --wait flag to execute tasks after instance is ready.")
 			} else if provider == "orgo" {
 				fmt.Println("\nWarning: Task execution not supported for Orgo provider. Tasks will be skipped.")
+			} else if provider == "modal" {
+				fmt.Println("\nWarning: Task execution not supported for Modal provider. Tasks will be skipped.")
 			}
 		}
 	},
@@ -407,15 +453,16 @@ func init() {
 	}
 
 	// Extract region keys from the map
-	launchCmd.Flags().StringP("provider", "p", "lambda", "Cloud provider to use (lambda or orgo)")
+	launchCmd.Flags().StringP("provider", "p", "lambda", "Cloud provider to use (lambda, orgo, or modal)")
 
-	launchCmd.Flags().StringP("api-token", "a", "", "API token for cloud provider (can also be set via LAMBDA_API_KEY or ORGO_API_KEY env var)")
+	launchCmd.Flags().StringP("api-token", "a", "", "API token for cloud provider (can also be set via LAMBDA_API_KEY, ORGO_API_KEY, or MODAL_TOKEN_ID/MODAL_TOKEN_SECRET env vars)")
 
-	launchCmd.Flags().StringP("region", "r", "", "Region (Lambda) or Project (Orgo) to launch the instance in")
+	launchCmd.Flags().StringP("region", "r", "", "Region (Lambda/Modal) or Project (Orgo) to launch the instance in")
 
 	launchCmd.Flags().StringP("instance-type", "t", "", `choose the instance type to launch.
 For Lambda: `+strings.Join(instanceOptions, ", ")+`
 For Orgo: 2gb, 4gb, 8gb (RAM-based instance types)
+For Modal: h100, a100, a10, t4, cpu
 	`)
 
 	launchCmd.Flags().BoolP("wait", "w", false, "Wait for instance type to become available before launching, then wait for instance to be ready")

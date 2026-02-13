@@ -355,6 +355,12 @@ func (d *DB) ListFilesystems() ([]Filesystem, error) {
 	return filesystems, nil
 }
 
+// DeleteFilesystem deletes a filesystem by name
+func (d *DB) DeleteFilesystem(name string) error {
+	_, err := d.Exec("DELETE FROM filesystems WHERE name = ?", name)
+	return err
+}
+
 // SaveTask saves a task
 func (d *DB) SaveTask(task *Task) error {
 	query := `INSERT INTO tasks (name, type, command, background, working_dir, env, depends_on, when_condition, restart, restart_sec) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`

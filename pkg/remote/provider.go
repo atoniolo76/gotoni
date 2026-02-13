@@ -47,6 +47,7 @@ type CloudProviderType string
 const (
 	CloudProviderLambda CloudProviderType = "lambda"
 	CloudProviderOrgo   CloudProviderType = "orgo"
+	CloudProviderModal  CloudProviderType = "modal"
 )
 
 // GetCloudProvider returns the appropriate cloud provider based on the GOTONI_CLOUD environment variable
@@ -57,6 +58,8 @@ func GetCloudProvider() (CloudProvider, CloudProviderType) {
 		return NewLambdaProvider(), CloudProviderLambda
 	case CloudProviderOrgo:
 		return NewOrgoProvider(), CloudProviderOrgo
+	case CloudProviderModal:
+		return NewModalProvider(), CloudProviderModal
 	default:
 		return NewLambdaProvider(), CloudProviderLambda
 	}
@@ -84,6 +87,8 @@ func GetAPITokenForProvider(providerType CloudProviderType) string {
 		return os.Getenv("LAMBDA_API_KEY")
 	case CloudProviderOrgo:
 		return os.Getenv("ORGO_API_KEY")
+	case CloudProviderModal:
+		return os.Getenv("MODAL_TOKEN_ID")
 	default:
 		return os.Getenv("LAMBDA_API_KEY")
 	}

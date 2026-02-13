@@ -6,6 +6,7 @@ package cmd
 import (
 	"fmt"
 	"log"
+	"os"
 	"strings"
 
 	"github.com/atoniolo76/gotoni/pkg/remote"
@@ -33,12 +34,16 @@ var deleteCmd = &cobra.Command{
 		if apiToken == "" {
 			if provider == "orgo" {
 				apiToken = remote.GetAPITokenForProvider(remote.CloudProviderOrgo)
+			} else if provider == "modal" {
+				apiToken = os.Getenv("MODAL_TOKEN_ID")
 			} else {
 				apiToken = remote.GetAPITokenForProvider(remote.CloudProviderLambda)
 			}
 			if apiToken == "" {
 				if provider == "orgo" {
 					log.Fatal("API token not provided via --api-token flag or ORGO_API_KEY environment variable")
+				} else if provider == "modal" {
+					log.Fatal("API token not provided via --api-token flag or MODAL_TOKEN_ID environment variable")
 				} else {
 					log.Fatal("API token not provided via --api-token flag or LAMBDA_API_KEY environment variable")
 				}
@@ -67,30 +72,57 @@ var deleteCmd = &cobra.Command{
 		// Create HTTP client
 		httpClient := remote.NewHTTPClient()
 
+		// Create provider based on flag
+		var cloudProvider remote.CloudProvider
+		switch provider {
+		case "modal":
+			cloudProvider = remote.NewModalProvider()
+		case "orgo":
+			cloudProvider = remote.NewOrgoProvider()
+		default:
+			cloudProvider = remote.NewLambdaProvider()
+		}
+
 		// Resolve instance names to IDs
 		var instanceIDs []string
 		for _, name := range instanceNames {
-			instance, err := remote.ResolveInstance(httpClient, apiToken, name)
+			instance, err := cloudProvider.GetInstance(httpClient, apiToken, name)
 			if err != nil {
-				log.Fatalf("Failed to resolve instance '%s': %v", name, err)
+				// Try listing to see if it exists
+				instances, listErr := cloudProvider.ListRunningInstances(httpClient, apiToken)
+				if listErr == nil {
+					for _, inst := range instances {
+						if inst.Name == name || inst.ID == name {
+							instanceIDs = append(instanceIDs, inst.ID)
+							instance = &inst
+							break
+						}
+					}
+				}
+				if instance == nil || len(instanceIDs) == 0 {
+					log.Fatalf("Failed to resolve instance '%s': %v", name, err)
+				}
+			} else {
+				instanceIDs = append(instanceIDs, instance.ID)
 			}
-			instanceIDs = append(instanceIDs, instance.ID)
 		}
 
 		resourceType := "instance"
 		if provider == "orgo" {
 			resourceType = "computer"
+		} else if provider == "modal" {
+			resourceType = "sandbox"
 		}
 
 		fmt.Printf("Terminating %s(s): %s\n", resourceType, strings.Join(instanceNames, ", "))
 
-		terminatedResponse, err := remote.TerminateInstance(httpClient, apiToken, instanceIDs)
+		terminatedResponse, err := cloudProvider.TerminateInstance(httpClient, apiToken, instanceIDs)
 		if err != nil {
 			log.Fatalf("Error terminating %s: %v", resourceType, err)
 		}
 
 		// Remove terminated instances from config (only for Lambda)
-		if provider != "orgo" {
+		if provider != "orgo" && provider != "modal" {
 			// Remove all requested instance IDs, not just the ones in the response
 			// (in case some were already terminated or not returned by API)
 			for _, instanceID := range instanceIDs {
@@ -113,7 +145,7 @@ func init() {
 	rootCmd.AddCommand(deleteCmd)
 
 	// Here you will define your flags and configuration settings.
-	deleteCmd.Flags().StringP("provider", "p", "lambda", "Cloud provider to use (lambda or orgo)")
-	deleteCmd.Flags().StringP("api-token", "a", "", "API token for cloud provider (can also be set via LAMBDA_API_KEY or ORGO_API_KEY env var)")
-	deleteCmd.Flags().StringSliceP("instance-names", "i", []string{}, "Instance/computer names to terminate (can also be provided as arguments)")
+	deleteCmd.Flags().StringP("provider", "p", "lambda", "Cloud provider to use (lambda, orgo, or modal)")
+	deleteCmd.Flags().StringP("api-token", "a", "", "API token for cloud provider (can also be set via LAMBDA_API_KEY, ORGO_API_KEY, or MODAL_TOKEN_ID env vars)")
+	deleteCmd.Flags().StringSliceP("instance-names", "i", []string{}, "Instance/computer/sandbox names to terminate (can also be provided as arguments)")
 }

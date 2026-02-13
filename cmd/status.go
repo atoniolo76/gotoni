@@ -17,8 +17,19 @@ var statusCmd = &cobra.Command{
 	Use:   "status [instance-name]",
 	Short: "Check status of services running on an instance",
 	Long: `Check the status of systemd user services running on a remote instance.
-Shows all active services and their status.`,
+Shows all active services and their status.
+
+Note: This command requires SSH access and does not work with Modal provider.`,
 	Run: func(cmd *cobra.Command, args []string) {
+		provider, err := cmd.Flags().GetString("provider")
+		if err != nil {
+			log.Fatalf("Error getting provider: %v", err)
+		}
+
+		if provider == "modal" {
+			log.Fatal("Status command is not supported for Modal provider. Use 'gotoni list' to see sandbox status.")
+		}
+
 		apiToken, err := cmd.Flags().GetString("api-token")
 		if err != nil {
 			log.Fatalf("Error getting API token: %v", err)
@@ -106,5 +117,6 @@ Shows all active services and their status.`,
 
 func init() {
 	rootCmd.AddCommand(statusCmd)
+	statusCmd.Flags().StringP("provider", "p", "lambda", "Cloud provider to use (lambda, orgo, or modal)")
 	statusCmd.Flags().StringP("api-token", "a", "", "API token for cloud provider (can also be set via LAMBDA_API_KEY env var)")
 }

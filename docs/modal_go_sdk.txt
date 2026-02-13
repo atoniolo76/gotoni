@@ -1,0 +1,1344 @@
+Modal Go SDK
+
+Build Status Go Reference Documentation
+
+The Modal Go SDK provides convenient, on-demand access to serverless cloud compute on Modal from golang projects. Use it to safely run arbitrary code in Modal Sandboxes, call Modal Functions, and interact with Modal resources.
+
+We're approaching feature parity with the main Modal Python SDK, although defining Modal Functions will likely remain exclusive to Python.
+
+Installation
+
+Install the latest version:
+
+go get -u github.com/modal-labs/libmodal/modal-go
+Import in your application:
+
+import "github.com/modal-labs/libmodal/modal-go"
+Go package: https://pkg.go.dev/github.com/modal-labs/libmodal/modal-go
+
+Authenticating with Modal
+
+You also need to authenticate with Modal (see Getting started). Either sign in with the Modal CLI using pip install modal && modal setup, or in machine environments set these environment variables:
+
+# Replace these with your actual token!
+export MODAL_TOKEN_ID=ak-NOTAREALTOKENSTRINGXYZ
+export MODAL_TOKEN_SECRET=as-FAKESECRETSTRINGABCDEF
+Telemetry and Observability
+
+The Modal Go SDK supports custom gRPC interceptors for telemetry, tracing, and observability. You can add custom unary and stream interceptors to measure API call latency, trace requests, and integrate with observability tools like OpenTelemetry, DataDog, and others. See the telemetry example for more details.
+
+Requirements
+
+Go 1.23 or later.
+
+Documentation
+
+See the main Modal documentation and user guides for high-level overviews. For details, see the API reference documentation for for Go.
+
+We also provide a number of examples:
+
+Call a deployed Function
+Spawn a deployed Function
+Call a deployed Cls
+Call a deployed Cls, and override its options
+Create a Sandbox
+Create a named Sandbox
+Create a Sandbox with GPU
+Create a Sandbox using a private image from AWS ECR
+Take a snapshot of the filesystem of a Sandbox
+Execute Sandbox commands
+Running a coding agent in a Sandbox
+Check the status and exit code of a Sandbox
+Access Sandbox filesystem
+Expose ports on a Sandbox using Tunnels
+Create connect tokens for a Sandbox
+Include Secrets in Sandbox
+Mount a Volume to a Sandbox, and same but with an ephemeral Volume
+Mount a cloud bucket to a Sandbox
+Eagerly build an Image for a Sandbox
+Building custom Images
+Add telemetry and tracing with custom interceptors
+Support
+
+For usage questions and other support, please reach out on the Modal Community Slack.
+
+Collapse ▴
+ Documentation ¶
+Overview ¶
+Configuration
+Package modal is a lightweight, idiomatic Go SDK for Modal.com.
+
+It mirrors the core feature-set of Modal’s Python SDK while feeling natural in Go:
+
+Spin up Sandboxes — fast, secure, ephemeral VMs for running code.
+Invoke Modal Functions and manage their inputs / outputs.
+Read, write, and list files in Modal Volumes.
+Create or inspect containers, streams, and logs.
+**What it does not do:** deploying Modal Functions. Deployment is still handled in Python; this package is for calling and orchestrating them from other projects.
+
+Configuration ¶
+The config file path can be customized via `MODAL_CONFIG_PATH` (defaults to `~/.modal.toml`).
+
+## Authentication
+
+At runtime the SDK resolves credentials in this order:
+
+Environment variables MODAL_TOKEN_ID, MODAL_TOKEN_SECRET, MODAL_ENVIRONMENT (optional)
+A profile explicitly requested via `MODAL_PROFILE`
+A profile marked `active = true` in `~/.modal.toml`
+## Logging
+
+The SDK logging level can be controlled in multiple ways (in order of precedence):
+
+`MODAL_LOGLEVEL` environment variable
+`loglevel` field in the active profile in `~/.modal.toml`
+Defaults to WARN
+Supported values are DEBUG, INFO, WARN, and ERROR (case-insensitive).
+
+Logs are written to stderr.
+
+For additional examples and language-parity tests, see https://github.com/modal-labs/libmodal/tree/main/modal-go.
+
+Index ¶
+Constants
+type AlreadyExistsError
+func (e AlreadyExistsError) Error() string
+type App
+type AppFromNameParams
+type AppService
+type AuthTokenManager
+func NewAuthTokenManager(client pb.ModalClientClient, logger *slog.Logger) *AuthTokenManager
+func (m *AuthTokenManager) FetchToken(ctx context.Context) (string, error)
+func (m *AuthTokenManager) GetCurrentToken() string
+func (m *AuthTokenManager) GetToken(ctx context.Context) (string, error)
+func (m *AuthTokenManager) IsExpired() bool
+func (m *AuthTokenManager) SetToken(token string, expiry int64)
+func (m *AuthTokenManager) Start(ctx context.Context) error
+func (m *AuthTokenManager) Stop()
+type Client
+func NewClient() (*Client, error)
+func NewClientWithOptions(params *ClientParams) (*Client, error)
+func (c *Client) Close()
+func (c *Client) Version() string
+type ClientParams
+type CloudBucketMount
+type CloudBucketMountParams
+type CloudBucketMountService
+type Cls
+func (c *Cls) Instance(ctx context.Context, parameters map[string]any) (*ClsInstance, error)
+func (c *Cls) WithBatching(params *ClsWithBatchingParams) *Cls
+func (c *Cls) WithConcurrency(params *ClsWithConcurrencyParams) *Cls
+func (c *Cls) WithOptions(params *ClsWithOptionsParams) *Cls
+type ClsFromNameParams
+type ClsInstance
+func (c *ClsInstance) Method(name string) (*Function, error)
+type ClsService
+type ClsWithBatchingParams
+type ClsWithConcurrencyParams
+type ClsWithOptionsParams
+type ContainerProcess
+func (cp *ContainerProcess) Wait(ctx context.Context) (int, error)
+type ExecutionError
+func (e ExecutionError) Error() string
+type Function
+func (f *Function) GetCurrentStats(ctx context.Context) (*FunctionStats, error)
+func (f *Function) GetWebURL() string
+func (f *Function) Remote(ctx context.Context, args []any, kwargs map[string]any) (any, error)
+func (f *Function) Spawn(ctx context.Context, args []any, kwargs map[string]any) (*FunctionCall, error)
+func (f *Function) UpdateAutoscaler(ctx context.Context, params *FunctionUpdateAutoscalerParams) error
+type FunctionCall
+func (fc *FunctionCall) Cancel(ctx context.Context, params *FunctionCallCancelParams) error
+func (fc *FunctionCall) Get(ctx context.Context, params *FunctionCallGetParams) (any, error)
+type FunctionCallCancelParams
+type FunctionCallGetParams
+type FunctionCallService
+type FunctionFromNameParams
+type FunctionService
+type FunctionStats
+type FunctionTimeoutError
+func (e FunctionTimeoutError) Error() string
+type FunctionUpdateAutoscalerParams
+type Image
+func (image *Image) Build(ctx context.Context, app *App) (*Image, error)
+func (image *Image) DockerfileCommands(commands []string, params *ImageDockerfileCommandsParams) *Image
+type ImageDeleteParams
+type ImageDockerfileCommandsParams
+type ImageFromRegistryParams
+type ImageService
+type InternalFailure
+func (e InternalFailure) Error() string
+type InvalidError
+func (e InvalidError) Error() string
+type NotFoundError
+func (e NotFoundError) Error() string
+type Profile
+type Proxy
+type ProxyFromNameParams
+type ProxyService
+type Queue
+func (q *Queue) Clear(ctx context.Context, params *QueueClearParams) error
+func (q *Queue) CloseEphemeral()
+func (q *Queue) Get(ctx context.Context, params *QueueGetParams) (any, error)
+func (q *Queue) GetMany(ctx context.Context, n int, params *QueueGetManyParams) ([]any, error)
+func (q *Queue) Iterate(ctx context.Context, params *QueueIterateParams) iter.Seq2[any, error]
+func (q *Queue) Len(ctx context.Context, params *QueueLenParams) (int, error)
+func (q *Queue) Put(ctx context.Context, v any, params *QueuePutParams) error
+func (q *Queue) PutMany(ctx context.Context, values []any, params *QueuePutManyParams) error
+type QueueClearParams
+type QueueDeleteParams
+type QueueEmptyError
+func (e QueueEmptyError) Error() string
+type QueueEphemeralParams
+type QueueFromNameParams
+type QueueFullError
+func (e QueueFullError) Error() string
+type QueueGetManyParams
+type QueueGetParams
+type QueueIterateParams
+type QueueLenParams
+type QueuePutManyParams
+type QueuePutParams
+type QueueService
+type RemoteError
+func (e RemoteError) Error() string
+type Retries
+func NewRetries(maxRetries int, params *RetriesParams) (*Retries, error)
+type RetriesParams
+type Sandbox
+func (sb *Sandbox) CreateConnectToken(ctx context.Context, params *SandboxCreateConnectTokenParams) (*SandboxCreateConnectCredentials, error)
+func (sb *Sandbox) Exec(ctx context.Context, command []string, params *SandboxExecParams) (*ContainerProcess, error)
+func (sb *Sandbox) GetTags(ctx context.Context) (map[string]string, error)
+func (sb *Sandbox) Open(ctx context.Context, path, mode string) (*SandboxFile, error)
+func (sb *Sandbox) Poll(ctx context.Context) (*int, error)
+func (sb *Sandbox) SetTags(ctx context.Context, tags map[string]string) error
+func (sb *Sandbox) SnapshotFilesystem(ctx context.Context, timeout time.Duration) (*Image, error)
+func (sb *Sandbox) Terminate(ctx context.Context) error
+func (sb *Sandbox) Tunnels(ctx context.Context, timeout time.Duration) (map[int]*Tunnel, error)
+func (sb *Sandbox) Wait(ctx context.Context) (int, error)
+type SandboxCreateConnectCredentials
+type SandboxCreateConnectTokenParams
+type SandboxCreateParams
+type SandboxExecParams
+type SandboxFile
+func (f *SandboxFile) Close() error
+func (f *SandboxFile) Flush() error
+func (f *SandboxFile) Read(p []byte) (int, error)
+func (f *SandboxFile) Write(p []byte) (n int, err error)
+type SandboxFilesystemError
+func (e SandboxFilesystemError) Error() string
+type SandboxFromNameParams
+type SandboxListParams
+type SandboxService
+type SandboxTimeoutError
+func (e SandboxTimeoutError) Error() string
+type Secret
+type SecretDeleteParams
+type SecretFromMapParams
+type SecretFromNameParams
+type SecretService
+type StdioBehavior
+type TokenAndExpiry
+type Tunnel
+func (t *Tunnel) TCPSocket() (string, int, error)
+func (t *Tunnel) TLSSocket() (string, int)
+func (t *Tunnel) URL() string
+type Volume
+func (v *Volume) CloseEphemeral()
+func (v *Volume) IsReadOnly() bool
+func (v *Volume) ReadOnly() *Volume
+type VolumeDeleteParams
+type VolumeEphemeralParams
+type VolumeFromNameParams
+type VolumeService
+Constants ¶
+View Source
+const (
+	// Start refreshing this many seconds before the token expires
+	RefreshWindow = 5 * 60
+	// If the token doesn't have an expiry field, default to current time plus this value (not expected).
+	DefaultExpiryOffset = 20 * 60
+)
+Variables ¶
+This section is empty.
+
+Functions ¶
+This section is empty.
+
+Types ¶
+type AlreadyExistsError ¶
+added in v0.0.18
+type AlreadyExistsError struct {
+	Exception string
+}
+AlreadyExistsError is returned when a resource already exists.
+
+func (AlreadyExistsError) Error ¶
+added in v0.0.18
+func (e AlreadyExistsError) Error() string
+type App ¶
+type App struct {
+	AppID string
+	Name  string
+}
+App references a deployed Modal App.
+
+type AppFromNameParams ¶
+added in v0.5.0
+type AppFromNameParams struct {
+	Environment     string
+	CreateIfMissing bool
+}
+AppFromNameParams are options for client.Apps.FromName.
+
+type AppService ¶
+added in v0.5.0
+type AppService interface {
+	FromName(ctx context.Context, name string, params *AppFromNameParams) (*App, error)
+}
+AppService provides App related operations.
+
+type AuthTokenManager ¶
+added in v0.0.25
+type AuthTokenManager struct {
+	// contains filtered or unexported fields
+}
+AuthTokenManager manages authentication tokens using a goroutine, and refreshes the token REFRESH_WINDOW seconds before it expires.
+
+func NewAuthTokenManager ¶
+added in v0.0.25
+func NewAuthTokenManager(client pb.ModalClientClient, logger *slog.Logger) *AuthTokenManager
+func (*AuthTokenManager) FetchToken ¶
+added in v0.0.25
+func (m *AuthTokenManager) FetchToken(ctx context.Context) (string, error)
+FetchToken fetches a new token using AuthTokenGet() and stores it.
+
+func (*AuthTokenManager) GetCurrentToken ¶
+added in v0.0.25
+func (m *AuthTokenManager) GetCurrentToken() string
+GetCurrentToken returns the current cached token.
+
+func (*AuthTokenManager) GetToken ¶
+added in v0.0.25
+func (m *AuthTokenManager) GetToken(ctx context.Context) (string, error)
+GetToken returns a valid auth token. If the current token is expired and the manager is running, triggers an on-demand refresh.
+
+func (*AuthTokenManager) IsExpired ¶
+added in v0.0.25
+func (m *AuthTokenManager) IsExpired() bool
+IsExpired checks if token is expired.
+
+func (*AuthTokenManager) SetToken ¶
+added in v0.0.25
+func (m *AuthTokenManager) SetToken(token string, expiry int64)
+SetToken sets the token and expiry (for testing).
+
+func (*AuthTokenManager) Start ¶
+added in v0.0.25
+func (m *AuthTokenManager) Start(ctx context.Context) error
+Start the token refresh goroutine. Returns an error if the initial token fetch fails.
+
+func (*AuthTokenManager) Stop ¶
+added in v0.0.25
+func (m *AuthTokenManager) Stop()
+Stop the refresh goroutine.
+
+type Client ¶
+added in v0.5.0
+type Client struct {
+	Apps              AppService
+	CloudBucketMounts CloudBucketMountService
+	Cls               ClsService
+	Functions         FunctionService
+	FunctionCalls     FunctionCallService
+	Images            ImageService
+	Proxies           ProxyService
+	Queues            QueueService
+	Sandboxes         SandboxService
+	Secrets           SecretService
+	Volumes           VolumeService
+	// contains filtered or unexported fields
+}
+Client exposes services for interacting with Modal resources. You should not instantiate it directly, and instead use NewClient/NewClientWithOptions.
+
+func NewClient ¶
+added in v0.5.0
+func NewClient() (*Client, error)
+NewClient generates a new client with the default profile configuration read from environment variables and ~/.modal.toml.
+
+func NewClientWithOptions ¶
+added in v0.5.0
+func NewClientWithOptions(params *ClientParams) (*Client, error)
+NewClientWithOptions generates a new client and allows overriding options in the default profile configuration.
+
+func (*Client) Close ¶
+added in v0.5.0
+func (c *Client) Close()
+Close stops the background auth token refresh and closes all gRPC connections.
+
+func (*Client) Version ¶
+added in v0.5.0
+func (c *Client) Version() string
+Version returns the SDK version.
+
+type ClientParams ¶
+added in v0.5.0
+type ClientParams struct {
+	TokenID     string
+	TokenSecret string
+	Environment string
+	Config      *config
+	Logger      *slog.Logger
+	// ControlPlaneClient is a custom gRPC client for testing.
+	// If provided, the client will use this instead of creating its own connection.
+	// Typically used with mock clients in tests.
+	ControlPlaneClient pb.ModalClientClient
+	// ControlPlaneConn is the underlying gRPC connection for ControlPlaneClient.
+	// If provided, Client.Close() will close this connection for proper cleanup.
+	// Leave nil for mock clients that don't have real connections.
+	ControlPlaneConn *grpc.ClientConn
+	// GRPCUnaryInterceptors allows custom gRPC unary interceptors for telemetry, tracing, and observability.
+	// These are appended after Modal's built-in interceptors (header injection, auth, retry, timeout).
+	// Note that the Modal gRPC API is not considered a public API, and can change without warning.
+	GRPCUnaryInterceptors []grpc.UnaryClientInterceptor
+	// GRPCStreamInterceptors allows custom gRPC stream interceptors for telemetry, tracing, and observability.
+	// These are appended after Modal's built-in stream interceptors (header injection).
+	// Note that the Modal gRPC API is not considered a public API, and can change without warning.
+	GRPCStreamInterceptors []grpc.StreamClientInterceptor
+}
+ClientParams defines credentials and options for initializing the Modal client.
+
+type CloudBucketMount ¶
+added in v0.0.17
+type CloudBucketMount struct {
+	BucketName        string
+	Secret            *Secret
+	ReadOnly          bool
+	RequesterPays     bool
+	BucketEndpointURL *string
+	KeyPrefix         *string
+	OidcAuthRoleArn   *string
+	// contains filtered or unexported fields
+}
+CloudBucketMount provides access to cloud storage buckets within Modal Functions.
+
+type CloudBucketMountParams ¶
+added in v0.5.0
+type CloudBucketMountParams struct {
+	Secret            *Secret
+	ReadOnly          bool
+	RequesterPays     bool
+	BucketEndpointURL *string
+	KeyPrefix         *string
+	OidcAuthRoleArn   *string
+}
+CloudBucketMountParams are options for creating a CloudBucketMount.
+
+type CloudBucketMountService ¶
+added in v0.5.0
+type CloudBucketMountService interface {
+	New(bucketName string, params *CloudBucketMountParams) (*CloudBucketMount, error)
+}
+CloudBucketMountService provides CloudBucketMount related operations.
+
+type Cls ¶
+added in v0.0.5
+type Cls struct {
+	// contains filtered or unexported fields
+}
+Cls represents a Modal class definition that can be instantiated with parameters. It contains metadata about the class and its methods.
+
+func (*Cls) Instance ¶
+added in v0.0.5
+func (c *Cls) Instance(ctx context.Context, parameters map[string]any) (*ClsInstance, error)
+Instance creates a new instance of the class with the provided parameters.
+
+func (*Cls) WithBatching ¶
+added in v0.0.18
+func (c *Cls) WithBatching(params *ClsWithBatchingParams) *Cls
+WithBatching creates an instance of the Cls with dynamic batching enabled or overridden with new values.
+
+func (*Cls) WithConcurrency ¶
+added in v0.0.18
+func (c *Cls) WithConcurrency(params *ClsWithConcurrencyParams) *Cls
+WithConcurrency creates an instance of the Cls with input concurrency enabled or overridden with new values.
+
+func (*Cls) WithOptions ¶
+added in v0.0.18
+func (c *Cls) WithOptions(params *ClsWithOptionsParams) *Cls
+WithOptions overrides the static Function configuration at runtime.
+
+type ClsFromNameParams ¶
+added in v0.5.0
+type ClsFromNameParams struct {
+	Environment     string
+	CreateIfMissing bool
+}
+ClsFromNameParams are options for client.Cls.FromName.
+
+type ClsInstance ¶
+added in v0.0.5
+type ClsInstance struct {
+	// contains filtered or unexported fields
+}
+ClsInstance represents an instantiated Modal class with bound parameters. It provides access to the class methods with the bound parameters.
+
+func (*ClsInstance) Method ¶
+added in v0.0.5
+func (c *ClsInstance) Method(name string) (*Function, error)
+Method returns the Function with the given name from a ClsInstance.
+
+type ClsService ¶
+added in v0.5.0
+type ClsService interface {
+	FromName(ctx context.Context, appName string, name string, params *ClsFromNameParams) (*Cls, error)
+}
+ClsService provides Cls related operations.
+
+type ClsWithBatchingParams ¶
+added in v0.5.0
+type ClsWithBatchingParams struct {
+	MaxBatchSize int
+	Wait         time.Duration
+}
+ClsWithBatchingParams represents batching configuration for a Modal Cls.
+
+type ClsWithConcurrencyParams ¶
+added in v0.5.0
+type ClsWithConcurrencyParams struct {
+	MaxInputs    int
+	TargetInputs *int
+}
+ClsWithConcurrencyParams represents concurrency configuration for a Modal Cls.
+
+type ClsWithOptionsParams ¶
+added in v0.5.0
+type ClsWithOptionsParams struct {
+	CPU              *float64
+	CPULimit         *float64
+	MemoryMiB        *int
+	MemoryLimitMiB   *int
+	GPU              *string
+	Env              map[string]string
+	Secrets          []*Secret
+	Volumes          map[string]*Volume
+	Retries          *Retries
+	MaxContainers    *int
+	BufferContainers *int
+	ScaledownWindow  *time.Duration
+	Timeout          *time.Duration
+}
+ClsWithOptionsParams represents runtime options for a Modal Cls.
+
+type ContainerProcess ¶
+type ContainerProcess struct {
+	Stdin  io.WriteCloser
+	Stdout io.ReadCloser
+	Stderr io.ReadCloser
+	// contains filtered or unexported fields
+}
+ContainerProcess represents a process running in a Modal container, allowing interaction with its standard input/output/error streams.
+
+It is created by executing a command in a Sandbox.
+
+func (*ContainerProcess) Wait ¶
+func (cp *ContainerProcess) Wait(ctx context.Context) (int, error)
+Wait blocks until the container process exits and returns its exit code.
+
+type ExecutionError ¶
+added in v0.0.15
+type ExecutionError struct {
+	Exception string
+}
+ExecutionError is returned when something unexpected happened during runtime.
+
+func (ExecutionError) Error ¶
+added in v0.0.15
+func (e ExecutionError) Error() string
+type Function ¶
+added in v0.0.3
+type Function struct {
+	FunctionID string
+	// contains filtered or unexported fields
+}
+Function references a deployed Modal Function.
+
+func (*Function) GetCurrentStats ¶
+added in v0.0.17
+func (f *Function) GetCurrentStats(ctx context.Context) (*FunctionStats, error)
+GetCurrentStats returns a FunctionStats object with statistics about the Function.
+
+func (*Function) GetWebURL ¶
+added in v0.0.17
+func (f *Function) GetWebURL() string
+GetWebURL returns the URL of a Function running as a web endpoint. Returns empty string if this Function is not a web endpoint.
+
+func (*Function) Remote ¶
+added in v0.0.3
+func (f *Function) Remote(ctx context.Context, args []any, kwargs map[string]any) (any, error)
+Remote executes a single input on a remote Function.
+
+func (*Function) Spawn ¶
+added in v0.0.6
+func (f *Function) Spawn(ctx context.Context, args []any, kwargs map[string]any) (*FunctionCall, error)
+Spawn starts running a single input on a remote Function.
+
+func (*Function) UpdateAutoscaler ¶
+added in v0.0.17
+func (f *Function) UpdateAutoscaler(ctx context.Context, params *FunctionUpdateAutoscalerParams) error
+UpdateAutoscaler overrides the current autoscaler behavior for this Function.
+
+type FunctionCall ¶
+added in v0.0.6
+type FunctionCall struct {
+	FunctionCallID string
+	// contains filtered or unexported fields
+}
+FunctionCall references a Modal Function Call. Function Calls are Function invocations with a given input. They can be consumed asynchronously (see Get()) or cancelled (see Cancel()).
+
+func (*FunctionCall) Cancel ¶
+added in v0.0.6
+func (fc *FunctionCall) Cancel(ctx context.Context, params *FunctionCallCancelParams) error
+Cancel cancels a FunctionCall.
+
+func (*FunctionCall) Get ¶
+added in v0.0.6
+func (fc *FunctionCall) Get(ctx context.Context, params *FunctionCallGetParams) (any, error)
+Get waits for the output of a FunctionCall. If timeout > 0, the operation will be cancelled after the specified duration.
+
+type FunctionCallCancelParams ¶
+added in v0.5.0
+type FunctionCallCancelParams struct {
+	TerminateContainers bool
+}
+FunctionCallCancelParams are options for cancelling Function Calls.
+
+type FunctionCallGetParams ¶
+added in v0.5.0
+type FunctionCallGetParams struct {
+	// Timeout specifies the maximum duration to wait for the output.
+	// If nil, no timeout is applied. If set to 0, it will check if the function
+	// call is already completed.
+	Timeout *time.Duration
+}
+FunctionCallGetParams are options for getting outputs from Function Calls.
+
+type FunctionCallService ¶
+added in v0.5.0
+type FunctionCallService interface {
+	FromID(ctx context.Context, functionCallID string) (*FunctionCall, error)
+}
+FunctionCallService provides FunctionCall related operations.
+
+type FunctionFromNameParams ¶
+added in v0.5.0
+type FunctionFromNameParams struct {
+	Environment     string
+	CreateIfMissing bool
+}
+FunctionFromNameParams are options for client.Functions.FromName.
+
+type FunctionService ¶
+added in v0.5.0
+type FunctionService interface {
+	FromName(ctx context.Context, appName string, name string, params *FunctionFromNameParams) (*Function, error)
+}
+FunctionService provides Function related operations.
+
+type FunctionStats ¶
+added in v0.0.17
+type FunctionStats struct {
+	Backlog         int
+	NumTotalRunners int
+}
+FunctionStats represents statistics for a running Function.
+
+type FunctionTimeoutError ¶
+added in v0.0.6
+type FunctionTimeoutError struct {
+	Exception string
+}
+FunctionTimeoutError is returned when a Function execution exceeds the allowed time limit.
+
+func (FunctionTimeoutError) Error ¶
+added in v0.0.6
+func (e FunctionTimeoutError) Error() string
+type FunctionUpdateAutoscalerParams ¶
+added in v0.5.0
+type FunctionUpdateAutoscalerParams struct {
+	MinContainers    *uint32
+	MaxContainers    *uint32
+	BufferContainers *uint32
+	ScaledownWindow  *uint32
+}
+FunctionUpdateAutoscalerParams contains options for overriding a Function's autoscaler behavior.
+
+type Image ¶
+type Image struct {
+	ImageID string
+	// contains filtered or unexported fields
+}
+Image represents a Modal Image, which can be used to create Sandboxes.
+
+func (*Image) Build ¶
+added in v0.0.18
+func (image *Image) Build(ctx context.Context, app *App) (*Image, error)
+Build eagerly builds an Image on Modal.
+
+func (*Image) DockerfileCommands ¶
+added in v0.0.22
+func (image *Image) DockerfileCommands(commands []string, params *ImageDockerfileCommandsParams) *Image
+DockerfileCommands extends an image with arbitrary Dockerfile-like commands.
+
+Each call creates a new Image layer that will be built sequentially. The provided options apply only to this layer.
+
+type ImageDeleteParams ¶
+added in v0.5.0
+type ImageDeleteParams struct{}
+ImageDeleteParams are options for deleting an Image.
+
+type ImageDockerfileCommandsParams ¶
+added in v0.5.0
+type ImageDockerfileCommandsParams struct {
+	// Environment variables to set in the build environment.
+	Env map[string]string
+
+	// Secrets that will be made available as environment variables to this layer's build environment.
+	Secrets []*Secret
+
+	// GPU reservation for this layer's build environment (e.g. "A100", "T4:2", "A100-80GB:4").
+	GPU string
+
+	// Ignore cached builds for this layer, similar to 'docker build --no-cache'.
+	ForceBuild bool
+}
+ImageDockerfileCommandsParams are options for Image.DockerfileCommands().
+
+type ImageFromRegistryParams ¶
+added in v0.5.0
+type ImageFromRegistryParams struct {
+	Secret *Secret // Secret for private registry authentication.
+}
+ImageFromRegistryParams are options for creating an Image from a registry.
+
+type ImageService ¶
+added in v0.5.0
+type ImageService interface {
+	FromRegistry(tag string, params *ImageFromRegistryParams) *Image
+	FromAwsEcr(tag string, secret *Secret) *Image
+	FromGcpArtifactRegistry(tag string, secret *Secret) *Image
+	FromID(ctx context.Context, imageID string) (*Image, error)
+	Delete(ctx context.Context, imageID string, params *ImageDeleteParams) error
+}
+ImageService provides Image related operations.
+
+type InternalFailure ¶
+added in v0.0.3
+type InternalFailure struct {
+	Exception string
+}
+InternalFailure is a retryable internal error from Modal.
+
+func (InternalFailure) Error ¶
+added in v0.0.3
+func (e InternalFailure) Error() string
+type InvalidError ¶
+added in v0.0.7
+type InvalidError struct {
+	Exception string
+}
+InvalidError represents an invalid request or operation.
+
+func (InvalidError) Error ¶
+added in v0.0.7
+func (e InvalidError) Error() string
+type NotFoundError ¶
+added in v0.0.5
+type NotFoundError struct {
+	Exception string
+}
+NotFoundError is returned when a resource is not found.
+
+func (NotFoundError) Error ¶
+added in v0.0.5
+func (e NotFoundError) Error() string
+type Profile ¶
+type Profile struct {
+	ServerURL           string
+	TokenID             string
+	TokenSecret         string
+	Environment         string
+	ImageBuilderVersion string
+	LogLevel            string
+}
+Profile holds a fully-resolved configuration ready for use by the client.
+
+type Proxy ¶
+added in v0.0.17
+type Proxy struct {
+	ProxyID string
+}
+Proxy represents a Modal Proxy.
+
+type ProxyFromNameParams ¶
+added in v0.5.0
+type ProxyFromNameParams struct {
+	Environment string
+}
+ProxyFromNameParams are options for looking up a Modal Proxy.
+
+type ProxyService ¶
+added in v0.5.0
+type ProxyService interface {
+	FromName(ctx context.Context, name string, params *ProxyFromNameParams) (*Proxy, error)
+}
+ProxyService provides Proxy related operations.
+
+type Queue ¶
+added in v0.0.7
+type Queue struct {
+	QueueID string
+	Name    string
+	// contains filtered or unexported fields
+}
+Queue is a distributed, FIFO queue for data flow in Modal Apps.
+
+func (*Queue) Clear ¶
+added in v0.0.7
+func (q *Queue) Clear(ctx context.Context, params *QueueClearParams) error
+Clear removes all objects from a Queue partition.
+
+func (*Queue) CloseEphemeral ¶
+added in v0.0.7
+func (q *Queue) CloseEphemeral()
+CloseEphemeral deletes an ephemeral Queue, only used with QueueEphemeral.
+
+func (*Queue) Get ¶
+added in v0.0.7
+func (q *Queue) Get(ctx context.Context, params *QueueGetParams) (any, error)
+Get removes and returns one item (blocking by default).
+
+By default, this will wait until at least one item is present in the Queue. If `timeout` is set, returns `QueueEmptyError` if no items are available within that timeout in milliseconds.
+
+func (*Queue) GetMany ¶
+added in v0.0.7
+func (q *Queue) GetMany(ctx context.Context, n int, params *QueueGetManyParams) ([]any, error)
+GetMany removes up to n items.
+
+By default, this will wait until at least one item is present in the Queue. If `timeout` is set, returns `QueueEmptyError` if no items are available within that timeout in milliseconds.
+
+func (*Queue) Iterate ¶
+added in v0.0.7
+func (q *Queue) Iterate(ctx context.Context, params *QueueIterateParams) iter.Seq2[any, error]
+Iterate yields items from the Queue until it is empty.
+
+func (*Queue) Len ¶
+added in v0.0.7
+func (q *Queue) Len(ctx context.Context, params *QueueLenParams) (int, error)
+Len returns the number of objects in the Queue.
+
+func (*Queue) Put ¶
+added in v0.0.7
+func (q *Queue) Put(ctx context.Context, v any, params *QueuePutParams) error
+Put adds a single item to the end of the Queue.
+
+If the Queue is full, this will retry with exponential backoff until the provided `timeout` is reached, or indefinitely if `timeout` is not set. Raises `QueueFullError` if the Queue is still full after the timeout.
+
+func (*Queue) PutMany ¶
+added in v0.0.7
+func (q *Queue) PutMany(ctx context.Context, values []any, params *QueuePutManyParams) error
+PutMany adds multiple items to the end of the Queue.
+
+If the Queue is full, this will retry with exponential backoff until the provided `timeout` is reached, or indefinitely if `timeout` is not set. Raises `QueueFullError` if the Queue is still full after the timeout.
+
+type QueueClearParams ¶
+added in v0.5.0
+type QueueClearParams struct {
+	Partition string // partition to clear (default "")
+	All       bool   // clear *all* partitions (mutually exclusive with Partition)
+}
+type QueueDeleteParams ¶
+added in v0.5.0
+type QueueDeleteParams struct {
+	Environment  string
+	AllowMissing bool
+}
+QueueDeleteParams are options for client.Queues.Delete.
+
+type QueueEmptyError ¶
+added in v0.0.7
+type QueueEmptyError struct {
+	Exception string
+}
+QueueEmptyError is returned when an operation is attempted on an empty Queue.
+
+func (QueueEmptyError) Error ¶
+added in v0.0.7
+func (e QueueEmptyError) Error() string
+type QueueEphemeralParams ¶
+added in v0.5.0
+type QueueEphemeralParams struct {
+	Environment string
+}
+QueueEphemeralParams are options for client.Queues.Ephemeral.
+
+type QueueFromNameParams ¶
+added in v0.5.0
+type QueueFromNameParams struct {
+	Environment     string
+	CreateIfMissing bool
+}
+QueueFromNameParams are options for client.Queues.FromName.
+
+type QueueFullError ¶
+added in v0.0.7
+type QueueFullError struct {
+	Exception string
+}
+QueueFullError is returned when an operation is attempted on a full Queue.
+
+func (QueueFullError) Error ¶
+added in v0.0.7
+func (e QueueFullError) Error() string
+type QueueGetManyParams ¶
+added in v0.5.0
+type QueueGetManyParams struct {
+	QueueGetParams
+}
+QueueGetManyParams are options for Queue.GetMany.
+
+type QueueGetParams ¶
+added in v0.5.0
+type QueueGetParams struct {
+	Timeout   *time.Duration // wait max (nil = indefinitely)
+	Partition string
+}
+QueueGetParams are options for Queue.Get.
+
+type QueueIterateParams ¶
+added in v0.5.0
+type QueueIterateParams struct {
+	ItemPollTimeout time.Duration // exit if no new items within this period
+	Partition       string
+}
+type QueueLenParams ¶
+added in v0.5.0
+type QueueLenParams struct {
+	Partition string
+	Total     bool // total across all partitions (mutually exclusive with Partition)
+}
+type QueuePutManyParams ¶
+added in v0.5.0
+type QueuePutManyParams struct {
+	QueuePutParams
+}
+QueuePutManyParams are options for Queue.PutMany.
+
+type QueuePutParams ¶
+added in v0.5.0
+type QueuePutParams struct {
+	Timeout      *time.Duration // max wait for space (nil = indefinitely)
+	Partition    string
+	PartitionTTL time.Duration // ttl for the *partition* (default 24h)
+}
+QueuePutParams are options for Queue.Put.
+
+type QueueService ¶
+added in v0.5.0
+type QueueService interface {
+	Ephemeral(ctx context.Context, params *QueueEphemeralParams) (*Queue, error)
+	FromName(ctx context.Context, name string, params *QueueFromNameParams) (*Queue, error)
+	Delete(ctx context.Context, name string, params *QueueDeleteParams) error
+}
+QueueService provides Queue related operations.
+
+type RemoteError ¶
+added in v0.0.3
+type RemoteError struct {
+	Exception string
+}
+RemoteError represents an error on the Modal server, or a Python exception.
+
+func (RemoteError) Error ¶
+added in v0.0.3
+func (e RemoteError) Error() string
+type Retries ¶
+added in v0.0.18
+type Retries struct {
+	MaxRetries         int
+	BackoffCoefficient float32
+	InitialDelay       time.Duration
+	MaxDelay           time.Duration
+}
+Retries represents retry policy configuration for a Modal Function/Cls.
+
+func NewRetries ¶
+added in v0.0.18
+func NewRetries(maxRetries int, params *RetriesParams) (*Retries, error)
+NewRetries creates a new Retries configuration.
+
+type RetriesParams ¶
+added in v0.5.0
+type RetriesParams struct {
+	BackoffCoefficient *float32       // Multiplier for exponential backoff. Defaults to 2.0.
+	InitialDelay       *time.Duration // Defaults to 1s.
+	MaxDelay           *time.Duration // Defaults to 60s.
+}
+RetriesParams are options for creating a Retries policy.
+
+type Sandbox ¶
+type Sandbox struct {
+	SandboxID string
+	Stdin     io.WriteCloser
+	Stdout    io.ReadCloser
+	Stderr    io.ReadCloser
+	// contains filtered or unexported fields
+}
+Sandbox represents a Modal Sandbox, which can run commands and manage input/output streams for a remote process.
+
+func (*Sandbox) CreateConnectToken ¶
+added in v0.5.6
+func (sb *Sandbox) CreateConnectToken(ctx context.Context, params *SandboxCreateConnectTokenParams) (*SandboxCreateConnectCredentials, error)
+CreateConnectToken creates a token for making HTTP connections to the Sandbox.
+
+func (*Sandbox) Exec ¶
+func (sb *Sandbox) Exec(ctx context.Context, command []string, params *SandboxExecParams) (*ContainerProcess, error)
+Exec runs a command in the Sandbox and returns text streams.
+
+func (*Sandbox) GetTags ¶
+added in v0.0.24
+func (sb *Sandbox) GetTags(ctx context.Context) (map[string]string, error)
+GetTags fetches any tags (key-value pairs) currently attached to this Sandbox from the server.
+
+func (*Sandbox) Open ¶
+added in v0.0.9
+func (sb *Sandbox) Open(ctx context.Context, path, mode string) (*SandboxFile, error)
+Open opens a file in the Sandbox filesystem. The mode parameter follows the same conventions as os.OpenFile: "r" for read-only, "w" for write-only (truncates), "a" for append, etc.
+
+func (*Sandbox) Poll ¶
+added in v0.0.15
+func (sb *Sandbox) Poll(ctx context.Context) (*int, error)
+Poll checks if the Sandbox has finished running. Returns nil if the Sandbox is still running, else returns the exit code.
+
+func (*Sandbox) SetTags ¶
+added in v0.0.17
+func (sb *Sandbox) SetTags(ctx context.Context, tags map[string]string) error
+SetTags sets key-value tags on the Sandbox. Tags can be used to filter results in SandboxList.
+
+func (*Sandbox) SnapshotFilesystem ¶
+added in v0.0.15
+func (sb *Sandbox) SnapshotFilesystem(ctx context.Context, timeout time.Duration) (*Image, error)
+SnapshotFilesystem takes a snapshot of the Sandbox's filesystem. Returns an Image object which can be used to spawn a new Sandbox with the same filesystem.
+
+func (*Sandbox) Terminate ¶
+func (sb *Sandbox) Terminate(ctx context.Context) error
+Terminate stops the Sandbox.
+
+func (*Sandbox) Tunnels ¶
+added in v0.0.14
+func (sb *Sandbox) Tunnels(ctx context.Context, timeout time.Duration) (map[int]*Tunnel, error)
+Tunnels gets Tunnel metadata for the Sandbox. Returns SandboxTimeoutError if the tunnels are not available after the timeout. Returns a map of Tunnel objects keyed by the container port.
+
+func (*Sandbox) Wait ¶
+func (sb *Sandbox) Wait(ctx context.Context) (int, error)
+Wait blocks until the Sandbox exits.
+
+type SandboxCreateConnectCredentials ¶
+added in v0.5.6
+type SandboxCreateConnectCredentials struct {
+	URL   string
+	Token string
+}
+SandboxCreateConnectCredentials contains the URL and token for connecting to a Sandbox.
+
+type SandboxCreateConnectTokenParams ¶
+added in v0.5.6
+type SandboxCreateConnectTokenParams struct {
+	// Optional user-provided metadata string that will be added to the headers by the proxy when forwarding requests to the Sandbox.
+	UserMetadata string
+}
+SandboxCreateConnectTokenParams are optional parameters for CreateConnectToken.
+
+type SandboxCreateParams ¶
+added in v0.5.0
+type SandboxCreateParams struct {
+	CPU                 float64                      // CPU request in fractional, physical cores.
+	CPULimit            float64                      // Hard limit in fractional, physical CPU cores. Zero means no limit.
+	MemoryMiB           int                          // Memory request in MiB.
+	MemoryLimitMiB      int                          // Hard memory limit in MiB. Zero means no limit.
+	GPU                 string                       // GPU reservation for the Sandbox (e.g. "A100", "T4:2", "A100-80GB:4").
+	Timeout             time.Duration                // Maximum lifetime of the Sandbox. Defaults to 5 minutes. If you pass zero you get the default 5 minutes.
+	IdleTimeout         time.Duration                // The amount of time that a Sandbox can be idle before being terminated.
+	Workdir             string                       // Working directory of the Sandbox.
+	Command             []string                     // Command to run in the Sandbox on startup.
+	Env                 map[string]string            // Environment variables to set in the Sandbox.
+	Secrets             []*Secret                    // Secrets to inject into the Sandbox as environment variables.
+	Volumes             map[string]*Volume           // Mount points for Volumes.
+	CloudBucketMounts   map[string]*CloudBucketMount // Mount points for cloud buckets.
+	PTY                 bool                         // Enable a PTY for the Sandbox.
+	EncryptedPorts      []int                        // List of encrypted ports to tunnel into the Sandbox, with TLS encryption.
+	H2Ports             []int                        // List of encrypted ports to tunnel into the Sandbox, using HTTP/2.
+	UnencryptedPorts    []int                        // List of ports to tunnel into the Sandbox without encryption.
+	BlockNetwork        bool                         // Whether to block all network access from the Sandbox.
+	CIDRAllowlist       []string                     // List of CIDRs the Sandbox is allowed to access. Cannot be used with BlockNetwork.
+	Cloud               string                       // Cloud provider to run the Sandbox on.
+	Regions             []string                     // Region(s) to run the Sandbox on.
+	Verbose             bool                         // Enable verbose logging.
+	Proxy               *Proxy                       // Reference to a Modal Proxy to use in front of this Sandbox.
+	Name                string                       // Optional name for the Sandbox. Unique within an App.
+	ExperimentalOptions map[string]any               // Experimental options
+	CustomDomain        string                       // If non-empty, connections to this Sandbox will be subdomains of this domain rather than the default. This requires prior manual setup by Modal and is only available for Enterprise customers.
+}
+SandboxCreateParams are options for creating a Modal Sandbox.
+
+type SandboxExecParams ¶
+added in v0.5.0
+type SandboxExecParams struct {
+	// Stdout defines whether to pipe or ignore standard output.
+	Stdout StdioBehavior
+	// Stderr defines whether to pipe or ignore standard error.
+	Stderr StdioBehavior
+	// Workdir is the working directory to run the command in.
+	Workdir string
+	// Timeout is the timeout for command execution. Defaults to 0 (no timeout).
+	Timeout time.Duration
+	// Environment variables to set for the command.
+	Env map[string]string
+	// Secrets to inject as environment variables for the command.
+	Secrets []*Secret
+	// PTY defines whether to enable a PTY for the command.
+	PTY bool
+}
+SandboxExecParams defines options for executing commands in a Sandbox.
+
+type SandboxFile ¶
+added in v0.0.9
+type SandboxFile struct {
+	// contains filtered or unexported fields
+}
+SandboxFile represents an open file in the Sandbox filesystem. It implements io.Reader, io.Writer, io.Seeker, and io.Closer interfaces.
+
+func (*SandboxFile) Close ¶
+added in v0.0.9
+func (f *SandboxFile) Close() error
+Close closes the file, rendering it unusable for I/O.
+
+func (*SandboxFile) Flush ¶
+added in v0.0.9
+func (f *SandboxFile) Flush() error
+Flush flushes any buffered data to the file.
+
+func (*SandboxFile) Read ¶
+added in v0.0.9
+func (f *SandboxFile) Read(p []byte) (int, error)
+Read reads up to len(p) bytes from the file into p. It returns the number of bytes read and any error encountered.
+
+func (*SandboxFile) Write ¶
+added in v0.0.9
+func (f *SandboxFile) Write(p []byte) (n int, err error)
+Write writes len(p) bytes from p to the file. It returns the number of bytes written and any error encountered.
+
+type SandboxFilesystemError ¶
+added in v0.0.9
+type SandboxFilesystemError struct {
+	Exception string
+}
+SandboxFilesystemError is returned when an operation is attempted on a full Queue.
+
+func (SandboxFilesystemError) Error ¶
+added in v0.0.9
+func (e SandboxFilesystemError) Error() string
+type SandboxFromNameParams ¶
+added in v0.5.0
+type SandboxFromNameParams struct {
+	Environment string
+}
+SandboxFromNameParams are options for finding deployed Sandbox objects by name.
+
+type SandboxListParams ¶
+added in v0.5.0
+type SandboxListParams struct {
+	AppID       string            // Filter by App ID
+	Tags        map[string]string // Only include Sandboxes that have all these tags
+	Environment string            // Override environment for this request
+}
+SandboxListParams are options for listing Sandboxes.
+
+type SandboxService ¶
+added in v0.5.0
+type SandboxService interface {
+	Create(ctx context.Context, app *App, image *Image, params *SandboxCreateParams) (*Sandbox, error)
+	FromID(ctx context.Context, sandboxID string) (*Sandbox, error)
+	FromName(ctx context.Context, appName, name string, params *SandboxFromNameParams) (*Sandbox, error)
+	List(ctx context.Context, params *SandboxListParams) (iter.Seq2[*Sandbox, error], error)
+}
+SandboxService provides Sandbox related operations.
+
+type SandboxTimeoutError ¶
+added in v0.0.14
+type SandboxTimeoutError struct {
+	Exception string
+}
+SandboxTimeoutError is returned when Sandbox operations exceed the allowed time limit.
+
+func (SandboxTimeoutError) Error ¶
+added in v0.0.14
+func (e SandboxTimeoutError) Error() string
+type Secret ¶
+added in v0.0.8
+type Secret struct {
+	SecretID string
+	Name     string
+}
+Secret represents a Modal Secret.
+
+type SecretDeleteParams ¶
+added in v0.5.4
+type SecretDeleteParams struct {
+	Environment  string
+	AllowMissing bool
+}
+SecretDeleteParams are options for client.Secrets.Delete.
+
+type SecretFromMapParams ¶
+added in v0.5.0
+type SecretFromMapParams struct {
+	Environment string
+}
+SecretFromMapParams are options for creating a Secret from a key/value map.
+
+type SecretFromNameParams ¶
+added in v0.5.0
+type SecretFromNameParams struct {
+	Environment  string
+	RequiredKeys []string
+}
+SecretFromNameParams are options for finding Modal Secrets.
+
+type SecretService ¶
+added in v0.5.0
+type SecretService interface {
+	FromName(ctx context.Context, name string, params *SecretFromNameParams) (*Secret, error)
+	FromMap(ctx context.Context, keyValuePairs map[string]string, params *SecretFromMapParams) (*Secret, error)
+	Delete(ctx context.Context, name string, params *SecretDeleteParams) error
+}
+SecretService provides Secret related operations.
+
+type StdioBehavior ¶
+type StdioBehavior string
+StdioBehavior defines how the standard input/output/error streams should behave.
+
+const (
+	// Pipe allows the Sandbox to pipe the streams.
+	Pipe StdioBehavior = "pipe"
+	// Ignore ignores the streams, meaning they will not be available.
+	Ignore StdioBehavior = "ignore"
+)
+type TokenAndExpiry ¶
+added in v0.0.25
+type TokenAndExpiry struct {
+	// contains filtered or unexported fields
+}
+type Tunnel ¶
+added in v0.0.14
+type Tunnel struct {
+	Host            string // The public hostname for the tunnel
+	Port            int    // The public port for the tunnel
+	UnencryptedHost string // The unencrypted hostname (if applicable)
+	UnencryptedPort int    // The unencrypted port (if applicable)
+}
+Tunnel represents a port forwarded from within a running Modal Sandbox.
+
+func (*Tunnel) TCPSocket ¶
+added in v0.0.14
+func (t *Tunnel) TCPSocket() (string, int, error)
+TCPSocket gets the public TCP socket as a (host, port) tuple.
+
+func (*Tunnel) TLSSocket ¶
+added in v0.0.14
+func (t *Tunnel) TLSSocket() (string, int)
+TLSSocket gets the public TLS socket as a (host, port) tuple.
+
+func (*Tunnel) URL ¶
+added in v0.0.14
+func (t *Tunnel) URL() string
+URL gets the public HTTPS URL of the forwarded port.
+
+type Volume ¶
+added in v0.0.13
+type Volume struct {
+	VolumeID string
+	Name     string
+	// contains filtered or unexported fields
+}
+Volume represents a Modal Volume that provides persistent storage.
+
+func (*Volume) CloseEphemeral ¶
+added in v0.0.18
+func (v *Volume) CloseEphemeral()
+CloseEphemeral deletes an ephemeral Volume, only used with VolumeEphemeral.
+
+func (*Volume) IsReadOnly ¶
+added in v0.0.17
+func (v *Volume) IsReadOnly() bool
+IsReadOnly returns true if the Volume is configured to mount as read-only.
+
+func (*Volume) ReadOnly ¶
+added in v0.0.17
+func (v *Volume) ReadOnly() *Volume
+ReadOnly configures Volume to mount as read-only.
+
+type VolumeDeleteParams ¶
+added in v0.5.4
+type VolumeDeleteParams struct {
+	Environment  string
+	AllowMissing bool
+}
+VolumeDeleteParams are options for client.Volumes.Delete.
+
+type VolumeEphemeralParams ¶
+added in v0.5.0
+type VolumeEphemeralParams struct {
+	Environment string
+}
+VolumeEphemeralParams are options for client.Volumes.Ephemeral.
+
+type VolumeFromNameParams ¶
+added in v0.5.0
+type VolumeFromNameParams struct {
+	Environment     string
+	CreateIfMissing bool
+}
+VolumeFromNameParams are options for finding Modal Volumes.
+
+type VolumeService ¶
+added in v0.5.0
+type VolumeService interface {
+	FromName(ctx context.Context, name string, params *VolumeFromNameParams) (*Volume, error)
+	Ephemeral(ctx context.Context, params *VolumeEphemeralParams) (*Volume, error)
+	Delete(ctx context.Context, name string, params *VolumeDeleteParams) error
+}
+VolumeService provides Volume related operations.
+
+ Source Files ¶
+View all Source files
+app.go
+auth_token_manager.go
+client.go
+cloud_bucket_mount.go
+cls.go
+config.go
+doc.go
+ephemeral.go
+errors.go
+function.go
+function_call.go
+image.go
+invocation.go
+logger.go
+proxy.go
+queue.go
+retries.go
+sandbox.go
+sandbox_filesystem.go
+secret.go
+volume.go
