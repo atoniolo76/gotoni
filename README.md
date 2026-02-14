@@ -30,18 +30,12 @@ export LAMBDA_API_KEY=your_token_here
 export MODAL_TOKEN_ID=your_token_here
 ```
 > **Modal users**: Ensure your Modal token has sandbox creation permissions. Modal uses tunnels (not direct IPs) for networking - ports 8080 (SGLang) and 8000 (LB) are automatically tunneled.
-5. (Optional) Set active cloud provider explicitly:
-```bash
-export GOTONI_CLOUD=lambda  # or 'modal'
-```
-> If not set, gotoni defaults to Lambda. Ensure you've exported the corresponding API key from step 4.
-
-6. Build gotoni from source:
+5. Build gotoni from source:
 ```bash
 go build -o gotoni
 ```
 
-7. Run `./gotoni available` to see available instances (uses whichever cloud credentials you exported above), then launch instances:
+6. Run `./gotoni available` to see available instances (gotoni auto-detects which cloud to use based on your exported credentials), then launch instances:
 ```bash
 # Launch a single GPU instance
 ./gotoni launch --type gpu_1x_a100 --name my-node --region us-east-1
@@ -51,7 +45,7 @@ go build -o gotoni
 ```
 > Check out instances from at least 3 regions to properly evaluate GORGO or 2 for GORGO-proxy.
 
-8. Run `./gotoni cluster setup`, which handles sglang installation, mistral-7b download, and the gotoni binary deployment for load balancer processes. Uses all currently running instances on your account (Lambda or Modal).
+7. Run `./gotoni cluster setup`, which handles sglang installation, mistral-7b download, and the gotoni binary deployment for load balancer processes. Uses all currently running instances on your account (Lambda or Modal).
 
 > **Modal Sandbox Details**: Everything is managed through code - no dashboard configuration needed. Sandboxes run as long-running processes (via `sleep infinity`). Services inside sandboxes (SGLang on port 8080, Load Balancer on port 8000) are automatically exposed via Modal's tunnel system, creating public URLs like `https://xxxxx-8080.modal.run`. All operations (upload, exec, status checks) use Modal's API - no SSH keys required.
 

@@ -75,12 +75,47 @@ func GetCloudProvider() (CloudProvider, CloudProviderType) {
 }
 
 // getCloudProviderType returns the cloud provider type from environment variable
+// If GOTONI_CLOUD is not set, automatically detects based on which API keys are exported
 func getCloudProviderType() string {
+	// Check if explicitly set
 	cloud := os.Getenv("GOTONI_CLOUD")
-	if cloud == "" {
-		return string(CloudProviderLambda) // Default to lambda
+	if cloud != "" {
+		return cloud
 	}
-	return cloud
+
+	// Auto-detect based on which credentials are exported
+	hasLambda := os.Getenv("LAMBDA_API_KEY") != ""
+	hasModal := os.Getenv("MODAL_TOKEN_ID") != ""
+	hasOrgo := os.Getenv("ORGO_API_KEY") != ""
+
+	// Count how many are set
+	count := 0
+	if hasLambda {
+		count++
+	}
+	if hasModal {
+		count++
+	}
+	if hasOrgo {
+		count++
+	}
+
+	// If only one is set, use that
+	if count == 1 {
+		if hasLambda {
+			return string(CloudProviderLambda)
+		}
+		if hasModal {
+			return string(CloudProviderModal)
+		}
+		if hasOrgo {
+			return string(CloudProviderOrgo)
+		}
+	}
+
+	// If multiple or none are set, default to Lambda for backward compatibility
+	// User can explicitly set GOTONI_CLOUD to override
+	return string(CloudProviderLambda)
 }
 
 // GetAPIToken returns the API token from environment variable based on the current cloud provider
