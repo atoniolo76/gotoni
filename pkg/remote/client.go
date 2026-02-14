@@ -108,6 +108,10 @@ type RunningInstance struct {
 	Tags             []TagEntry                 `json:"tags,omitempty"`
 	FirewallRulesets []FirewallRulesetEntry     `json:"firewall_rulesets,omitempty"`
 	IsBusy           bool
+
+	// TunnelURLs contains public tunnel endpoints for providers that support them (e.g., Modal)
+	// Key is the port number (as string), value is the public URL
+	TunnelURLs map[string]string `json:"tunnel_urls,omitempty"`
 }
 
 type LaunchedInstance struct {

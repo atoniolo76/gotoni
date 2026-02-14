@@ -893,7 +893,16 @@ func runProxyDeploy(cmd *cobra.Command, args []string) {
 	if err != nil {
 		log.Fatalf("Failed to resolve instance: %v", err)
 	}
-	fmt.Printf("Found instance: %s (%s)\n", proxyInstance.Name, proxyInstance.IP)
+
+	// Check provider type
+	_, providerType := remote.GetCloudProvider()
+	isModal := providerType == remote.CloudProviderModal
+
+	if isModal {
+		fmt.Printf("Found Modal sandbox: %s\n", proxyInstance.Name)
+	} else {
+		fmt.Printf("Found instance: %s (%s)\n", proxyInstance.Name, proxyInstance.IP)
+	}
 
 	// Step 2: Build Linux binary (unless skipped)
 	binaryPath := "/tmp/gotoni-linux"
@@ -909,6 +918,16 @@ func runProxyDeploy(cmd *cobra.Command, args []string) {
 		fmt.Printf("Built %s\n", binaryPath)
 	}
 
+	if isModal {
+		// Modal deployment path: use file upload API + exec
+		deployProxyToModal(proxyInstance, binaryPath, listenPort, msPerToken, runningCostFactor, autoAddServers, sglangPort, httpClient, apiToken)
+	} else {
+		// Lambda/Orgo deployment path: use SSH
+		deployProxyToLambda(proxyInstance, binaryPath, listenPort, msPerToken, runningCostFactor, autoAddServers, sglangPort, httpClient, apiToken)
+	}
+}
+
+func deployProxyToLambda(proxyInstance *remote.RunningInstance, binaryPath string, listenPort int, msPerToken, runningCostFactor float64, autoAddServers bool, sglangPort int, httpClient *http.Client, apiToken string) {
 	// Step 3: Get SSH key and connect
 	keyFile, err := remote.GetSSHKeyFileForInstance(proxyInstance)
 	if err != nil {
@@ -1043,7 +1062,129 @@ echo "Cleanup complete"
 	}
 
 	fmt.Printf("\nProxy endpoint: http://%s:%d\n", proxyInstance.IP, listenPort)
-	fmt.Printf("Use: gotoni proxy status --remote %s\n", instanceName)
+}
+
+func deployProxyToModal(proxyInstance *remote.RunningInstance, binaryPath string, listenPort int, msPerToken, runningCostFactor float64, autoAddServers bool, sglangPort int, httpClient *http.Client, apiToken string) {
+	fmt.Println("\nDeploying to Modal sandbox...")
+
+	// Get provider for file operations
+	provider, _ := remote.GetCloudProvider()
+	uploader, ok := provider.(remote.FileUploader)
+	if !ok {
+		log.Fatal("Modal provider does not support file upload")
+	}
+
+	// Read binary
+	binaryContent, err := os.ReadFile(binaryPath)
+	if err != nil {
+		log.Fatalf("Failed to read binary: %v", err)
+	}
+
+	// Step 1: Cleanup and upload binary
+	fmt.Printf("Uploading binary to sandbox %s...\n", proxyInstance.Name)
+
+	// Stop any existing proxy
+	cleanupCmd := `#!/bin/bash
+for pid in $(pgrep -f "gotoni proxy" 2>/dev/null | head -5); do kill $pid 2>/dev/null || true; done
+rm -f /home/ubuntu/gotoni
+echo "CLEANED"
+`
+	provider.ExecuteBashCommand(proxyInstance.ID, cleanupCmd)
+
+	// Upload binary
+	err = uploader.UploadFile(proxyInstance.ID, "/home/ubuntu/gotoni", binaryContent)
+	if err != nil {
+		log.Fatalf("Failed to upload binary: %v", err)
+	}
+
+	// Make executable
+	_, err = provider.ExecuteBashCommand(proxyInstance.ID, "chmod +x /home/ubuntu/gotoni")
+	if err != nil {
+		log.Printf("Warning: chmod failed: %v\n", err)
+	}
+
+	fmt.Println("Upload complete")
+
+	// Step 2: Start proxy
+	fmt.Println("\nStarting proxy...")
+	startCmd := fmt.Sprintf("nohup /home/ubuntu/gotoni proxy start --listen-port %d --ms-per-token %.4f --running-cost-factor %.2f > /tmp/proxy.log 2>&1 &",
+		listenPort, msPerToken, runningCostFactor)
+	_, err = provider.ExecuteBashCommand(proxyInstance.ID, startCmd)
+	if err != nil {
+		log.Fatalf("Failed to start proxy: %v", err)
+	}
+
+	time.Sleep(2 * time.Second)
+
+	// Step 3: Auto-add servers (with Modal-specific handling)
+	if autoAddServers {
+		fmt.Println("\nAuto-discovering SGLang servers...")
+		fmt.Println("Note: For Modal, servers must have tunnel URLs configured")
+
+		instances, err := remote.ListRunningInstances(httpClient, apiToken)
+		if err != nil {
+			log.Printf("Warning: Failed to list instances: %v", err)
+		} else {
+			// Get proxy tunnel URL
+			proxyTunnelURL := getModalTunnelURL(proxyInstance, listenPort)
+			if proxyTunnelURL == "" {
+				fmt.Println("Warning: No tunnel URL available for proxy. Cannot auto-add servers.")
+				fmt.Println("Servers must be added manually using: gotoni proxy servers add <url>")
+			} else {
+				client := &http.Client{Timeout: 5 * time.Second}
+
+				for _, inst := range instances {
+					if inst.ID == proxyInstance.ID {
+						continue
+					}
+
+					// Get tunnel URL for this instance
+					tunnelURL := getModalTunnelURL(&inst, sglangPort)
+					if tunnelURL == "" {
+						fmt.Printf("  Skipping %s: no tunnel URL available\n", inst.Name)
+						continue
+					}
+
+					// Parse tunnel URL
+					parts := strings.Split(tunnelURL, ":")
+					if len(parts) != 2 {
+						fmt.Printf("  Failed to add %s: invalid tunnel URL format\n", inst.Name)
+						continue
+					}
+
+					body := fmt.Sprintf(`{"id": "%s", "ip": "%s", "port": %s}`, tunnelURL, parts[0], parts[1])
+					resp, err := client.Post("http://"+proxyTunnelURL+"/proxy/servers", "application/json", strings.NewReader(body))
+					if err != nil {
+						fmt.Printf("  Failed to add %s (%s): %v\n", inst.Name, tunnelURL, err)
+						continue
+					}
+					resp.Body.Close()
+					fmt.Printf("  Added %s (%s)\n", inst.Name, tunnelURL)
+				}
+			}
+		}
+	}
+
+	// Step 4: Show final status
+	fmt.Println("\nProxy deployment complete!")
+
+	// Get tunnel URL for status check
+	tunnelURL := getModalTunnelURL(proxyInstance, listenPort)
+	if tunnelURL != "" {
+		fmt.Printf("\nProxy tunnel URL: %s\n", tunnelURL)
+		fmt.Printf("Use: gotoni proxy status --host %s --port %d\n", strings.Split(tunnelURL, ":")[0], listenPort)
+	} else {
+		fmt.Println("\nNote: No tunnel URL available yet. Tunnels may take a moment to provision.")
+		fmt.Printf("Sandbox ID: %s\n", proxyInstance.ID)
+	}
+}
+
+// getModalTunnelURL extracts the tunnel URL for a specific port from a Modal sandbox
+func getModalTunnelURL(instance *remote.RunningInstance, port int) string {
+	if instance.TunnelURLs == nil {
+		return ""
+	}
+	return instance.TunnelURLs[fmt.Sprintf("%d", port)]
 }
 
 func runProxyMetricsExport(cmd *cobra.Command, args []string) {

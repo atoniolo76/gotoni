@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/atoniolo76/gotoni/pkg/db"
@@ -32,6 +34,72 @@ func (p *ModalProvider) getClient() (*modal.Client, error) {
 	return client, nil
 }
 
+// parseGPUInstanceType parses instance type strings like "gpu_1x_a100", "gpu_8x_h100", or "cpu"
+// Returns GPU type and count (default count is 1)
+// Supports both Lambda-style (gpu_1x_a100) and Modal-style (a100:8) formats
+func parseGPUInstanceType(instanceType string) (string, int) {
+	instanceType = strings.ToLower(instanceType)
+
+	// Check for Lambda-style format: gpu_<count>x_<type> or gpu_<type> (1x implied)
+	if strings.HasPrefix(instanceType, "gpu_") {
+		// Remove "gpu_" prefix
+		afterGPU := strings.TrimPrefix(instanceType, "gpu_")
+
+		// Check for count prefix like "1x_", "8x_", etc.
+		if strings.Contains(afterGPU, "x_") {
+			parts := strings.SplitN(afterGPU, "x_", 2)
+			if len(parts) == 2 {
+				if count, err := strconv.Atoi(parts[0]); err == nil && count > 0 {
+					return normalizeGPUType(parts[1]), count
+				}
+			}
+		}
+
+		// No count specified, default to 1x
+		return normalizeGPUType(afterGPU), 1
+	}
+
+	// Check for Modal-style format: <type>:<count> (e.g., "a100:8")
+	if strings.Contains(instanceType, ":") {
+		parts := strings.Split(instanceType, ":")
+		gpuType := parts[0]
+		gpuCount := 1
+		if len(parts) > 1 {
+			if count, err := strconv.Atoi(parts[1]); err == nil && count > 0 {
+				gpuCount = count
+			}
+		}
+		return normalizeGPUType(gpuType), gpuCount
+	}
+
+	// Plain GPU type (e.g., "a100", "h100")
+	return normalizeGPUType(instanceType), 1
+}
+
+// normalizeGPUType converts various GPU type names to Modal format
+func normalizeGPUType(gpuType string) string {
+	gpuType = strings.ToLower(strings.TrimSpace(gpuType))
+
+	switch gpuType {
+	case "h100", "h100-80gb":
+		return "H100"
+	case "a100", "a100-80gb", "a100-40gb":
+		return "A100"
+	case "a10", "a10g":
+		return "A10"
+	case "t4":
+		return "T4"
+	case "cpu":
+		return ""
+	default:
+		// Capitalize first letter for unknown types
+		if len(gpuType) > 0 {
+			return strings.ToUpper(gpuType[:1]) + gpuType[1:]
+		}
+		return gpuType
+	}
+}
+
 func (p *ModalProvider) LaunchInstance(httpClient *http.Client, apiToken string, instanceType string, region string, quantity int, name string, sshKeyName string, filesystemName string) ([]LaunchedInstance, error) {
 	return p.LaunchAndWait(httpClient, apiToken, instanceType, region, quantity, name, sshKeyName, 24*time.Hour, filesystemName)
 }
@@ -44,31 +112,35 @@ func (p *ModalProvider) LaunchAndWait(httpClient *http.Client, apiToken string, 
 
 	ctx := context.Background()
 
-	gpuType := instanceType
+	// Parse instance type for GPU count (e.g., "h100:8" for 8x H100)
+	gpuType, gpuCount := parseGPUInstanceType(instanceType)
+
+	// Calculate resources based on GPU type and count
 	cpu := 4.0
 	memoryMiB := 16384
 
-	switch instanceType {
-	case "h100":
-		gpuType = "H100"
-		cpu = 8.0
-		memoryMiB = 32768
-	case "a100":
-		gpuType = "A100"
-		cpu = 8.0
-		memoryMiB = 32768
-	case "a10":
-		gpuType = "A10"
-		cpu = 4.0
-		memoryMiB = 16384
-	case "t4":
-		gpuType = "T4"
-		cpu = 4.0
-		memoryMiB = 16384
-	case "cpu":
-		gpuType = ""
+	switch gpuType {
+	case "H100":
+		cpu = 8.0 * float64(gpuCount)
+		memoryMiB = 32768 * gpuCount
+	case "A100":
+		cpu = 8.0 * float64(gpuCount)
+		memoryMiB = 32768 * gpuCount
+	case "A10":
+		cpu = 4.0 * float64(gpuCount)
+		memoryMiB = 16384 * gpuCount
+	case "T4":
+		cpu = 4.0 * float64(gpuCount)
+		memoryMiB = 16384 * gpuCount
+	case "":
+		// CPU only
 		cpu = 4.0
 		memoryMiB = 8192
+	}
+
+	// Format GPU string for Modal (e.g., "H100:8" for multi-GPU)
+	if gpuType != "" && gpuCount > 1 {
+		gpuType = fmt.Sprintf("%s:%d", gpuType, gpuCount)
 	}
 
 	envVars := map[string]string{}
@@ -90,6 +162,8 @@ func (p *ModalProvider) LaunchAndWait(httpClient *http.Client, apiToken string, 
 		Name:      name,
 		Command:   []string{"sleep", "infinity"},
 		Regions:   []string{region},
+		// Enable tunnels for common ports (SGLang: 8080, LB: 8000)
+		UnencryptedPorts: []int{8080, 8000},
 	}
 
 	volumes := map[string]*modal.Volume{}
@@ -161,11 +235,35 @@ func (p *ModalProvider) GetInstance(httpClient *http.Client, apiToken string, in
 		status = "terminated"
 	}
 
+	// Get tunnel information
+	tunnelURLs := p.getSandboxTunnels(ctx, sandbox)
+
 	return &RunningInstance{
-		ID:     sandbox.SandboxID,
-		Status: status,
-		Name:   sandbox.SandboxID,
+		ID:         sandbox.SandboxID,
+		Status:     status,
+		Name:       sandbox.SandboxID,
+		TunnelURLs: tunnelURLs,
 	}, nil
+}
+
+// getSandboxTunnels retrieves tunnel URLs for a sandbox
+func (p *ModalProvider) getSandboxTunnels(ctx context.Context, sandbox *modal.Sandbox) map[string]string {
+	tunnelURLs := make(map[string]string)
+
+	// Try to get tunnels with a short timeout
+	tunnels, err := sandbox.Tunnels(ctx, 30*time.Second)
+	if err != nil {
+		// Tunnels may not be available yet, that's ok
+		return tunnelURLs
+	}
+
+	for port, tunnel := range tunnels {
+		if tunnel.Host != "" {
+			tunnelURLs[fmt.Sprintf("%d", port)] = fmt.Sprintf("%s:%d", tunnel.Host, tunnel.Port)
+		}
+	}
+
+	return tunnelURLs
 }
 
 func (p *ModalProvider) ListRunningInstances(httpClient *http.Client, apiToken string) ([]RunningInstance, error) {
@@ -185,10 +283,13 @@ func (p *ModalProvider) ListRunningInstances(httpClient *http.Client, apiToken s
 	for sb := range sandboxes {
 		pollResult, _ := sb.Poll(ctx)
 		if pollResult == nil {
+			// Get tunnel information
+			tunnelURLs := p.getSandboxTunnels(ctx, sb)
 			instances = append(instances, RunningInstance{
-				ID:     sb.SandboxID,
-				Status: "running",
-				Name:   sb.SandboxID,
+				ID:         sb.SandboxID,
+				Status:     "running",
+				Name:       sb.SandboxID,
+				TunnelURLs: tunnelURLs,
 			})
 		}
 	}
@@ -268,11 +369,12 @@ func (p *ModalProvider) DeleteSSHKey(httpClient *http.Client, apiToken string, s
 }
 
 func (p *ModalProvider) GetAvailableInstanceTypes(httpClient *http.Client, apiToken string) ([]Instance, error) {
+	// Return Lambda-style instance type names for consistency
 	return []Instance{
 		{
 			InstanceType: InstanceType{
-				Name:        "h100",
-				Description: "H100 GPU",
+				Name:        "gpu_1x_h100",
+				Description: "1x H100 GPU",
 			},
 			RegionsWithCapacityAvailable: []Region{
 				{Name: "us-east-1", Description: "US East (N. Virginia)"},
@@ -282,18 +384,8 @@ func (p *ModalProvider) GetAvailableInstanceTypes(httpClient *http.Client, apiTo
 		},
 		{
 			InstanceType: InstanceType{
-				Name:        "a100",
-				Description: "A100 GPU",
-			},
-			RegionsWithCapacityAvailable: []Region{
-				{Name: "us-east-1", Description: "US East (N. Virginia)"},
-				{Name: "us-west-2", Description: "US West (Oregon)"},
-			},
-		},
-		{
-			InstanceType: InstanceType{
-				Name:        "a10",
-				Description: "A10G GPU",
+				Name:        "gpu_8x_h100",
+				Description: "8x H100 GPU",
 			},
 			RegionsWithCapacityAvailable: []Region{
 				{Name: "us-east-1", Description: "US East (N. Virginia)"},
@@ -303,8 +395,49 @@ func (p *ModalProvider) GetAvailableInstanceTypes(httpClient *http.Client, apiTo
 		},
 		{
 			InstanceType: InstanceType{
-				Name:        "t4",
-				Description: "T4 GPU",
+				Name:        "gpu_1x_a100",
+				Description: "1x A100 GPU",
+			},
+			RegionsWithCapacityAvailable: []Region{
+				{Name: "us-east-1", Description: "US East (N. Virginia)"},
+				{Name: "us-west-2", Description: "US West (Oregon)"},
+			},
+		},
+		{
+			InstanceType: InstanceType{
+				Name:        "gpu_4x_a100",
+				Description: "4x A100 GPU",
+			},
+			RegionsWithCapacityAvailable: []Region{
+				{Name: "us-east-1", Description: "US East (N. Virginia)"},
+				{Name: "us-west-2", Description: "US West (Oregon)"},
+			},
+		},
+		{
+			InstanceType: InstanceType{
+				Name:        "gpu_8x_a100",
+				Description: "8x A100 GPU",
+			},
+			RegionsWithCapacityAvailable: []Region{
+				{Name: "us-east-1", Description: "US East (N. Virginia)"},
+				{Name: "us-west-2", Description: "US West (Oregon)"},
+			},
+		},
+		{
+			InstanceType: InstanceType{
+				Name:        "gpu_1x_a10",
+				Description: "1x A10G GPU",
+			},
+			RegionsWithCapacityAvailable: []Region{
+				{Name: "us-east-1", Description: "US East (N. Virginia)"},
+				{Name: "us-west-2", Description: "US West (Oregon)"},
+				{Name: "eu-west-1", Description: "EU (Ireland)"},
+			},
+		},
+		{
+			InstanceType: InstanceType{
+				Name:        "gpu_1x_t4",
+				Description: "1x T4 GPU",
 			},
 			RegionsWithCapacityAvailable: []Region{
 				{Name: "us-east-1", Description: "US East (N. Virginia)"},

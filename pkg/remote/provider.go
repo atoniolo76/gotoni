@@ -41,6 +41,15 @@ type CloudProvider interface {
 	ExecutePythonCode(instanceID string, code string, timeout int) (string, error)
 }
 
+// FileUploader is an optional interface for providers that support direct file uploads
+// Modal implements this using the sandbox filesystem API
+// Lambda/Orgo can use SCP via SSH (implemented separately)
+type FileUploader interface {
+	UploadFile(instanceID string, remotePath string, content []byte) error
+	UploadFileFromPath(instanceID string, localPath string, remotePath string) error
+	DownloadFile(instanceID string, remotePath string) ([]byte, error)
+}
+
 // CloudProviderType represents the type of cloud provider
 type CloudProviderType string
 

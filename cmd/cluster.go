@@ -164,6 +164,16 @@ func runClusterStatus(cmd *cobra.Command, args []string) {
 		return
 	}
 
+	// Check provider type
+	_, providerType := remote.GetCloudProvider()
+	isModal := providerType == remote.CloudProviderModal
+
+	if isModal {
+		// For Modal, use tunnel URLs instead of IPs
+		runClusterStatusModal(instances)
+		return
+	}
+
 	client := &http.Client{Timeout: 5 * time.Second}
 	var wg sync.WaitGroup
 	results := make(chan nodeStatus, len(instances))
@@ -220,7 +230,98 @@ func runClusterStatus(cmd *cobra.Command, args []string) {
 	fmt.Println()
 }
 
+// runClusterStatusModal checks status of Modal sandboxes using tunnel URLs
+func runClusterStatusModal(instances []remote.RunningInstance) {
+	fmt.Println("\nModal sandbox status (using tunnel URLs):")
+	fmt.Println("Note: Health checks require tunnels to be provisioned")
+	fmt.Println()
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	var wg sync.WaitGroup
+	results := make(chan nodeStatus, len(instances))
+
+	for _, inst := range instances {
+		wg.Add(1)
+		go func(instance remote.RunningInstance) {
+			defer wg.Done()
+
+			// Get tunnel URLs
+			lbTunnel := instance.TunnelURLs["8000"]
+			sglangTunnel := instance.TunnelURLs["8080"]
+
+			tunnelInfo := "no tunnels"
+			if lbTunnel != "" || sglangTunnel != "" {
+				tunnelInfo = fmt.Sprintf("LB:%v SGLang:%v", lbTunnel != "", sglangTunnel != "")
+			}
+
+			status := nodeStatus{
+				Name: instance.Name,
+				IP:   tunnelInfo,
+			}
+
+			// Check LB via tunnel
+			if lbTunnel != "" {
+				resp, err := client.Get(fmt.Sprintf("http://%s/lb/status", lbTunnel))
+				if err == nil {
+					defer resp.Body.Close()
+					var lbStatus map[string]interface{}
+					if json.NewDecoder(resp.Body).Decode(&lbStatus) == nil {
+						status.LBHealthy = true
+						if peers, ok := lbStatus["peer_count"].(float64); ok {
+							status.LBPeers = int(peers)
+						}
+					}
+				}
+			}
+
+			// Check SGLang via tunnel
+			if sglangTunnel != "" {
+				resp, err := client.Get(fmt.Sprintf("http://%s/health", sglangTunnel))
+				if err == nil {
+					defer resp.Body.Close()
+					status.SGLang = resp.StatusCode == 200
+				}
+			}
+
+			results <- status
+		}(inst)
+	}
+
+	wg.Wait()
+	close(results)
+
+	// Print results
+	fmt.Printf("%-20s %-30s %-12s %-8s %-8s\n", "NAME", "TUNNELS", "LB", "PEERS", "SGLANG")
+	fmt.Println(strings.Repeat("-", 80))
+
+	for status := range results {
+		lbStr := "❌"
+		if status.LBHealthy {
+			lbStr = "✅"
+		}
+		sgStr := "❌"
+		if status.SGLang {
+			sgStr = "✅"
+		}
+		fmt.Printf("%-20s %-30s %-12s %-8d %-8s\n",
+			status.Name, status.IP, lbStr, status.LBPeers, sgStr)
+	}
+	fmt.Println()
+}
+
 func runClusterRestartLB(cmd *cobra.Command, args []string) {
+	// Check provider type
+	_, providerType := remote.GetCloudProvider()
+	if providerType == remote.CloudProviderModal {
+		fmt.Println("⚠️  cluster restart-lb is not supported for Modal sandboxes")
+		fmt.Println()
+		fmt.Println("Modal sandboxes use tunnels for networking. To manage load balancers:")
+		fmt.Println("  1. Upload the binary: gotoni cluster upload")
+		fmt.Println("  2. Start LB manually in each sandbox using Modal exec API")
+		fmt.Println("  3. Or deploy a centralized proxy: gotoni proxy deploy <sandbox-name>")
+		return
+	}
+
 	instances, err := getClusterNodes()
 	if err != nil {
 		fmt.Printf("Failed to get instances: %v\n", err)
@@ -334,6 +435,10 @@ fi
 }
 
 func runClusterUpload(cmd *cobra.Command, args []string) {
+	// Check provider type
+	_, providerType := remote.GetCloudProvider()
+	isModal := providerType == remote.CloudProviderModal
+
 	fmt.Println("Building gotoni for Linux...")
 
 	// Build binary
@@ -352,6 +457,12 @@ func runClusterUpload(cmd *cobra.Command, args []string) {
 	if err != nil {
 		fmt.Printf("Failed to get instances: %v\n", err)
 		os.Exit(1)
+	}
+
+	if isModal {
+		// Modal deployment: use file upload API
+		uploadToModalSandboxes(instances, "/tmp/gotoni-linux")
+		return
 	}
 
 	sshMgr := remote.NewSSHClientManager()
@@ -414,6 +525,58 @@ rm -f /home/ubuntu/gotoni
 
 	wg.Wait()
 	fmt.Println("\nDone. Run 'gotoni cluster restart-lb' to use new binary.")
+}
+
+// uploadToModalSandboxes uploads the gotoni binary to Modal sandboxes using the file upload API
+func uploadToModalSandboxes(instances []remote.RunningInstance, binaryPath string) {
+	fmt.Println("Uploading to Modal sandboxes...")
+
+	provider, _ := remote.GetCloudProvider()
+	uploader, ok := provider.(remote.FileUploader)
+	if !ok {
+		fmt.Println("❌ Modal provider does not support file upload")
+		return
+	}
+
+	binaryContent, err := os.ReadFile(binaryPath)
+	if err != nil {
+		fmt.Printf("❌ Failed to read binary: %v\n", err)
+		return
+	}
+
+	var wg sync.WaitGroup
+	for _, inst := range instances {
+		wg.Add(1)
+		go func(instance remote.RunningInstance) {
+			defer wg.Done()
+
+			// Cleanup
+			cleanupCmd := `#!/bin/bash
+for pid in $(pgrep -f "gotoni" 2>/dev/null | head -5); do kill $pid 2>/dev/null || true; done
+rm -f /home/ubuntu/gotoni
+echo "CLEANED"
+`
+			provider.ExecuteBashCommand(instance.ID, cleanupCmd)
+
+			// Upload
+			err := uploader.UploadFile(instance.ID, "/home/ubuntu/gotoni", binaryContent)
+			if err != nil {
+				fmt.Printf("%-20s: ❌ upload failed: %v\n", instance.Name, err)
+				return
+			}
+
+			// Make executable
+			_, err = provider.ExecuteBashCommand(instance.ID, "chmod +x /home/ubuntu/gotoni")
+			if err != nil {
+				fmt.Printf("%-20s: ⚠️  chmod failed: %v\n", instance.Name, err)
+			}
+
+			fmt.Printf("%-20s: ✅ uploaded\n", instance.Name)
+		}(inst)
+	}
+
+	wg.Wait()
+	fmt.Println("\nDone. Binary uploaded to all sandboxes.")
 }
 
 func runClusterStartTrace(cmd *cobra.Command, args []string) {
@@ -637,6 +800,10 @@ func runClusterTokenizerStatus(cmd *cobra.Command, args []string) {
 }
 
 func runClusterSetup(cmd *cobra.Command, args []string) {
+	// Check provider type
+	_, providerType := remote.GetCloudProvider()
+	isModal := providerType == remote.CloudProviderModal
+
 	// Get flags
 	clusterName, _ := cmd.Flags().GetString("cluster-name")
 	strategy, _ := cmd.Flags().GetString("strategy")
@@ -644,12 +811,23 @@ func runClusterSetup(cmd *cobra.Command, args []string) {
 	runningThreshold, _ := cmd.Flags().GetInt("running-threshold")
 
 	fmt.Println("🚀 Starting complete cluster setup...")
-	fmt.Println("Steps:")
-	fmt.Println("  1. Connect to cluster and fix common issues (docker permissions)")
-	fmt.Println("  2. Setup SGLang Docker containers")
-	fmt.Println("  3. Build and upload gotoni binary")
-	fmt.Printf("  4. Start load balancers with strategy=%s\n", strategy)
-	fmt.Println()
+
+	if isModal {
+		fmt.Println("Modal provider detected")
+		fmt.Println("Steps:")
+		fmt.Println("  1. Connect to Modal sandboxes")
+		fmt.Println("  2. Setup SGLang inside sandboxes")
+		fmt.Println("  3. Upload gotoni binary via Modal API")
+		fmt.Printf("  4. Start load balancers with strategy=%s\n", strategy)
+		fmt.Println()
+	} else {
+		fmt.Println("Steps:")
+		fmt.Println("  1. Connect to cluster and fix common issues (docker permissions)")
+		fmt.Println("  2. Setup SGLang Docker containers")
+		fmt.Println("  3. Build and upload gotoni binary")
+		fmt.Printf("  4. Start load balancers with strategy=%s\n", strategy)
+		fmt.Println()
+	}
 
 	// Get cluster instances
 	httpClient := remote.NewHTTPClient()
