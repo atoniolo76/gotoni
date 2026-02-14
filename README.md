@@ -2,9 +2,13 @@
 
 Maximizing KV-Cache Reuse While Minimizing Network Latency in Cross-Region LLM Load Balancing.
 
-## Python Environment Setup
+## About this Repo
 
-Create a Python virtual environment in the benchmark directory:
+Gotoni helps manage and orchestrate GPU resources across clouds and regions. In this branch, we augment Gotoni with custom load balancing logic, request-level tracing, and a sidecar tokenziation service. To test load-balancing policies, Gotoni provides support for running GPUs on [Lambda.ai](https://lambda.ai) and GPU-enabled Sandboxes on [Modal](https://modal.com). 
+
+## Environment Setup
+
+1. Create a Python virtual environment in the benchmark directory:
 
 ```bash
 cd benchmark
@@ -14,21 +18,42 @@ pip install -r requirements.txt
 cd ..
 ```
 
-## Setup for Research Replication/Experimentation
-1. [Install golang](https://go.dev/doc/install)
-2. Clone this repo
-3. Build gotoni from source
-```bash
-go build -o gotoni
-```
-4. Setup an account on [Lambda.ai](https://lambda.ai) and run:
+2. [Install golang](https://go.dev/doc/install)
+3. Clone this repo
+4. Export your cloud credentials:
+-  For [Lambda.ai](https://lambda.ai) run:
 ```bash
 export LAMBDA_API_KEY=your_token_here
 ```
-> Email [atoniolo76@gmail.com](mailto:atoniolo76@gmail.com) to get a Lambda.ai API key for testing
-5. Run `./gotoni available` to see available Lambda instances and `./gotoni launch` to check out instances
-- Note: Instances from at least three separate regions are required for Gorgo's TTFT improvement (or two if running GORGO-proxy)
-6. Run `./gotoni cluster setup`, which handles sglang installation, mistral-7b download, and the gotoni binary deployment for load balancer processes. Uses all currently running Lambda.ai instances on your account.
+- For [Modal](https://modal.com) run:
+```bash
+export MODAL_TOKEN_ID=your_token_here
+```
+> **Modal users**: Ensure your Modal token has sandbox creation permissions. Modal uses tunnels (not direct IPs) for networking - ports 8080 (SGLang) and 8000 (LB) are automatically tunneled.
+5. (Optional) Set active cloud provider explicitly:
+```bash
+export GOTONI_CLOUD=lambda  # or 'modal'
+```
+> If not set, gotoni defaults to Lambda. Ensure you've exported the corresponding API key from step 4.
+
+6. Build gotoni from source:
+```bash
+go build -o gotoni
+```
+
+7. Run `./gotoni available` to see available instances (uses whichever cloud credentials you exported above), then launch instances:
+```bash
+# Launch a single GPU instance
+./gotoni launch --type gpu_1x_a100 --name my-node --region us-east-1
+
+# Launch multi-GPU (Modal supports up to 8x)
+./gotoni launch --type gpu_8x_h100 --name big-cluster --region us-west-2
+```
+> Check out instances from at least 3 regions to properly evaluate GORGO or 2 for GORGO-proxy.
+
+8. Run `./gotoni cluster setup`, which handles sglang installation, mistral-7b download, and the gotoni binary deployment for load balancer processes. Uses all currently running instances on your account (Lambda or Modal).
+
+> **Modal Sandbox Details**: Everything is managed through code - no dashboard configuration needed. Sandboxes run as long-running processes (via `sleep infinity`). Services inside sandboxes (SGLang on port 8080, Load Balancer on port 8000) are automatically exposed via Modal's tunnel system, creating public URLs like `https://xxxxx-8080.modal.run`. All operations (upload, exec, status checks) use Modal's API - no SSH keys required.
 
 ## Benchmarking Routing Policies
 
@@ -60,7 +85,9 @@ guidellm benchmark \
 
 Results, including metrics like TTFT and Throughput, are saved to `guidellm_results/`.
 
-**Note #1**: Update cluster node IPs in `geo_proxy.py` (lines 40-44) to match your deployment.
+**Note #1**: Update cluster endpoints in `geo_proxy.py` (lines 40-44) to match your deployment:
+- **Lambda**: Use instance IPs directly
+- **Modal**: Use tunnel URLs (e.g., `https://xxxxx-8080.modal.run`)
 
 **Note #2**: Between benchmarks, run `gotoni cluster flush-cache` to clear both KV-caches and LB prefix trees, otherwise prefix-tree and GORGO will behave like least-load.
 

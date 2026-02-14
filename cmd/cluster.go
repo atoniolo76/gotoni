@@ -312,15 +312,7 @@ func runClusterStatusModal(instances []remote.RunningInstance) {
 func runClusterRestartLB(cmd *cobra.Command, args []string) {
 	// Check provider type
 	_, providerType := remote.GetCloudProvider()
-	if providerType == remote.CloudProviderModal {
-		fmt.Println("⚠️  cluster restart-lb is not supported for Modal sandboxes")
-		fmt.Println()
-		fmt.Println("Modal sandboxes use tunnels for networking. To manage load balancers:")
-		fmt.Println("  1. Upload the binary: gotoni cluster upload")
-		fmt.Println("  2. Start LB manually in each sandbox using Modal exec API")
-		fmt.Println("  3. Or deploy a centralized proxy: gotoni proxy deploy <sandbox-name>")
-		return
-	}
+	isModal := providerType == remote.CloudProviderModal
 
 	instances, err := getClusterNodes()
 	if err != nil {
@@ -331,6 +323,11 @@ func runClusterRestartLB(cmd *cobra.Command, args []string) {
 	strategy, _ := cmd.Flags().GetString("strategy")
 	maxConcurrent, _ := cmd.Flags().GetInt("max-concurrent")
 	runningThreshold, _ := cmd.Flags().GetInt("running-threshold")
+
+	if isModal {
+		restartLBOnModal(instances, strategy, maxConcurrent, runningThreshold)
+		return
+	}
 
 	// Collect all IPs for peer configuration
 	var allIPs []string
@@ -427,6 +424,90 @@ fi
 			} else {
 				fmt.Printf("%-20s: ❌ restart failed\n%s\n", instance.Name, output)
 			}
+		}(inst, i)
+	}
+
+	wg.Wait()
+	fmt.Println("\nDone. Run 'gotoni cluster status' to verify.")
+}
+
+// restartLBOnModal restarts load balancers on Modal sandboxes using Exec API
+func restartLBOnModal(instances []remote.RunningInstance, strategy string, maxConcurrent, runningThreshold int) {
+	fmt.Printf("Restarting LBs on Modal sandboxes with strategy=%s, max_concurrent=%d\n\n", strategy, maxConcurrent)
+
+	provider, _ := remote.GetCloudProvider()
+
+	// Collect all tunnel URLs for peer configuration
+	var allTunnels []string
+	for _, inst := range instances {
+		if tunnel := inst.TunnelURLs["8000"]; tunnel != "" {
+			allTunnels = append(allTunnels, tunnel)
+		}
+	}
+
+	var wg sync.WaitGroup
+	for i, inst := range instances {
+		wg.Add(1)
+		go func(instance remote.RunningInstance, idx int) {
+			defer wg.Done()
+
+			// Build peer list (all other nodes using tunnel URLs)
+			var peers []string
+			for j, tunnel := range allTunnels {
+				if j != idx && tunnel != "" {
+					peers = append(peers, fmt.Sprintf("--peers %s", tunnel))
+				}
+			}
+			peersArg := strings.Join(peers, " ")
+
+			// Build threshold flag if set
+			thresholdArg := ""
+			if runningThreshold > 0 {
+				thresholdArg = fmt.Sprintf("--running-threshold %d", runningThreshold)
+			}
+
+			// Stop existing LB
+			stopCmd := `#!/bin/bash
+for pid in $(pgrep -f "gotoni lb" 2>/dev/null | head -5); do kill $pid 2>/dev/null || true; done
+sleep 1
+echo "STOPPED"
+`
+			_, err := provider.ExecuteBashCommand(instance.ID, stopCmd)
+			if err != nil {
+				fmt.Printf("%-20s: ⚠️  stop warning: %v\n", instance.Name, err)
+			}
+
+			// Check binary exists
+			checkCmd := "test -f /home/ubuntu/gotoni && echo 'EXISTS' || echo 'MISSING'"
+			output, err := provider.ExecuteBashCommand(instance.ID, checkCmd)
+			if err != nil || strings.TrimSpace(output) != "EXISTS" {
+				fmt.Printf("%-20s: ❌ binary not found at /home/ubuntu/gotoni\n", instance.Name)
+				return
+			}
+
+			// Start LB
+			startCmd := fmt.Sprintf(`#!/bin/bash
+nohup /home/ubuntu/gotoni lb start \
+  --listen-port 8000 \
+  --local-port 8080 \
+  --strategy %s \
+  --max-concurrent %d \
+  --ie-queue-indicator \
+  --node-id %s \
+  %s %s \
+  > /home/ubuntu/lb.log 2>&1 &
+disown
+sleep 2
+echo "STARTED"
+`, strategy, maxConcurrent, instance.Name, thresholdArg, peersArg)
+
+			_, err = provider.ExecuteBashCommand(instance.ID, startCmd)
+			if err != nil {
+				fmt.Printf("%-20s: ❌ failed to start: %v\n", instance.Name, err)
+				return
+			}
+
+			fmt.Printf("%-20s: ✅ restarted\n", instance.Name)
 		}(inst, i)
 	}
 
