@@ -1,0 +1,8 @@
+README.md
+pyproject.toml
+gotoni/__init__.py
+gotoni.egg-info/PKG-INFO
+gotoni.egg-info/SOURCES.txt
+gotoni.egg-info/dependency_links.txt
+gotoni.egg-info/requires.txt
+gotoni.egg-info/top_level.txt
