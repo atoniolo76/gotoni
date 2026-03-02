@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gotoni"
-version = "0.1.2"
+version = "0.1.7"
 description = "A helper package to easily add SSH support to Modal apps."
 readme = "README.md"
 authors = [

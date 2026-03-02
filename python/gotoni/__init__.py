@@ -3,7 +3,30 @@ import subprocess
 import time
 import modal
 
-def add_ssh(image: modal.Image, key_path: str = "~/.ssh/id_rsa.pub") -> modal.Image:
+_KEY_CANDIDATES = [
+    "~/.ssh/id_ed25519.pub",
+    "~/.ssh/id_rsa.pub",
+    "~/.ssh/id_ecdsa.pub",
+    "~/.ssh/id_dsa.pub",
+]
+
+def _resolve_key_path(key_path: str | None) -> str:
+    if key_path is not None:
+        resolved = os.path.abspath(os.path.expanduser(key_path))
+        if not os.path.exists(resolved):
+            raise FileNotFoundError(f"SSH public key not found: {resolved}")
+        return resolved
+    for candidate in _KEY_CANDIDATES:
+        resolved = os.path.abspath(os.path.expanduser(candidate))
+        if os.path.exists(resolved):
+            return resolved
+    raise FileNotFoundError(
+        "No SSH public key found in ~/.ssh/. "
+        "Generate one with: ssh-keygen -t ed25519"
+    )
+
+
+def add_ssh(image: modal.Image, key_path: str | None = None) -> modal.Image:
     """
     Modifies a Modal image to configure an SSH daemon, allowing secure remote access.
     
@@ -14,28 +37,40 @@ def add_ssh(image: modal.Image, key_path: str = "~/.ssh/id_rsa.pub") -> modal.Im
        - Allow root login ('PermitRootLogin yes').
        - Enable public key authentication ('PubkeyAuthentication yes').
        - Disable password authentication ('PasswordAuthentication no').
-    4. Copies the specified local SSH public key to the container's '/root/.ssh/authorized_keys'.
-    5. Sets strict permissions (chmod 600) on the 'authorized_keys' file to ensure SSH accepts it.
+       - Disable StrictModes to avoid home-directory permission issues in containers.
+       - Disable UsePAM since minimal images (e.g. debian_slim) lack a full PAM setup.
+    4. Copies the local SSH public key to the container's '/root/.ssh/authorized_keys'.
+       Auto-detects the key type (ed25519, rsa, ecdsa, dsa) when key_path is not given.
+    5. Sets strict permissions (chmod 600) on the 'authorized_keys' file.
     
     Args:
         image (modal.Image): The base Modal image to modify.
-        key_path (str): The path to your local public SSH key. 
-                        Defaults to "~/.ssh/id_rsa.pub".
+        key_path (str | None): Path to your local public SSH key.
+                               When None (default), auto-detects the first available key
+                               in ~/.ssh/ (tries ed25519, rsa, ecdsa, dsa in order).
                         
     Returns:
         modal.Image: The updated Modal image with the SSH daemon and keys configured.
     """
-    return (
-        image
-        .apt_install("openssh-server")
-        .run_commands(
-            "ssh-keygen -A",
-            r"sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config",
-            r"sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/' /etc/ssh/sshd_config",
-            r"sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config",
-        )
-        .add_local_file(os.path.abspath(os.path.expanduser(key_path)), "/root/.ssh/authorized_keys", copy=True)
-        .run_commands("chmod 600 /root/.ssh/authorized_keys")
+    # When Modal imports this module inside a running container it re-executes
+    # module-level code (including add_ssh calls) to locate the decorated
+    # function.  The image is already built at that point, so skip everything.
+    if os.environ.get("MODAL_TASK_ID"):
+        return image
+
+    resolved_key_path = _resolve_key_path(key_path)
+    pubkey = open(resolved_key_path).read().strip()
+
+    return image.run_commands(
+        "apt-get update && apt-get install -y openssh-server && rm -rf /var/lib/apt/lists/*",
+        "mkdir -p /root/.ssh && chmod 700 /root/.ssh",
+        f"echo '{pubkey}' > /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys",
+        "ssh-keygen -A",
+        r"sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config",
+        r"sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/' /etc/ssh/sshd_config",
+        r"sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config",
+        r"sed -i 's/^#\?StrictModes.*/StrictModes no/' /etc/ssh/sshd_config || echo 'StrictModes no' >> /etc/ssh/sshd_config",
+        r"sed -i 's/^#\?UsePAM.*/UsePAM no/' /etc/ssh/sshd_config || echo 'UsePAM no' >> /etc/ssh/sshd_config",
     )
 
 
@@ -57,16 +92,25 @@ def start_ssh(port: int = 2222, timeout: int = 3600):
         timeout (int): The number of seconds to keep the container running and the tunnel open. 
                        Defaults to 3600 (1 hour).
     """
-    # Start the SSH daemon in the background
-    subprocess.Popen(["/usr/sbin/sshd", "-D", "-e", "-p", str(port)])
-    
-    # Expose via Modal tunnel
+    os.makedirs("/run/sshd", exist_ok=True)
+    subprocess.run(["/usr/sbin/sshd", "-t"], check=True)
+
+    proc = subprocess.Popen(
+        ["/usr/sbin/sshd", "-D", "-e", "-p", str(port)],
+        stderr=subprocess.PIPE,
+    )
+
+    # Give sshd a moment to bind and confirm it hasn't crashed on startup
+    time.sleep(1)
+    if proc.poll() is not None:
+        stderr_output = proc.stderr.read().decode() if proc.stderr else ""
+        raise RuntimeError(f"sshd exited immediately (code {proc.returncode}):\n{stderr_output}")
+
     with modal.forward(port=port, unencrypted=True) as tunnel:
         host, tunnel_port = tunnel.tcp_socket
         print(f"\n=======================================================")
         print(f" SSH into container using command:")
         print(f"     ssh -p {tunnel_port} root@{host}")
         print(f"=======================================================\n")
-        
-        # Block to keep the container alive and tunnel active
+
         time.sleep(timeout)
