@@ -104,16 +104,10 @@ func openInIDE(instanceName, remotePath string, forceCode bool) {
 	var binary string
 	if forceCode {
 		binary = "code"
-		fmt.Printf("Opening VS Code for instance '%s' at path '%s'...\n", instanceName, remotePath)
 	} else {
-		// Default to 'cursor', fallback to 'code'
 		binary = "cursor"
-		if _, err := exec.LookPath("cursor"); err != nil {
-			fmt.Println("Warning: 'cursor' command not found in PATH. Falling back to 'code'...")
-			binary = "code"
-		}
-		fmt.Printf("Opening %s for instance '%s' at path '%s'...\n", binary, instanceName, remotePath)
 	}
+	fmt.Printf("Opening %s for instance '%s' at path '%s'...\n", binary, instanceName, remotePath)
 
 	command := exec.Command(binary, "--folder-uri", uri)
 

@@ -13,15 +13,27 @@ import (
 
 // openCmd represents the open command
 var openCmd = &cobra.Command{
-	Use:   "open <instance-name> [remote-path]",
+	Use:   "open <instance-name> [remote-path] --code|--cursor",
 	Short: "Open a remote instance in VS Code or Cursor",
-	Long: `Open a remote instance in VS Code or Cursor via SSH remote. Defaults to Cursor if available.
+	Long: `Open a remote instance in VS Code or Cursor via SSH remote.
+
+You must specify either --code or --cursor to choose the editor.
 
 Requirements:
   - For Cursor: Ensure the 'cursor' command is installed (Cmd+Shift+P > "Install 'cursor' command")
   - For VS Code: Ensure the 'code' command is installed (Cmd+Shift+P > "Install 'code' command")`,
 	Args: cobra.MinimumNArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
+		useCode, _ := cmd.Flags().GetBool("code")
+		useCursor, _ := cmd.Flags().GetBool("cursor")
+
+		if !useCode && !useCursor {
+			log.Fatal("You must specify either --code or --cursor")
+		}
+		if useCode && useCursor {
+			log.Fatal("Cannot specify both --code and --cursor")
+		}
+
 		target := args[0]
 		remotePath := "/home/ubuntu"
 
@@ -34,27 +46,18 @@ Requirements:
 			}
 		}
 
-		forceCode, _ := cmd.Flags().GetBool("code")
-
 		// Determine instance name
 		var instanceName string
 		if strings.Contains(target, ".") {
-			// It's an IP - we can't open in IDE with IP, need to resolve to name
 			log.Fatal("Cannot open IDE with IP address. Please provide an instance name instead.")
 		} else {
-			// It's a name - try to resolve it for IDE opening
-			// For IDE opening, we ideally need the SSH config name
-
-			// Try to resolve to verify it exists, but use the provided name as the host alias
 			apiToken := remote.GetAPIToken()
 			if apiToken != "" {
 				httpClient := remote.NewHTTPClient()
 				_, err := remote.ResolveInstance(httpClient, apiToken, target)
 				if err == nil {
-					// It exists in cloud, assume it's configured in SSH
 					instanceName = target
 				} else {
-					// Not found in cloud, might be just an SSH config entry
 					instanceName = target
 				}
 			} else {
@@ -62,11 +65,12 @@ Requirements:
 			}
 		}
 
-		openInIDE(instanceName, remotePath, forceCode)
+		openInIDE(instanceName, remotePath, useCode)
 	},
 }
 
 func init() {
 	rootCmd.AddCommand(openCmd)
-	openCmd.Flags().Bool("code", false, "Force open in VS Code")
+	openCmd.Flags().Bool("code", false, "Open in VS Code")
+	openCmd.Flags().Bool("cursor", false, "Open in Cursor")
 }
