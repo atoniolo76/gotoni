@@ -97,7 +97,6 @@ var receiveCmd = &cobra.Command{
 			fmt.Printf("Receiving file '%s' (%d bytes)...\n", fileName, len(data))
 		}
 
-		// If instance name still empty, derive from filename
 		if instanceName == "" {
 			instanceName = strings.TrimSuffix(fileName, filepath.Ext(fileName))
 		}
@@ -106,7 +105,6 @@ var receiveCmd = &cobra.Command{
 
 		// 4. Remove existing file if it exists (it might be read-only)
 		if _, err := os.Stat(targetPath); err == nil {
-			// File exists, make it writable first then remove it
 			os.Chmod(targetPath, 0600)
 			if err := os.Remove(targetPath); err != nil {
 				log.Fatalf("Failed to remove existing key file: %v", err)
@@ -115,13 +113,11 @@ var receiveCmd = &cobra.Command{
 		}
 
 		// 5. Save file with secure permissions
-		// Open destination file with 0600 permissions (read/write owner)
 		err = os.WriteFile(targetPath, fileContent, 0600)
 		if err != nil {
 			log.Fatalf("Failed to write key file: %v", err)
 		}
 
-		// Now lock it down to read-only (0400)
 		if err := os.Chmod(targetPath, 0400); err != nil {
 			log.Printf("Warning: failed to set secure permissions (0400): %v", err)
 		}
@@ -142,7 +138,18 @@ var receiveCmd = &cobra.Command{
 		}
 
 		// 7. Update SSH config (~/.ssh/config)
-		if instanceIP != "" {
+		if isJSON && payload.TunnelHost != "" && payload.TunnelPort != "" {
+			sshUser := payload.SSHUser
+			if sshUser == "" {
+				sshUser = "root"
+			}
+			fmt.Printf("Configuring SSH tunnel access for %s (%s:%s)...\n", instanceName, payload.TunnelHost, payload.TunnelPort)
+			if err := remote.UpdateSSHConfigWithTunnel(instanceName, payload.TunnelHost, payload.TunnelPort, sshUser, targetPath); err != nil {
+				log.Printf("Failed to update SSH config: %v", err)
+			} else {
+				fmt.Printf("\n✓ You can now connect with: ssh %s\n", instanceName)
+			}
+		} else if instanceIP != "" {
 			fmt.Printf("Configuring SSH access for %s (%s)...\n", instanceName, instanceIP)
 			if err := remote.UpdateSSHConfig(instanceName, instanceIP, targetPath); err != nil {
 				log.Printf("Failed to update SSH config: %v", err)
@@ -150,7 +157,6 @@ var receiveCmd = &cobra.Command{
 				fmt.Printf("\n✓ You can now connect with: ssh %s\n", instanceName)
 			}
 		} else {
-			// Fallback for non-payload transfer
 			fmt.Println("\nTo complete setup, you need to know the Instance IP.")
 			fmt.Printf("Run: ssh -i %s ubuntu@<IP>\n", targetPath)
 

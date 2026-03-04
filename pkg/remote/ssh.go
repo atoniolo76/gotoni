@@ -397,3 +397,37 @@ func UpdateSSHConfig(hostName, hostIP, identityFile string) error {
 	fmt.Printf("Updated SSH config at %s with host '%s'\n", configPath, hostName)
 	return nil
 }
+
+// UpdateSSHConfigWithTunnel adds a Host entry configured for a tunnel-based connection (host + port + custom user).
+func UpdateSSHConfigWithTunnel(hostAlias, hostName, port, user, identityFile string) error {
+	sshDir, err := getSSHDir()
+	if err != nil {
+		return err
+	}
+
+	configPath := filepath.Join(sshDir, "config")
+
+	f, err := os.OpenFile(configPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+	if err != nil {
+		return fmt.Errorf("failed to open ssh config: %w", err)
+	}
+	defer f.Close()
+
+	content, err := os.ReadFile(configPath)
+	if err == nil {
+		if strings.Contains(string(content), "Host "+hostAlias) {
+			fmt.Printf("Warning: Host '%s' already exists in %s, skipping update.\n", hostAlias, configPath)
+			return nil
+		}
+	}
+
+	entry := fmt.Sprintf("\nHost %s\n  HostName %s\n  Port %s\n  User %s\n  IdentityFile %s\n  StrictHostKeyChecking no\n  UserKnownHostsFile /dev/null\n",
+		hostAlias, hostName, port, user, identityFile)
+
+	if _, err := f.WriteString(entry); err != nil {
+		return fmt.Errorf("failed to write to ssh config: %w", err)
+	}
+
+	fmt.Printf("Updated SSH config at %s with host '%s'\n", configPath, hostAlias)
+	return nil
+}
