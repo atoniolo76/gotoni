@@ -2,7 +2,7 @@
 
 ![gotoni running a remote command](./docs/Terminal.gif)
 
-gotoni lets you manage, share, and interact with your GPUs over SSH.
+gotoni lets you manage, share, and interact with your GPUs/Sandboxes over SSH.
 
 ## Installation
 
