@@ -39,29 +39,31 @@ gotoni launch my-project \
 
 ### 2. Open in IDE
 
-Once launched, instantly open the remote workspace in your preferred IDE (defaults to Cursor).
+Once launched, open the remote workspace in your preferred IDE. You must specify `--cursor` or `--code`.
 
 > **Prerequisite:** Ensure you have installed the command-line tool for your IDE.
 > - **Cursor:** `Cmd+Shift+P` > "Install 'cursor' command"
 > - **VS Code:** `Cmd+Shift+P` > "Install 'code' command"
 
-**Cursor:**
-
 ```bash
 gotoni open my-project --cursor
-```
-
-**VS Code:**
-
-```bash
 gotoni open my-project --code
+gotoni open my-project /home/ubuntu/repo --cursor   # open a specific path
 ```
 
 ### 3. Share Access Securely
 
-Grants SSH capability to your project partner or research buddy.
+Grants SSH access to your project partner or research buddy using the Magic Wormhole protocol.
 
-**Sender:**
+Works with both Lambda (SSH key + IP) and Modal (SSH key + tunnel) instances.
+
+**Sender (Lambda):**
+```bash
+gotoni share              # auto-picks first running instance
+gotoni share my-project   # specific instance
+```
+
+**Sender (Modal):**
 ```bash
 export GOTONI_CLOUD=modal
 gotoni share              # auto-picks first running sandbox
@@ -71,12 +73,11 @@ gotoni share sb-abc123    # specific sandbox ID
 **Receiver:**
 ```bash
 gotoni receive <wormhole-code>
-# Automatically configures: ssh modal-sb-abc12345
 ```
 
 ## Add Tasks on creation
 
-Create tasks that will be executed during instance launch. You can also specify services to run in the background like an inference server.
+Create tasks that will be executed during instance launch. You can specify services to run in the background like an inference server.
 
 ### Example: Install vLLM and Serve Kimi-K2-Thinking 
 
@@ -85,7 +86,7 @@ gotoni tasks add --name "install vllm" --command "sudo apt install -y python3-pi
 gotoni tasks add --name "run kimi" --command "vllm serve moonshotai/Kimi-K2-Thinking" --depends-on "install dependencies" --type service
 ```
 
-### Launch with Tasks
+**Launch with Tasks:**
 
 ```bash
 gotoni launch ml-instance
@@ -97,15 +98,47 @@ gotoni launch ml-instance
 
 ## Commands Reference
 
+### Instance Management
+
 - `gotoni launch` - Launch instances (supports waiting, filesystems, and tasks)
-- `gotoni open` - Open remote instance in Cursor/VS Code
-- `gotoni share` - Securely share SSH access
-- `gotoni receive` - Receive SSH access and auto-configure
-- `gotoni tasks` - Manage automation tasks
-- `gotoni provision` - Run tasks on an existing instance
-- `gotoni list` - List active instances
-- `gotoni available` - List available instance types and regions
-- `gotoni run` - Execute remote commands
+- `gotoni list` - List running instances
+- `gotoni status` - Check status of services running on an instance
 - `gotoni delete` - Terminate instances
-- `gotoni filesystems` - Manage filesystems
+- `gotoni available` - List available instance types and regions
+- `gotoni price` - Show pricing for instance types
+
+### Connect & Share
+
+- `gotoni open` - Open remote instance in Cursor (`--cursor`) or VS Code (`--code`)
+- `gotoni connect` - Connect to a remote instance via SSH or IDE
+- `gotoni share` - Securely share instance access (Lambda + Modal)
+- `gotoni receive` - Receive shared access and auto-configure SSH
+- `gotoni run` - Execute a command on a remote instance
+
+### Automation
+
+- `gotoni tasks` - Manage automation tasks for instance provisioning
+- `gotoni provision` - Run automation tasks on an existing instance
+- `gotoni serve` - Serve models on vLLM across instances and regions
+
+### Infrastructure
+
+- `gotoni filesystems` - Manage persistent filesystems
 - `gotoni ssh-keys` - Manage SSH keys
+- `gotoni firewall` - Manage firewall rules
+- `gotoni sync` - Sync SSH keys from running instances to local database
+- `gotoni gpu` - Track GPU memory usage over time
+
+### Cluster & Load Balancing
+
+- `gotoni cluster` - Manage cluster nodes (status, setup, uploads)
+- `gotoni sglang` - Manage SGLang servers on cluster instances
+- `gotoni proxy` - Manage centralized proxy for SGLang server pools
+- `gotoni lb` - Manage local load balancer processes
+- `gotoni lb-deploy` - Build, upload, and start load balancer on instances
+- `gotoni tokenizer` - Manage tokenizer sidecar on cluster instances
+
+### Utilities
+
+- `gotoni update` - Update gotoni to the latest version
+- `gotoni check` - Parse and analyze a Dockerfile
