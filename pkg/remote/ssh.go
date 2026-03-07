@@ -411,9 +411,12 @@ func replaceSSHHostBlock(content, hostName, newEntry string) string {
 			continue
 		}
 		if inBlock {
-			if strings.HasPrefix(trimmed, "Host ") || i == len(lines)-1 {
+			if strings.HasPrefix(trimmed, "Host ") {
 				inBlock = false
 				result = append(result, line)
+			} else if i == len(lines)-1 {
+				inBlock = false
+				// last line is still part of the old block, don't re-add it
 			}
 			continue
 		}
