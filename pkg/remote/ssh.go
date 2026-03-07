@@ -368,34 +368,58 @@ func UpdateSSHConfig(hostName, hostIP, identityFile string) error {
 
 	configPath := filepath.Join(sshDir, "config")
 
-	// Create config file if it doesn't exist
+	newEntry := fmt.Sprintf("\nHost %s\n  HostName %s\n  User ubuntu\n  IdentityFile %s\n  StrictHostKeyChecking no\n  UserKnownHostsFile /dev/null\n", hostName, hostIP, identityFile)
+
+	content, err := os.ReadFile(configPath)
+	if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("failed to read ssh config: %w", err)
+	}
+
+	if err == nil && strings.Contains(string(content), "Host "+hostName) {
+		updated := replaceSSHHostBlock(string(content), hostName, newEntry)
+		if err := os.WriteFile(configPath, []byte(updated), 0600); err != nil {
+			return fmt.Errorf("failed to write ssh config: %w", err)
+		}
+		fmt.Printf("Updated SSH config at %s with host '%s'\n", configPath, hostName)
+		return nil
+	}
+
 	f, err := os.OpenFile(configPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
 	if err != nil {
 		return fmt.Errorf("failed to open ssh config: %w", err)
 	}
 	defer f.Close()
 
-	// Read existing config to check for duplicates (basic check)
-	content, err := os.ReadFile(configPath)
-	if err == nil {
-		if strings.Contains(string(content), "Host "+hostName) {
-			// Already exists, maybe just print a warning or skip
-			// For now, we skip to avoid duplicate entries making the file messy
-			fmt.Printf("Warning: Host '%s' already exists in %s, skipping update.\n", hostName, configPath)
-			return nil
-		}
-	}
-
-	// Construct new entry
-	// We use StrictHostKeyChecking no to avoid manual verification for new cloud instances
-	entry := fmt.Sprintf("\nHost %s\n  HostName %s\n  User ubuntu\n  IdentityFile %s\n  StrictHostKeyChecking no\n  UserKnownHostsFile /dev/null\n", hostName, hostIP, identityFile)
-
-	if _, err := f.WriteString(entry); err != nil {
+	if _, err := f.WriteString(newEntry); err != nil {
 		return fmt.Errorf("failed to write to ssh config: %w", err)
 	}
 
 	fmt.Printf("Updated SSH config at %s with host '%s'\n", configPath, hostName)
 	return nil
+}
+
+// replaceSSHHostBlock replaces the block starting with "Host <name>" up to the next Host entry.
+func replaceSSHHostBlock(content, hostName, newEntry string) string {
+	lines := strings.Split(content, "\n")
+	var result []string
+	inBlock := false
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "Host "+hostName {
+			inBlock = true
+			result = append(result, strings.TrimLeft(newEntry, "\n"))
+			continue
+		}
+		if inBlock {
+			if strings.HasPrefix(trimmed, "Host ") || i == len(lines)-1 {
+				inBlock = false
+				result = append(result, line)
+			}
+			continue
+		}
+		result = append(result, line)
+	}
+	return strings.Join(result, "\n")
 }
 
 // UpdateSSHConfigWithTunnel adds a Host entry configured for a tunnel-based connection (host + port + custom user).
@@ -407,24 +431,30 @@ func UpdateSSHConfigWithTunnel(hostAlias, hostName, port, user, identityFile str
 
 	configPath := filepath.Join(sshDir, "config")
 
+	newEntry := fmt.Sprintf("\nHost %s\n  HostName %s\n  Port %s\n  User %s\n  IdentityFile %s\n  StrictHostKeyChecking no\n  UserKnownHostsFile /dev/null\n",
+		hostAlias, hostName, port, user, identityFile)
+
+	content, err := os.ReadFile(configPath)
+	if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("failed to read ssh config: %w", err)
+	}
+
+	if err == nil && strings.Contains(string(content), "Host "+hostAlias) {
+		updated := replaceSSHHostBlock(string(content), hostAlias, newEntry)
+		if err := os.WriteFile(configPath, []byte(updated), 0600); err != nil {
+			return fmt.Errorf("failed to write ssh config: %w", err)
+		}
+		fmt.Printf("Updated SSH config at %s with host '%s'\n", configPath, hostAlias)
+		return nil
+	}
+
 	f, err := os.OpenFile(configPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
 	if err != nil {
 		return fmt.Errorf("failed to open ssh config: %w", err)
 	}
 	defer f.Close()
 
-	content, err := os.ReadFile(configPath)
-	if err == nil {
-		if strings.Contains(string(content), "Host "+hostAlias) {
-			fmt.Printf("Warning: Host '%s' already exists in %s, skipping update.\n", hostAlias, configPath)
-			return nil
-		}
-	}
-
-	entry := fmt.Sprintf("\nHost %s\n  HostName %s\n  Port %s\n  User %s\n  IdentityFile %s\n  StrictHostKeyChecking no\n  UserKnownHostsFile /dev/null\n",
-		hostAlias, hostName, port, user, identityFile)
-
-	if _, err := f.WriteString(entry); err != nil {
+	if _, err := f.WriteString(newEntry); err != nil {
 		return fmt.Errorf("failed to write to ssh config: %w", err)
 	}
 
