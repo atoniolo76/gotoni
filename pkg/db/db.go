@@ -253,6 +253,19 @@ func (d *DB) ListInstances() ([]Instance, error) {
 	return instances, nil
 }
 
+// GetInstanceByName retrieves an instance by name
+func (d *DB) GetInstanceByName(name string) (*Instance, error) {
+	query := `SELECT id, name, region, docker_image, status, ssh_key_name, filesystem_name, instance_type, ip_address, created_at FROM instances WHERE name = ?`
+	row := d.QueryRow(query, name)
+
+	var inst Instance
+	err := row.Scan(&inst.ID, &inst.Name, &inst.Region, &inst.DockerImage, &inst.Status, &inst.SSHKeyName, &inst.FilesystemName, &inst.InstanceType, &inst.IPAddress, &inst.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return &inst, nil
+}
+
 // DeleteInstance removes an instance from the database
 func (d *DB) DeleteInstance(id string) error {
 	_, err := d.Exec("DELETE FROM instances WHERE id = ?", id)

@@ -214,7 +214,7 @@ func (p *ModalProvider) LaunchAndWait(httpClient *http.Client, apiToken string, 
 	}}, nil
 }
 
-func (p *ModalProvider) GetInstance(httpClient *http.Client, apiToken string, instanceID string) (*RunningInstance, error) {
+func (p *ModalProvider) GetInstance(httpClient *http.Client, apiToken string, nameOrID string) (*RunningInstance, error) {
 	client, err := p.getClient()
 	if err != nil {
 		return nil, err
@@ -222,9 +222,23 @@ func (p *ModalProvider) GetInstance(httpClient *http.Client, apiToken string, in
 
 	ctx := context.Background()
 
-	sandbox, err := client.Sandboxes.FromID(ctx, instanceID)
+	// Try to resolve a friendly name to a sandbox ID via the local DB
+	sandboxID := nameOrID
+	friendlyName := nameOrID
+	database, dbErr := db.InitDB()
+	if dbErr == nil {
+		defer database.Close()
+		if inst, lookupErr := database.GetInstanceByName(nameOrID); lookupErr == nil {
+			sandboxID = inst.ID
+			friendlyName = inst.Name
+		} else if inst, lookupErr := database.GetInstance(nameOrID); lookupErr == nil && inst.Name != "" {
+			friendlyName = inst.Name
+		}
+	}
+
+	sandbox, err := client.Sandboxes.FromID(ctx, sandboxID)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get Modal Sandbox: %w", err)
+		return nil, fmt.Errorf("failed to get Modal Sandbox %q: %w", nameOrID, err)
 	}
 
 	status := "booting"
@@ -235,13 +249,12 @@ func (p *ModalProvider) GetInstance(httpClient *http.Client, apiToken string, in
 		status = "terminated"
 	}
 
-	// Get tunnel information
 	tunnelURLs := p.getSandboxTunnels(ctx, sandbox)
 
 	return &RunningInstance{
 		ID:         sandbox.SandboxID,
 		Status:     status,
-		Name:       sandbox.SandboxID,
+		Name:       friendlyName,
 		TunnelURLs: tunnelURLs,
 	}, nil
 }
@@ -279,16 +292,34 @@ func (p *ModalProvider) ListRunningInstances(httpClient *http.Client, apiToken s
 		return nil, fmt.Errorf("failed to list Modal Sandboxes: %w", err)
 	}
 
+	// Build a name lookup from the local DB so we can display friendly names
+	dbNameByID := map[string]string{}
+	database, dbErr := db.InitDB()
+	if dbErr == nil {
+		defer database.Close()
+		dbInstances, listErr := database.ListInstances()
+		if listErr == nil {
+			for _, inst := range dbInstances {
+				if inst.Name != "" {
+					dbNameByID[inst.ID] = inst.Name
+				}
+			}
+		}
+	}
+
 	var instances []RunningInstance
 	for sb := range sandboxes {
 		pollResult, _ := sb.Poll(ctx)
 		if pollResult == nil {
-			// Get tunnel information
 			tunnelURLs := p.getSandboxTunnels(ctx, sb)
+			name := sb.SandboxID
+			if dbName, ok := dbNameByID[sb.SandboxID]; ok {
+				name = dbName
+			}
 			instances = append(instances, RunningInstance{
 				ID:         sb.SandboxID,
 				Status:     "running",
-				Name:       sb.SandboxID,
+				Name:       name,
 				TunnelURLs: tunnelURLs,
 			})
 		}
