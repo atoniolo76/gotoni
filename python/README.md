@@ -12,17 +12,15 @@ pip install gotoni
 
 ```python
 import modal
-import gotoni
+from gotoni import add_ssh, start_ssh
 
-# 1. Add SSH into your Modal Image
-image = modal.Image.debian_slim().pip_install("fastapi")
-image = gotoni.add_ssh(image, key_path="~/.ssh/id_rsa.pub")
+app = modal.App("fused-moe")
 
-app = modal.App("my-ssh-app", image=image)
+image = modal.Image.debian_slim().uv_pip_install("gotoni", "cuda-tile")
 
-# 2. Start the SSH daemon in a modal function
-@app.function(timeout=3600)
-def debug_session():
-    # This will print the SSH command to your terminal and block for the duration of the timeout
-    gotoni.start_ssh(port=2222, timeout=3600)
+image = add_ssh(image)
+
+@app.function(image=image)
+def main():
+    start_ssh()
 ```
