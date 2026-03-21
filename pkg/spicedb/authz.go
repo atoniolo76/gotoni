@@ -8,16 +8,28 @@ import (
 )
 
 var (
-	authzOnce   sync.Once
-	authzClient *Client
-	authzUserID string
-	authzOrgID  string
+	authzOnce      sync.Once
+	authzClient    *Client
+	authzUserID    string
+	authzOrgID     string
+	authzProjectID string
 )
 
 func initAuthz() {
 	authzOnce.Do(func() {
-		authzUserID = ResolveUserID()
-		authzOrgID = os.Getenv("GOTONI_ORG_ID")
+		id := LoadIdentity()
+		if id != nil {
+			authzUserID = id.UserID
+			authzOrgID = id.OrgID
+			authzProjectID = id.ProjectID
+		}
+
+		if env := os.Getenv("GOTONI_ORG_ID"); env != "" {
+			authzOrgID = env
+		}
+		if env := os.Getenv("GOTONI_PROJECT_ID"); env != "" {
+			authzProjectID = env
+		}
 
 		client, err := NewClient()
 		if err != nil {
@@ -33,14 +45,15 @@ func Enabled() bool {
 	return authzClient != nil && authzUserID != ""
 }
 
-// CurrentUserID returns the resolved user ID (env var or local identity file).
+// CurrentUserID returns the resolved user ID from the local identity file.
 func CurrentUserID() string {
 	return ResolveUserID()
 }
 
-// GetProjectID returns the optional project scope from the environment.
+// GetProjectID returns the project scope (from identity file or env override).
 func GetProjectID() string {
-	return os.Getenv("GOTONI_PROJECT_ID")
+	initAuthz()
+	return authzProjectID
 }
 
 // Check verifies the current user has the given permission on the specified
@@ -71,7 +84,7 @@ func CheckCreate(ctx context.Context) error {
 	if authzOrgID != "" {
 		return Check(ctx, "organization", authzOrgID, "write_access")
 	}
-	return fmt.Errorf("permission denied: GOTONI_ORG_ID (or GOTONI_PROJECT_ID) is required when SpiceDB is enabled")
+	return fmt.Errorf("permission denied: no org or project configured (join an org or set GOTONI_ORG_ID)")
 }
 
 // WriteResourceOwnership records that the current user owns a newly created

@@ -13,7 +13,9 @@ import (
 const identityFilePerms = 0600
 
 type Identity struct {
-	UserID string `json:"user_id"`
+	UserID    string `json:"user_id"`
+	OrgID     string `json:"org_id,omitempty"`
+	ProjectID string `json:"project_id,omitempty"`
 }
 
 func identityPath() string {

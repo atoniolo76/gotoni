@@ -36,6 +36,10 @@ Examples:
   gotoni launch my-instance -t gpu_1x_a100 -r us-west-1 --wait --tasks "Install Docker,Setup Environment"`,
 	Args: cobra.MaximumNArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
+		if proj, _ := cmd.Flags().GetString("project"); proj != "" {
+			os.Setenv("GOTONI_PROJECT_ID", proj)
+		}
+
 		var instanceName string
 		if len(args) > 0 {
 			instanceName = args[0]
@@ -476,6 +480,8 @@ For Modal: h100, a100, a10, t4, cpu
 	launchCmd.Flags().StringP("filesystem", "f", "", "Create and mount a filesystem with the specified name (will be created in the same region as the instance)")
 
 	launchCmd.Flags().StringSlice("tasks", []string{}, "Comma-separated list of task names to execute after launch (requires --wait)")
+
+	launchCmd.Flags().String("project", "", "Override the active project for this launch")
 
 	launchCmd.MarkFlagRequired("instance-type")
 	// Region is required unless --wait is used (which auto-selects region)

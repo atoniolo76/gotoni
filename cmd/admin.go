@@ -33,7 +33,6 @@ Examples:
   gotoni admin org invite acme alice editor
   gotoni admin org set-role acme alice reader
   gotoni admin org list-users acme
-  gotoni admin join <wormhole-code>
   gotoni admin whoami`,
 }
 
@@ -99,6 +98,15 @@ var adminOrgCreateCmd = &cobra.Command{
 		if err := client.WriteRelationship(ctx, "organization", orgID, "admin", "user", userID); err != nil {
 			log.Fatalf("WriteRelationship: %v", err)
 		}
+
+		id := spicedb.LoadIdentity()
+		if id != nil {
+			id.OrgID = orgID
+			if err := spicedb.SaveIdentity(id); err != nil {
+				log.Printf("Warning: could not save org to identity: %v", err)
+			}
+		}
+
 		fmt.Printf("Organization '%s' created. You (%s) are admin.\n", orgID, userID)
 	},
 }
@@ -164,44 +172,6 @@ Roles: admin, editor, reader`,
 		case <-time.After(10 * time.Minute):
 			log.Fatal("Invite timed out after 10 minutes.")
 		}
-	},
-}
-
-var adminJoinCmd = &cobra.Command{
-	Use:   "join <wormhole-code>",
-	Short: "Join an organization using an invite code",
-	Args:  cobra.ExactArgs(1),
-	Run: func(cmd *cobra.Command, args []string) {
-		code := args[0]
-
-		var c wormhole.Client
-		ctx := context.Background()
-
-		fmt.Println("Connecting...")
-
-		msg, err := c.Receive(ctx, code)
-		if err != nil {
-			log.Fatalf("Receive: %v", err)
-		}
-
-		buf := make([]byte, 4096)
-		n, _ := msg.Read(buf)
-
-		var payload invitePayload
-		if err := json.Unmarshal(buf[:n], &payload); err != nil {
-			log.Fatalf("Invalid invite payload: %v", err)
-		}
-
-		if err := spicedb.SaveIdentity(&spicedb.Identity{UserID: payload.UserID}); err != nil {
-			log.Fatalf("SaveIdentity: %v", err)
-		}
-
-		fmt.Printf("\nJoined organization '%s' as %s.\n", payload.OrgID, payload.Role)
-		fmt.Printf("Your user ID: %s\n", payload.UserID)
-		if payload.Nickname != "" {
-			fmt.Printf("Your nickname: %s\n", payload.Nickname)
-		}
-		fmt.Println("Identity saved locally. You're ready to go.")
 	},
 }
 
@@ -487,7 +457,6 @@ func init() {
 	rootCmd.AddCommand(adminCmd)
 
 	adminCmd.AddCommand(adminWhoamiCmd)
-	adminCmd.AddCommand(adminJoinCmd)
 
 	adminCmd.AddCommand(adminOrgCmd)
 	adminOrgCmd.AddCommand(adminOrgCreateCmd)

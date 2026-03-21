@@ -24,23 +24,25 @@ export MODAL_TOKEN_SECRET=your_token_secret
 export ORGO_API_KEY=your_token_here
 ```
 
-### SpiceDB (Access Control)
+### RBAC
 
-Optional. When configured, gotoni gates CRUD operations through SpiceDB
-permission checks. Without it, gotoni works as before with no access control.
+Gotoni can use [SpiceDB](https://authzed.com/spicedb) to check operations based on a user's role.
 
 ```bash
 export SPICEDB_ENDPOINT=http://localhost:8444
 export SPICEDB_TOKEN=your_preshared_key
-export GOTONI_ORG_ID=acme
-export GOTONI_PROJECT_ID=ml-team   # optional, scopes to a project within the org
 ```
 
+The permission hiearchy follows Organization -> Project -> Cluster -> Instance. You can optionally restrict access to projects 
 ```bash
-gotoni admin org create acme            # creates org, you become admin
-gotoni admin org invite acme editor     # prints a wormhole code to share
-gotoni admin join <wormhole-code>       # join an org from another machine
+gotoni admin org create acme              # creates org, you become admin
+gotoni admin org invite acme alice editor  # invite by nickname
+gotoni join <wormhole-code>               # join an org from another machine
+gotoni admin org set-role acme alice reader
 ```
+
+Org and project are saved locally when you create or join. Override with
+`GOTONI_ORG_ID` / `GOTONI_PROJECT_ID` if needed.
 
 ## Workflow
 
