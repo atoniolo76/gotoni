@@ -16,7 +16,7 @@ var (
 
 func initAuthz() {
 	authzOnce.Do(func() {
-		authzUserID = os.Getenv("GOTONI_USER_ID")
+		authzUserID = ResolveUserID()
 		authzOrgID = os.Getenv("GOTONI_ORG_ID")
 
 		client, err := NewClient()
@@ -31,6 +31,11 @@ func initAuthz() {
 func Enabled() bool {
 	initAuthz()
 	return authzClient != nil && authzUserID != ""
+}
+
+// CurrentUserID returns the resolved user ID (env var or local identity file).
+func CurrentUserID() string {
+	return ResolveUserID()
 }
 
 // GetProjectID returns the optional project scope from the environment.

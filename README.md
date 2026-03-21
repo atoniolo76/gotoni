@@ -26,19 +26,21 @@ export ORGO_API_KEY=your_token_here
 
 ### SpiceDB (Access Control)
 
-Optional. If using SpiceDB for multi-user permission management, export:
+Optional. When configured, gotoni gates CRUD operations through SpiceDB
+permission checks. Without it, gotoni works as before with no access control.
 
 ```bash
 export SPICEDB_ENDPOINT=http://localhost:8444
 export SPICEDB_TOKEN=your_preshared_key
-export GOTONI_USER_ID=alice
 export GOTONI_ORG_ID=acme
 export GOTONI_PROJECT_ID=ml-team   # optional, scopes to a project within the org
 ```
 
-When all of `SPICEDB_ENDPOINT`, `SPICEDB_TOKEN`, and `GOTONI_USER_ID` are set,
-gotoni gates CRUD operations through SpiceDB permission checks. Without them,
-gotoni works as before with no access control.
+```bash
+gotoni admin org create acme            # creates org, you become admin
+gotoni admin org invite acme editor     # prints a wormhole code to share
+gotoni admin join <wormhole-code>       # join an org from another machine
+```
 
 ## Workflow
 
