@@ -1,0 +1,61 @@
+// Crusoe Cloud permission hierarchy: Organization > Project > Resources
+
+definition user {}
+
+definition organization {
+    relation admin: user
+    relation editor: user
+    relation reader: user
+    relation member: user
+
+    // org-admin: full admin across all projects
+    permission admin_access = admin
+    // org-editor: CRUD across all projects
+    permission write_access = admin + editor
+    // org-reader: read-only across all projects
+    permission read_access = admin + editor + reader
+}
+
+definition project {
+    relation org: organization
+    relation editor: user
+    relation reader: user
+
+    permission delete = org->admin_access
+    permission edit = editor + org->write_access
+    permission view = editor + reader + org->read_access
+}
+
+// A cluster is a logical group of resources (VMs).
+// Cluster-level permissions cascade to all contained resources and their SSH keys.
+definition cluster {
+    relation project: project
+    relation owner: user
+
+    permission delete = owner + project->delete
+    permission edit = owner + project->edit
+    permission view = owner + project->view
+}
+
+// A resource is a VM, optionally belonging to a cluster.
+definition resource {
+    relation project: project
+    relation parent_cluster: cluster
+    relation owner: user
+
+    permission delete = owner + parent_cluster->edit + project->delete
+    permission edit = owner + parent_cluster->edit + project->edit
+    permission ssh = edit
+    permission view = owner + parent_cluster->view + project->view
+}
+
+// SSH keys are scoped to a resource. A resource can have multiple SSH keys.
+// Cluster editors can manage all SSH keys across the cluster's resources.
+definition ssh_key {
+    relation resource: resource
+    relation owner: user
+
+    permission delete = owner + resource->edit
+    permission use = owner + resource->ssh
+    permission view = owner + resource->view
+}
