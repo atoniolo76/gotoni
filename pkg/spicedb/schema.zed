@@ -1,4 +1,5 @@
-// Crusoe Cloud permission hierarchy: Organization > Project > Resources
+// Permission hierarchy: Organization > (optional) Project > Resources
+// Resources and clusters can belong directly to an org or to a project within an org.
 
 definition user {}
 
@@ -23,34 +24,35 @@ definition project {
 }
 
 // A cluster is a logical group of resources (VMs).
-// Cluster-level permissions cascade to all contained resources and their SSH keys.
+// Can belong to an org directly or to a project within an org.
 definition cluster {
+    relation org: organization
     relation project: project
     relation owner: user
     relation editor: user
     relation viewer: user
 
-    permission delete = owner + project->delete
-    permission edit = owner + editor + project->edit
-    permission view = owner + editor + viewer + project->view
+    permission delete = owner + project->delete + org->admin_access
+    permission edit = owner + editor + project->edit + org->write_access
+    permission view = owner + editor + viewer + project->view + org->read_access
 }
 
-// A resource is a VM, optionally belonging to a cluster.
+// A resource is a VM. Can belong to an org, a project, and/or a cluster.
 definition resource {
+    relation org: organization
     relation project: project
     relation parent_cluster: cluster
     relation owner: user
     relation editor: user
     relation viewer: user
 
-    permission delete = owner + parent_cluster->edit + project->delete
-    permission edit = owner + editor + parent_cluster->edit + project->edit
+    permission delete = owner + parent_cluster->edit + project->delete + org->admin_access
+    permission edit = owner + editor + parent_cluster->edit + project->edit + org->write_access
     permission ssh = edit
-    permission view = owner + editor + viewer + parent_cluster->view + project->view
+    permission view = owner + editor + viewer + parent_cluster->view + project->view + org->read_access
 }
 
 // SSH keys are scoped to a resource. A resource can have multiple SSH keys.
-// Cluster editors can manage all SSH keys across the cluster's resources.
 definition ssh_key {
     relation resource: resource
     relation owner: user

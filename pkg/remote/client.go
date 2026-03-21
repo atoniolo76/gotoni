@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/atoniolo76/gotoni/pkg/db"
+	"github.com/atoniolo76/gotoni/pkg/spicedb"
 )
 
 // NewHTTPClient creates a new HTTP client with secure defaults
@@ -319,8 +320,21 @@ func LaunchInstance(
 	sshKeyName string, // optional: if provided, use this existing SSH key name instead of generating new one
 	filesystemName string, // optional: if provided, mount this filesystem to the instance
 ) ([]LaunchedInstance, error) {
+	ctx := context.Background()
+	if err := spicedb.CheckCreate(ctx); err != nil {
+		return nil, err
+	}
+
 	provider, _ := GetCloudProvider()
-	return provider.LaunchInstance(httpClient, apiToken, instanceType, region, quantity, name, sshKeyName, filesystemName)
+	instances, err := provider.LaunchInstance(httpClient, apiToken, instanceType, region, quantity, name, sshKeyName, filesystemName)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, inst := range instances {
+		spicedb.WriteResourceOwnership(ctx, inst.ID)
+	}
+	return instances, nil
 }
 
 // WaitForInstanceReady waits for an instance to become active
@@ -331,6 +345,9 @@ func WaitForInstanceReady(httpClient *http.Client, apiToken, instanceID string, 
 
 // GetInstance retrieves details for a specific instance
 func GetInstance(httpClient *http.Client, apiToken, instanceID string) (*RunningInstance, error) {
+	if err := spicedb.Check(context.Background(), "resource", instanceID, "view"); err != nil {
+		return nil, err
+	}
 	provider, _ := GetCloudProvider()
 	return provider.GetInstance(httpClient, apiToken, instanceID)
 }
@@ -347,8 +364,21 @@ func LaunchAndWait(
 	timeout time.Duration,
 	filesystemName string, // optional: if provided, mount this filesystem to the instance
 ) ([]LaunchedInstance, error) {
+	ctx := context.Background()
+	if err := spicedb.CheckCreate(ctx); err != nil {
+		return nil, err
+	}
+
 	provider, _ := GetCloudProvider()
-	return provider.LaunchAndWait(httpClient, apiToken, instanceType, region, quantity, name, sshKeyName, timeout, filesystemName)
+	instances, err := provider.LaunchAndWait(httpClient, apiToken, instanceType, region, quantity, name, sshKeyName, timeout, filesystemName)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, inst := range instances {
+		spicedb.WriteResourceOwnership(ctx, inst.ID)
+	}
+	return instances, nil
 }
 
 func RunCommandOnInstance(instanceIP string) error {
@@ -366,7 +396,6 @@ func RunCommandOnInstance(instanceIP string) error {
 // It first tries to find the instance from Lambda API to get the SSH key name,
 // then looks up the key file path locally.
 func ConnectToInstance(instanceIP string) error {
-	// First, try to find the instance from Lambda API to get SSH key name
 	httpClient := NewHTTPClient()
 	apiToken := GetAPIToken()
 
@@ -377,7 +406,9 @@ func ConnectToInstance(instanceIP string) error {
 		if err == nil {
 			for _, inst := range instances {
 				if inst.IP == instanceIP {
-					// Found the instance, get SSH key file
+					if err := spicedb.Check(context.Background(), "resource", inst.ID, "ssh"); err != nil {
+						return err
+					}
 					keyFile, keyErr := GetSSHKeyFileForInstance(&inst)
 					if keyErr == nil {
 						sshKeyFile = keyFile
@@ -510,7 +541,21 @@ func RemoveInstanceFromConfig(instanceID string) error {
 
 func ListRunningInstances(httpClient *http.Client, apiToken string) ([]RunningInstance, error) {
 	provider, _ := GetCloudProvider()
-	return provider.ListRunningInstances(httpClient, apiToken)
+	instances, err := provider.ListRunningInstances(httpClient, apiToken)
+	if err != nil {
+		return nil, err
+	}
+	ctx := context.Background()
+	if allowed := spicedb.ViewableResourceIDs(ctx); allowed != nil {
+		var filtered []RunningInstance
+		for _, inst := range instances {
+			if allowed[inst.ID] {
+				filtered = append(filtered, inst)
+			}
+		}
+		return filtered, nil
+	}
+	return instances, nil
 }
 
 // ResolveInstance resolves an instance name or ID to a RunningInstance
@@ -537,8 +582,23 @@ func TerminateInstance(
 	apiToken string,
 	instanceIDs []string,
 ) (*InstanceTerminateResponse, error) {
+	ctx := context.Background()
+	for _, id := range instanceIDs {
+		if err := spicedb.Check(ctx, "resource", id, "delete"); err != nil {
+			return nil, err
+		}
+	}
+
 	provider, _ := GetCloudProvider()
-	return provider.TerminateInstance(httpClient, apiToken, instanceIDs)
+	resp, err := provider.TerminateInstance(httpClient, apiToken, instanceIDs)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, id := range instanceIDs {
+		spicedb.DeleteResource(ctx, id)
+	}
+	return resp, nil
 }
 
 // CreateSSHKeyForProject creates a new SSH key and saves it in the ssh directory

@@ -24,6 +24,22 @@ export MODAL_TOKEN_SECRET=your_token_secret
 export ORGO_API_KEY=your_token_here
 ```
 
+### SpiceDB (Access Control)
+
+Optional. If using SpiceDB for multi-user permission management, export:
+
+```bash
+export SPICEDB_ENDPOINT=http://localhost:8444
+export SPICEDB_TOKEN=your_preshared_key
+export GOTONI_USER_ID=alice
+export GOTONI_ORG_ID=acme
+export GOTONI_PROJECT_ID=ml-team   # optional, scopes to a project within the org
+```
+
+When all of `SPICEDB_ENDPOINT`, `SPICEDB_TOKEN`, and `GOTONI_USER_ID` are set,
+gotoni gates CRUD operations through SpiceDB permission checks. Without them,
+gotoni works as before with no access control.
+
 ## Workflow
 
 ### 1. Launch an Instance
@@ -39,9 +55,12 @@ gotoni launch my-project \
 
 ### 2. Open in IDE
 
-Once launched, open the remote workspace in your preferred IDE. You must specify `--cursor` or `--code`.
+Once launched, open the remote workspace in your preferred IDE. You must specify
+`--cursor` or `--code`.
 
-> **Prerequisite:** Ensure you have installed the command-line tool for your IDE.
+> **Prerequisite:** Ensure you have installed the command-line tool for your
+> IDE.
+>
 > - **Cursor:** `Cmd+Shift+P` > "Install 'cursor' command"
 > - **VS Code:** `Cmd+Shift+P` > "Install 'code' command"
 
@@ -53,17 +72,20 @@ gotoni open my-project /home/ubuntu/repo --cursor   # open a specific path
 
 ### 3. Share Access Securely
 
-Grants SSH access to your project partner or research buddy using the Magic Wormhole protocol.
+Grants SSH access to your project partner or research buddy using the Magic
+Wormhole protocol.
 
 Works with both Lambda (SSH key + IP) and Modal (SSH key + tunnel) instances.
 
 **Sender (Lambda):**
+
 ```bash
 gotoni share              # auto-picks first running instance
 gotoni share my-project   # specific instance
 ```
 
 **Sender (Modal):**
+
 ```bash
 export GOTONI_CLOUD=modal
 gotoni share              # auto-picks first running sandbox
@@ -71,15 +93,17 @@ gotoni share sb-abc123    # specific sandbox ID
 ```
 
 **Receiver:**
+
 ```bash
 gotoni receive <wormhole-code>
 ```
 
 ## Add Tasks on creation
 
-Create tasks that will be executed during instance launch. You can specify services to run in the background like an inference server.
+Create tasks that will be executed during instance launch. You can specify
+services to run in the background like an inference server.
 
-### Example: Install vLLM and Serve Kimi-K2-Thinking 
+### Example: Install vLLM and Serve Kimi-K2-Thinking
 
 ```bash
 gotoni tasks add --name "install vllm" --command "sudo apt install -y python3-pip && pip install vllm"
@@ -109,7 +133,8 @@ gotoni launch ml-instance
 
 ### Connect & Share
 
-- `gotoni open` - Open remote instance in Cursor (`--cursor`) or VS Code (`--code`)
+- `gotoni open` - Open remote instance in Cursor (`--cursor`) or VS Code
+  (`--code`)
 - `gotoni connect` - Connect to a remote instance via SSH or IDE
 - `gotoni share` - Securely share instance access (Lambda + Modal)
 - `gotoni receive` - Receive shared access and auto-configure SSH
