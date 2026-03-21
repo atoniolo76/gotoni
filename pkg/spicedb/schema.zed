@@ -6,13 +6,9 @@ definition organization {
     relation admin: user
     relation editor: user
     relation reader: user
-    relation member: user
 
-    // org-admin: full admin across all projects
     permission admin_access = admin
-    // org-editor: CRUD across all projects
     permission write_access = admin + editor
-    // org-reader: read-only across all projects
     permission read_access = admin + editor + reader
 }
 
@@ -31,10 +27,12 @@ definition project {
 definition cluster {
     relation project: project
     relation owner: user
+    relation editor: user
+    relation viewer: user
 
     permission delete = owner + project->delete
-    permission edit = owner + project->edit
-    permission view = owner + project->view
+    permission edit = owner + editor + project->edit
+    permission view = owner + editor + viewer + project->view
 }
 
 // A resource is a VM, optionally belonging to a cluster.
@@ -42,11 +40,13 @@ definition resource {
     relation project: project
     relation parent_cluster: cluster
     relation owner: user
+    relation editor: user
+    relation viewer: user
 
     permission delete = owner + parent_cluster->edit + project->delete
-    permission edit = owner + parent_cluster->edit + project->edit
+    permission edit = owner + editor + parent_cluster->edit + project->edit
     permission ssh = edit
-    permission view = owner + parent_cluster->view + project->view
+    permission view = owner + editor + viewer + parent_cluster->view + project->view
 }
 
 // SSH keys are scoped to a resource. A resource can have multiple SSH keys.
