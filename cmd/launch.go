@@ -4,6 +4,7 @@ Copyright © 2025 ALESSIO TONIOLO
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/atoniolo76/gotoni/pkg/db"
 	"github.com/atoniolo76/gotoni/pkg/remote"
+	"github.com/atoniolo76/gotoni/pkg/spicedb"
 
 	"github.com/spf13/cobra"
 )
@@ -264,6 +266,10 @@ Examples:
 			fmt.Println("Note: Modal provider uses Volumes instead of filesystems. Use --volume flag for Modal.")
 		}
 
+		if err := spicedb.CheckCreate(context.Background()); err != nil {
+			log.Fatalf("Permission denied: %v", err)
+		}
+
 		fmt.Printf("\nLaunching instance...\n")
 		if provider == "orgo" {
 			// Orgo provider - use project-based launch
@@ -310,6 +316,12 @@ Examples:
 						fmt.Printf("Warning: Failed to update SSH config: %v\n", err)
 					}
 				}
+			}
+		}
+
+		if launchErr == nil {
+			for _, inst := range launchedInstances {
+				spicedb.WriteResourceOwnership(context.Background(), inst.ID)
 			}
 		}
 

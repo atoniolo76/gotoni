@@ -4,12 +4,14 @@ Copyright © 2025 ALESSIO TONIOLO
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
 	"strings"
 
 	"github.com/atoniolo76/gotoni/pkg/remote"
+	"github.com/atoniolo76/gotoni/pkg/spicedb"
 
 	"github.com/spf13/cobra"
 )
@@ -68,6 +70,16 @@ var listCmd = &cobra.Command{
 		runningInstances, err := cloudProvider.ListRunningInstances(httpClient, apiToken)
 		if err != nil {
 			log.Fatalf("Error listing running instances: %v", err)
+		}
+
+		if allowed := spicedb.ViewableResourceIDs(context.Background()); allowed != nil {
+			filtered := runningInstances[:0]
+			for _, inst := range runningInstances {
+				if allowed[inst.ID] {
+					filtered = append(filtered, inst)
+				}
+			}
+			runningInstances = filtered
 		}
 
 		if len(runningInstances) == 0 {

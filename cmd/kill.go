@@ -4,12 +4,14 @@ Copyright © 2025 ALESSIO TONIOLO
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"net/http"
 	"strings"
 
 	"github.com/atoniolo76/gotoni/pkg/remote"
+	"github.com/atoniolo76/gotoni/pkg/spicedb"
 
 	"github.com/spf13/cobra"
 )
@@ -130,11 +132,22 @@ Use --all to terminate every running resource for the selected provider.`,
 			resolvedNames = append(resolvedNames, displayName)
 		}
 
+		ctx := context.Background()
+		for _, id := range instanceIDs {
+			if err := spicedb.Check(ctx, "resource", id, "delete"); err != nil {
+				log.Fatalf("Permission denied for %s: %v", id, err)
+			}
+		}
+
 		fmt.Printf("Terminating %s(s): %s\n", resType, strings.Join(resolvedNames, ", "))
 
 		resp, err := cloudProvider.TerminateInstance(httpClient, apiToken, instanceIDs)
 		if err != nil {
 			log.Fatalf("Error terminating %s(s): %v", resType, err)
+		}
+
+		for _, id := range instanceIDs {
+			spicedb.DeleteResource(ctx, id)
 		}
 
 		// Lambda manages state via API, but we still clean up any leftover config refs

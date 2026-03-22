@@ -4,12 +4,14 @@ Copyright © 2025 ALESSIO TONIOLO
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
 	"strings"
 
 	"github.com/atoniolo76/gotoni/pkg/remote"
+	"github.com/atoniolo76/gotoni/pkg/spicedb"
 
 	"github.com/spf13/cobra"
 )
@@ -127,6 +129,10 @@ Examples:
 				}
 			}
 			instanceID = instanceDetails.ID
+		}
+
+		if err := spicedb.Check(context.Background(), "resource", instanceID, "ssh"); err != nil {
+			log.Fatalf("Permission denied: %v", err)
 		}
 
 		// Execute command based on provider

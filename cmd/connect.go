@@ -4,6 +4,7 @@ Copyright © 2025 ALESSIO TONIOLO
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/atoniolo76/gotoni/pkg/remote"
+	"github.com/atoniolo76/gotoni/pkg/spicedb"
 
 	"github.com/spf13/cobra"
 )
@@ -64,17 +66,18 @@ var connectCmd = &cobra.Command{
 				instanceName = target
 			} else {
 				// For SSH, try to resolve to IP first, fallback to name
-				apiToken := remote.GetAPIToken()
-				if apiToken != "" {
-					httpClient := remote.NewHTTPClient()
-					instance, err := remote.ResolveInstance(httpClient, apiToken, target)
-					if err == nil {
-						// Found instance, use IP for SSH
-						instanceName = instance.IP
-					} else {
-						// Not found, assume it's an SSH config entry name
-						instanceName = target
+			apiToken := remote.GetAPIToken()
+			if apiToken != "" {
+				httpClient := remote.NewHTTPClient()
+				instance, err := remote.ResolveInstance(httpClient, apiToken, target)
+				if err == nil {
+					if checkErr := spicedb.Check(context.Background(), "resource", instance.ID, "ssh"); checkErr != nil {
+						log.Fatalf("Permission denied: %v", checkErr)
 					}
+					instanceName = instance.IP
+				} else {
+					instanceName = target
+				}
 				} else {
 					// No API token, assume SSH config entry
 					instanceName = target

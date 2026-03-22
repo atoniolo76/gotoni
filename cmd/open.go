@@ -4,10 +4,12 @@ Copyright © 2025 ALESSIO TONIOLO
 package cmd
 
 import (
+	"context"
 	"log"
 	"strings"
 
 	"github.com/atoniolo76/gotoni/pkg/remote"
+	"github.com/atoniolo76/gotoni/pkg/spicedb"
 	"github.com/spf13/cobra"
 )
 
@@ -54,8 +56,11 @@ Requirements:
 			apiToken := remote.GetAPIToken()
 			if apiToken != "" {
 				httpClient := remote.NewHTTPClient()
-				_, err := remote.ResolveInstance(httpClient, apiToken, target)
+				inst, err := remote.ResolveInstance(httpClient, apiToken, target)
 				if err == nil {
+					if checkErr := spicedb.Check(context.Background(), "resource", inst.ID, "ssh"); checkErr != nil {
+						log.Fatalf("Permission denied: %v", checkErr)
+					}
 					instanceName = target
 				} else {
 					instanceName = target
