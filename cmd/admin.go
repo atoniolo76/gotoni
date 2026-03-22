@@ -30,10 +30,30 @@ Nicknames are assigned when inviting users. You can also pass raw UUIDs.
 
 Examples:
   gotoni admin org create acme
+  gotoni admin init
   gotoni admin org invite acme alice editor
   gotoni admin org set-role acme alice reader
   gotoni admin org list-users acme
   gotoni admin whoami`,
+}
+
+// --- Init -------------------------------------------------------------------
+
+var adminInitCmd = &cobra.Command{
+	Use:   "init",
+	Short: "Push the permission schema to SpiceDB",
+	Long: `Writes the embedded schema.zed to the configured SpiceDB instance.
+Run this once to set up the permission model, or after schema changes.
+
+Note: anyone with the SpiceDB preshared key can write the schema.
+In production, restrict the token to trusted admins or use a gateway.`,
+	Run: func(cmd *cobra.Command, args []string) {
+		client := mustClient()
+		if err := client.ApplySchema(context.Background()); err != nil {
+			log.Fatalf("ApplySchema: %v", err)
+		}
+		fmt.Println("Schema applied successfully.")
+	},
 }
 
 // --- Whoami -----------------------------------------------------------------
@@ -249,14 +269,17 @@ var adminOrgListUsersCmd = &cobra.Command{
 		ctx := context.Background()
 		orgID := args[0]
 
-		for _, role := range []string{"admin", "editor", "reader"} {
-			perm := role + "_access"
-			users, err := client.LookupSubjects(ctx, "organization", orgID, perm, "user")
+		for _, entry := range []struct{ role, perm string }{
+			{"admin", "admin_access"},
+			{"editor", "write_access"},
+			{"reader", "read_access"},
+		} {
+			users, err := client.LookupSubjects(ctx, "organization", orgID, entry.perm, "user")
 			if err != nil {
 				log.Fatalf("LookupSubjects: %v", err)
 			}
 			if len(users) > 0 {
-				fmt.Printf("%ss:\n", role)
+				fmt.Printf("%ss:\n", entry.role)
 				for _, u := range users {
 					fmt.Printf("  %s\n", formatUserByUUID(u))
 				}
@@ -456,6 +479,7 @@ func formatUserByUUID(userID string) string {
 func init() {
 	rootCmd.AddCommand(adminCmd)
 
+	adminCmd.AddCommand(adminInitCmd)
 	adminCmd.AddCommand(adminWhoamiCmd)
 
 	adminCmd.AddCommand(adminOrgCmd)
