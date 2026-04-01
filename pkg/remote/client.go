@@ -529,6 +529,18 @@ func ResolveInstance(httpClient *http.Client, apiToken string, nameOrID string) 
 		}
 	}
 
+	// Modal: resolve sb-... or named sandbox (e.g. proxy-us-east) via API when list snapshot missed it
+	provider, ptype := GetCloudProvider()
+	if ptype == CloudProviderModal {
+		if mp, ok := provider.(*ModalProvider); ok {
+			inst, err := mp.ResolveByNameOrID(context.Background(), httpClient, apiToken, nameOrID)
+			if err == nil {
+				return inst, nil
+			}
+			return nil, err
+		}
+	}
+
 	return nil, fmt.Errorf("instance '%s' not found among running instances", nameOrID)
 }
 

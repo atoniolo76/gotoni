@@ -35,6 +35,14 @@ import (
 	"github.com/atoniolo76/gotoni/pkg/config"
 )
 
+// RoutingPolicy defines the interface for proxy routing algorithms.
+// Select picks the best server from the pool for a given request.
+// Returns nil if no server is available.
+type RoutingPolicy interface {
+	Name() string
+	Select(servers []*SGLangServer, proxy *HttpProxy, prompt string, requestTokens int) (*SGLangServer, *routingMetrics)
+}
+
 // ProxyConfig configures the centralized proxy
 type ProxyConfig struct {
 	// Proxy server settings
@@ -71,6 +79,9 @@ type ProxyConfig struct {
 	LatencyProbeEndpoint string        `json:"latency_probe_endpoint"` // lightweight endpoint for latency measurement
 	LatencyHistorySize   int           `json:"latency_history_size"`   // number of samples to keep for averaging
 	LatencyEWMAAlpha     float64       `json:"latency_ewma_alpha"`     // exponential weighted moving average alpha (0-1)
+
+	// Routing policy selection
+	RoutingPolicyName string `json:"routing_policy"` // "gorgo" (default), "least-load", "prefix-tree"
 }
 
 // DefaultProxyConfig returns sensible defaults
@@ -97,6 +108,8 @@ func DefaultProxyConfig() *ProxyConfig {
 		LatencyProbeEndpoint: "/health",              // lightweight endpoint
 		LatencyHistorySize:   20,                     // keep last 20 samples
 		LatencyEWMAAlpha:     0.3,                    // weight recent samples more heavily
+
+		RoutingPolicyName: "gorgo",
 	}
 }
 
@@ -218,6 +231,10 @@ type GORGONode struct {
 type HttpProxy struct {
 	config *ProxyConfig
 
+	// Routing policy
+	routingPolicy   RoutingPolicy
+	routingPolicyMu sync.RWMutex
+
 	// Server pool
 	servers   []*SGLangServer
 	serversMu sync.RWMutex
@@ -283,6 +300,8 @@ func NewHttpProxy(cfg *ProxyConfig) *HttpProxy {
 		cancel:    cancel,
 		startTime: time.Now(),
 	}
+
+	proxy.routingPolicy = proxy.newRoutingPolicy(cfg.RoutingPolicyName)
 
 	return proxy
 }
@@ -427,6 +446,9 @@ func (p *HttpProxy) Handler() http.Handler {
 		case "/proxy/metrics/enable":
 			p.handleMetricsEnableEndpoint(w, r)
 			return
+		case "/proxy/policy":
+			p.handlePolicyEndpoint(w, r)
+			return
 		}
 
 		// Regular request processing
@@ -476,24 +498,27 @@ type routingMetrics struct {
 	ServerCosts            map[string]float64
 }
 
-// selectServer chooses the best server using GORGO cost calculation
-// Returns nil if no healthy servers are available
-// Also returns routing metrics for tracking
-func (p *HttpProxy) selectServer(prompt string, requestTokens int) (*SGLangServer, *routingMetrics) {
-	p.serversMu.RLock()
-	defer p.serversMu.RUnlock()
+// =============================================================================
+// ROUTING POLICIES
+// =============================================================================
 
-	if len(p.servers) == 0 {
+// GORGORoutingPolicy selects the server with the lowest estimated cost
+// using GORGO-style weighted costs: queued, running, incoming, and prefix match.
+type GORGORoutingPolicy struct{}
+
+func (g *GORGORoutingPolicy) Name() string { return "gorgo" }
+
+func (g *GORGORoutingPolicy) Select(servers []*SGLangServer, proxy *HttpProxy, prompt string, requestTokens int) (*SGLangServer, *routingMetrics) {
+	if len(servers) == 0 {
 		return nil, nil
 	}
 
-	p.tuningMu.RLock()
-	msPerToken := p.msPerToken
-	runningCostFactor := p.runningCostFactor
-	p.tuningMu.RUnlock()
+	proxy.tuningMu.RLock()
+	msPerToken := proxy.msPerToken
+	runningCostFactor := proxy.runningCostFactor
+	proxy.tuningMu.RUnlock()
 
-	// Find servers with prefix cache match
-	matchedServers := p.findPrefixMatches(prompt)
+	matchedServers := proxy.findPrefixMatches(prompt)
 
 	type serverCost struct {
 		server        *SGLangServer
@@ -503,20 +528,17 @@ func (p *HttpProxy) selectServer(prompt string, requestTokens int) (*SGLangServe
 		runningTokens int
 	}
 
-	candidates := make([]serverCost, 0, len(p.servers))
-	allServerCosts := make(map[string]float64) // Track costs for all servers
+	candidates := make([]serverCost, 0, len(servers))
+	allServerCosts := make(map[string]float64)
 
-	// Calculate cost for each server
-	for _, server := range p.servers {
-		// Check capacity (healthy + GPU cache + optional running limit)
-		if !p.serverHasCapacity(server) {
-			allServerCosts[server.ID] = -1 // Mark unavailable
+	for _, server := range servers {
+		if !proxy.serverHasCapacity(server) {
+			allServerCosts[server.ID] = -1
 			continue
 		}
 
-		cost, queuedTokens, runningTokens := p.calculateServerCost(server, prompt, requestTokens, msPerToken, runningCostFactor)
+		cost, queuedTokens, runningTokens := proxy.calculateServerCost(server, prompt, requestTokens, msPerToken, runningCostFactor)
 
-		// Check if this server has a prefix match
 		matchedLen := 0
 		for _, match := range matchedServers {
 			if match.server == server && match.matchedLen > matchedLen {
@@ -524,7 +546,6 @@ func (p *HttpProxy) selectServer(prompt string, requestTokens int) (*SGLangServe
 			}
 		}
 
-		// Subtract matched prefix cost (already cached)
 		if matchedLen > 0 {
 			matchedTokens := estimateTokenCount(prompt[:matchedLen])
 			cost -= float64(matchedTokens) * msPerToken
@@ -545,27 +566,16 @@ func (p *HttpProxy) selectServer(prompt string, requestTokens int) (*SGLangServe
 		return nil, nil
 	}
 
-	// Sort by cost (ascending)
 	sort.Slice(candidates, func(i, j int) bool {
 		return candidates[i].cost < candidates[j].cost
 	})
 
-	// Best candidate
 	best := candidates[0]
 
-	// Calculate predicted prefill time for the selected server (GORGO-style)
-	// = (queued_tokens * ms_per_token) + (running_tokens * ms_per_token * running_cost_factor) + (incoming_request_tokens * ms_per_token) - (matched_prefix_tokens * ms_per_token)
-	//
-	// Components:
-	// 1. Queued requests: full prefill cost
-	// 2. Running requests: weighted by running_cost_factor (qhat)
-	// 3. Incoming request: full prefill cost
-	// 4. Prefix match: subtract cached portion
 	queuedCost := float64(best.queuedTokens) * msPerToken
 	runningCost := float64(best.runningTokens) * msPerToken * runningCostFactor
 	incomingCost := float64(requestTokens) * msPerToken
 
-	// Subtract prefix match (already cached)
 	prefixDiscount := 0.0
 	if best.matchedLen > 0 {
 		matchedTokens := estimateTokenCount(prompt[:best.matchedLen])
@@ -582,6 +592,166 @@ func (p *HttpProxy) selectServer(prompt string, requestTokens int) (*SGLangServe
 	}
 
 	return best.server, metrics
+}
+
+// LeastLoadRoutingPolicy selects the server with the fewest running requests.
+type LeastLoadRoutingPolicy struct{}
+
+func (l *LeastLoadRoutingPolicy) Name() string { return "least-load" }
+
+func (l *LeastLoadRoutingPolicy) Select(servers []*SGLangServer, proxy *HttpProxy, prompt string, requestTokens int) (*SGLangServer, *routingMetrics) {
+	if len(servers) == 0 {
+		return nil, nil
+	}
+
+	var best *SGLangServer
+	lowestLoad := -1
+
+	for _, server := range servers {
+		if !proxy.serverHasCapacity(server) {
+			continue
+		}
+
+		server.runningRequestsMu.RLock()
+		runningCount := len(server.runningRequests)
+		server.runningRequestsMu.RUnlock()
+
+		totalLoad := runningCount + server.Metrics.NumWaitingReqs
+
+		if lowestLoad == -1 || totalLoad < lowestLoad {
+			lowestLoad = totalLoad
+			best = server
+		}
+	}
+
+	if best == nil {
+		return nil, nil
+	}
+
+	best.runningRequestsMu.RLock()
+	runningTokens := 0
+	for _, req := range best.runningRequests {
+		runningTokens += req.TokenCount
+	}
+	best.runningRequestsMu.RUnlock()
+
+	return best, &routingMetrics{
+		RunningTokens: runningTokens,
+		ServerCosts:   map[string]float64{best.ID: float64(lowestLoad)},
+	}
+}
+
+// PrefixTreeRoutingPolicy selects the server with the best prefix cache hit,
+// falling back to least-load when no prefix match exists.
+type PrefixTreeRoutingPolicy struct{}
+
+func (pt *PrefixTreeRoutingPolicy) Name() string { return "prefix-tree" }
+
+func (pt *PrefixTreeRoutingPolicy) Select(servers []*SGLangServer, proxy *HttpProxy, prompt string, requestTokens int) (*SGLangServer, *routingMetrics) {
+	if len(servers) == 0 {
+		return nil, nil
+	}
+
+	matchedServers := proxy.findPrefixMatches(prompt)
+
+	type candidate struct {
+		server     *SGLangServer
+		matchedLen int
+		matchRate  float64
+	}
+
+	var candidates []candidate
+	promptLen := len(prompt)
+
+	for _, match := range matchedServers {
+		if !proxy.serverHasCapacity(match.server) {
+			continue
+		}
+		rate := 0.0
+		if promptLen > 0 {
+			rate = float64(match.matchedLen) / float64(promptLen)
+		}
+		candidates = append(candidates, candidate{
+			server:     match.server,
+			matchedLen: match.matchedLen,
+			matchRate:  rate,
+		})
+	}
+
+	// Sort by match rate descending
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].matchRate > candidates[j].matchRate
+	})
+
+	if len(candidates) > 0 {
+		best := candidates[0]
+		best.server.runningRequestsMu.RLock()
+		runningTokens := 0
+		for _, req := range best.server.runningRequests {
+			runningTokens += req.TokenCount
+		}
+		best.server.runningRequestsMu.RUnlock()
+
+		return best.server, &routingMetrics{
+			RunningTokens: runningTokens,
+			ServerCosts:   map[string]float64{best.server.ID: best.matchRate},
+		}
+	}
+
+	// No prefix match — fall back to least-load
+	return (&LeastLoadRoutingPolicy{}).Select(servers, proxy, prompt, requestTokens)
+}
+
+// newRoutingPolicy creates a policy by name, defaulting to GORGO.
+func (p *HttpProxy) newRoutingPolicy(name string) RoutingPolicy {
+	switch strings.ToLower(name) {
+	case "least-load", "leastload", "least_load":
+		return &LeastLoadRoutingPolicy{}
+	case "prefix-tree", "prefixtree", "prefix_tree", "prefix":
+		return &PrefixTreeRoutingPolicy{}
+	case "gorgo", "":
+		return &GORGORoutingPolicy{}
+	default:
+		log.Printf("[Proxy] Unknown routing policy %q, defaulting to gorgo", name)
+		return &GORGORoutingPolicy{}
+	}
+}
+
+// SetRoutingPolicy changes the routing policy at runtime.
+func (p *HttpProxy) SetRoutingPolicy(name string) error {
+	policy := p.newRoutingPolicy(name)
+	if policy == nil {
+		return fmt.Errorf("unknown routing policy: %s", name)
+	}
+	p.routingPolicyMu.Lock()
+	p.routingPolicy = policy
+	p.routingPolicyMu.Unlock()
+	log.Printf("[Proxy] Routing policy set to %s", policy.Name())
+	return nil
+}
+
+// GetRoutingPolicyName returns the current routing policy name.
+func (p *HttpProxy) GetRoutingPolicyName() string {
+	p.routingPolicyMu.RLock()
+	defer p.routingPolicyMu.RUnlock()
+	return p.routingPolicy.Name()
+}
+
+// selectServer delegates to the current routing policy.
+func (p *HttpProxy) selectServer(prompt string, requestTokens int) (*SGLangServer, *routingMetrics) {
+	p.serversMu.RLock()
+	servers := p.servers
+	p.serversMu.RUnlock()
+
+	if len(servers) == 0 {
+		return nil, nil
+	}
+
+	p.routingPolicyMu.RLock()
+	policy := p.routingPolicy
+	p.routingPolicyMu.RUnlock()
+
+	return policy.Select(servers, p, prompt, requestTokens)
 }
 
 // serverHasCapacity checks if a server can accept a new request
@@ -1828,6 +1998,7 @@ func (p *HttpProxy) handleStatusEndpoint(w http.ResponseWriter, r *http.Request)
 	status := map[string]interface{}{
 		"running":             p.running.Load(),
 		"uptime_seconds":      time.Since(p.startTime).Seconds(),
+		"routing_policy":      p.GetRoutingPolicyName(),
 		"servers":             servers,
 		"queue_size":          queueSize,
 		"total_handled":       p.totalRequestsHandled.Load(),
@@ -1980,6 +2151,62 @@ func (p *HttpProxy) handleLatencyEndpoint(w http.ResponseWriter, r *http.Request
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(latencies)
+}
+
+func (p *HttpProxy) handlePolicyEndpoint(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	available := []string{"gorgo", "least-load", "prefix-tree"}
+
+	if r.Method == http.MethodGet {
+		if newPolicy := r.URL.Query().Get("set"); newPolicy != "" {
+			old := p.GetRoutingPolicyName()
+			if err := p.SetRoutingPolicy(newPolicy); err != nil {
+				http.Error(w, fmt.Sprintf(`{"error": %q, "available": ["gorgo","least-load","prefix-tree"]}`, err), http.StatusBadRequest)
+				return
+			}
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success":    true,
+				"old_policy": old,
+				"new_policy": p.GetRoutingPolicyName(),
+				"available":  available,
+			})
+			return
+		}
+
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"current":   p.GetRoutingPolicyName(),
+			"available": available,
+			"hint":      "POST with {\"policy\": \"least-load\"} or GET /proxy/policy?set=least-load",
+		})
+		return
+	}
+
+	if r.Method == http.MethodPost || r.Method == http.MethodPut {
+		var req struct {
+			Policy string `json:"policy"`
+		}
+		body, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(body, &req); err != nil {
+			req.Policy = strings.TrimSpace(string(body))
+		}
+		if req.Policy == "" {
+			http.Error(w, fmt.Sprintf(`{"error":"policy required","available":%q}`, available), http.StatusBadRequest)
+			return
+		}
+		old := p.GetRoutingPolicyName()
+		if err := p.SetRoutingPolicy(req.Policy); err != nil {
+			http.Error(w, fmt.Sprintf(`{"error":%q,"available":%q}`, err, available), http.StatusBadRequest)
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":    true,
+			"old_policy": old,
+			"new_policy": p.GetRoutingPolicyName(),
+		})
+		return
+	}
+
+	http.Error(w, `{"error":"method not allowed, use GET or POST"}`, http.StatusMethodNotAllowed)
 }
 
 // SetTuningParams allows runtime adjustment of GORGO parameters

@@ -187,6 +187,26 @@ Example:
 	Run:  runProxyDeploy,
 }
 
+// proxyPolicyCmd gets or sets the routing policy
+var proxyPolicyCmd = &cobra.Command{
+	Use:   "policy [gorgo|least-load|prefix-tree]",
+	Short: "Get or set the routing policy on a running proxy",
+	Long: `Get or change the routing policy on a running proxy at runtime.
+
+Available policies:
+  gorgo         GORGO cost-based routing (default): weighted queue/running/prefix costs
+  least-load    Picks the server with the fewest running+waiting requests
+  prefix-tree   Picks the server with the best prefix cache match, falls back to least-load
+
+Examples:
+  # Show current policy
+  gotoni proxy policy
+
+  # Switch to least-load
+  gotoni proxy policy least-load`,
+	Run: runProxyPolicy,
+}
+
 // proxyMetricsCmd manages metrics collection and export
 var proxyMetricsCmd = &cobra.Command{
 	Use:   "metrics",
@@ -275,6 +295,7 @@ func init() {
 	proxyCmd.AddCommand(proxyLatencyCmd)
 	proxyCmd.AddCommand(proxyPrefixStatsCmd)
 	proxyCmd.AddCommand(proxyDeployCmd)
+	proxyCmd.AddCommand(proxyPolicyCmd)
 	proxyCmd.AddCommand(proxyMetricsCmd)
 
 	// Metrics subcommands
@@ -298,6 +319,9 @@ func init() {
 	proxyStartCmd.Flags().Bool("auto-discover", false, "Auto-discover servers from Lambda cloud API")
 	proxyStartCmd.Flags().String("pid-file", "/tmp/gotoni-proxy.pid", "Path to PID file")
 
+	// Routing policy
+	proxyStartCmd.Flags().String("policy", "gorgo", "Routing policy: gorgo, least-load, prefix-tree")
+
 	// GORGO tuning parameters
 	proxyStartCmd.Flags().Float64("ms-per-token", 0.094, "Estimated prefill time per token in ms")
 	proxyStartCmd.Flags().Float64("running-cost-factor", 0.5, "Weight for running requests (qhat)")
@@ -316,7 +340,7 @@ func init() {
 
 	// Flags for proxy status
 	proxyStatusCmd.Flags().String("host", "localhost", "Proxy host to check")
-	proxyStatusCmd.Flags().Int("port", 8000, "Proxy port")
+	proxyStatusCmd.Flags().Int("port", 8000, "Proxy port (Modal tunnel URLs use the public port, usually 443)")
 
 	// Flags for proxy servers
 	proxyServersCmd.Flags().String("host", "localhost", "Proxy host")
@@ -340,9 +364,14 @@ func init() {
 	proxyPrefixStatsCmd.Flags().String("host", "localhost", "Proxy host")
 	proxyPrefixStatsCmd.Flags().Int("port", 8000, "Proxy port")
 
+	// Flags for proxy policy
+	proxyPolicyCmd.Flags().String("host", "localhost", "Proxy host")
+	proxyPolicyCmd.Flags().Int("port", 8000, "Proxy port")
+
 	// Flags for proxy deploy
 	proxyDeployCmd.Flags().Int("listen-port", 8000, "Port for the proxy to listen on")
 	proxyDeployCmd.Flags().Int("sglang-port", 8080, "SGLang server port on discovered instances")
+	proxyDeployCmd.Flags().String("policy", "gorgo", "Routing policy: gorgo, least-load, prefix-tree")
 	proxyDeployCmd.Flags().Float64("ms-per-token", 0.094, "Estimated prefill time per token in ms")
 	proxyDeployCmd.Flags().Float64("running-cost-factor", 0.5, "Weight for running requests (qhat)")
 	proxyDeployCmd.Flags().Bool("skip-build", false, "Skip building the binary (use existing /tmp/gotoni-linux)")
@@ -360,6 +389,40 @@ func init() {
 
 	proxyMetricsEnableCmd.Flags().String("host", "localhost", "Proxy host")
 	proxyMetricsEnableCmd.Flags().Int("port", 8000, "Proxy port")
+}
+
+// proxyBaseURL is the origin for proxy HTTP APIs. Modal tunnels expose HTTPS on port 443.
+func proxyBaseURL(host string, port int) string {
+	scheme := "http"
+	if port == 443 {
+		scheme = "https"
+	}
+	return fmt.Sprintf("%s://%s:%d", scheme, host, port)
+}
+
+func proxyAPIURL(host string, port int, path string) string {
+	return proxyBaseURL(host, port) + path
+}
+
+// splitHostPortLast parses "hostname:port" (Modal tunnel URLs). IPv6 is not supported.
+func splitHostPortLast(s string) (host string, port int, err error) {
+	i := strings.LastIndex(s, ":")
+	if i <= 0 || i >= len(s)-1 {
+		return "", 0, fmt.Errorf("invalid host:port %q", s)
+	}
+	p, err := strconv.Atoi(s[i+1:])
+	if err != nil {
+		return "", 0, err
+	}
+	return s[:i], p, nil
+}
+
+func proxyBaseURLFromHostPort(hostPort string) string {
+	host, port, err := splitHostPortLast(hostPort)
+	if err != nil {
+		return "http://" + hostPort
+	}
+	return proxyBaseURL(host, port)
 }
 
 // resolveProxyHost resolves the --remote flag to an actual IP address using Lambda API.
@@ -383,10 +446,11 @@ func resolveProxyHost(cmd *cobra.Command) (string, int) {
 	return instance.IP, port
 }
 
-// resolveInstanceByName resolves an instance name/ID to a RunningInstance using Lambda API
+// resolveInstanceByName resolves an instance name/ID to a RunningInstance using the configured cloud provider
 func resolveInstanceByName(nameOrID string) (*remote.RunningInstance, error) {
-	apiToken := remote.GetAPIToken()
-	if apiToken == "" {
+	_, ptype := remote.GetCloudProvider()
+	apiToken := remote.GetAPITokenForProvider(ptype)
+	if ptype != remote.CloudProviderModal && apiToken == "" {
 		return nil, fmt.Errorf("LAMBDA_API_KEY not set")
 	}
 
@@ -473,6 +537,9 @@ func runProxyStart(cmd *cobra.Command, args []string) {
 	if cmd.Flags().Changed("metrics-endpoint") {
 		cfg.MetricsEndpoint, _ = cmd.Flags().GetString("metrics-endpoint")
 	}
+	if cmd.Flags().Changed("policy") {
+		cfg.RoutingPolicyName, _ = cmd.Flags().GetString("policy")
+	}
 
 	// Write PID file
 	pidFile, _ := cmd.Flags().GetString("pid-file")
@@ -539,6 +606,7 @@ func runProxyStart(cmd *cobra.Command, args []string) {
 	fmt.Printf("\nStarting centralized proxy:\n")
 	fmt.Printf("  Listen port:          %d\n", cfg.ListenPort)
 	fmt.Printf("  SGLang port:          %d\n", sglangPort)
+	fmt.Printf("  Routing policy:       %s\n", cfg.RoutingPolicyName)
 	fmt.Printf("  Queue enabled:        %v\n", cfg.QueueEnabled)
 	fmt.Printf("  Max queue:            %d\n", cfg.MaxQueueSize)
 	fmt.Printf("  ms_per_token:         %.4f\n", cfg.MsPerToken)
@@ -600,7 +668,7 @@ func runProxyStatus(cmd *cobra.Command, args []string) {
 	host, port := resolveProxyHost(cmd)
 
 	client := &http.Client{Timeout: 5 * time.Second}
-	statusURL := fmt.Sprintf("http://%s:%d/proxy/status", host, port)
+	statusURL := proxyAPIURL(host, port, "/proxy/status")
 
 	resp, err := client.Get(statusURL)
 	if err != nil {
@@ -619,6 +687,7 @@ func runProxyStatus(cmd *cobra.Command, args []string) {
 	fmt.Printf("Proxy Status:\n")
 	fmt.Printf("  Running:              %v\n", status["running"])
 	fmt.Printf("  Uptime:               %.0f seconds\n", status["uptime_seconds"])
+	fmt.Printf("  Routing policy:       %v\n", status["routing_policy"])
 	fmt.Printf("  Queue size:           %v\n", status["queue_size"])
 	fmt.Printf("  ms_per_token:         %v\n", status["ms_per_token"])
 	fmt.Printf("  running_cost_factor:  %v\n", status["running_cost_factor"])
@@ -651,7 +720,7 @@ func runProxyServers(cmd *cobra.Command, args []string) {
 	host, port := resolveProxyHost(cmd)
 
 	client := &http.Client{Timeout: 5 * time.Second}
-	serversURL := fmt.Sprintf("http://%s:%d/proxy/servers", host, port)
+	serversURL := proxyAPIURL(host, port, "/proxy/servers")
 
 	// Determine action
 	action := "list"
@@ -739,11 +808,11 @@ func runProxyTune(cmd *cobra.Command, args []string) {
 	runningCostFactor, _ := cmd.Flags().GetFloat64("running-cost-factor")
 
 	client := &http.Client{Timeout: 5 * time.Second}
-	tuneURL := fmt.Sprintf("http://%s:%d/proxy/tune", host, port)
+	tuneURL := proxyAPIURL(host, port, "/proxy/tune")
 
 	if msPerToken == 0 && runningCostFactor == 0 {
 		// GET current values
-		statusURL := fmt.Sprintf("http://%s:%d/proxy/status", host, port)
+		statusURL := proxyAPIURL(host, port, "/proxy/status")
 		resp, err := client.Get(statusURL)
 		if err != nil {
 			fmt.Printf("Failed to connect: %v\n", err)
@@ -787,7 +856,7 @@ func runProxyClearCache(cmd *cobra.Command, args []string) {
 	host, port := resolveProxyHost(cmd)
 
 	client := &http.Client{Timeout: 5 * time.Second}
-	clearURL := fmt.Sprintf("http://%s:%d/proxy/cache/clear", host, port)
+	clearURL := proxyAPIURL(host, port, "/proxy/cache/clear")
 
 	resp, err := client.Post(clearURL, "application/json", nil)
 	if err != nil {
@@ -805,7 +874,7 @@ func runProxyLatency(cmd *cobra.Command, args []string) {
 	host, port := resolveProxyHost(cmd)
 
 	client := &http.Client{Timeout: 5 * time.Second}
-	latencyURL := fmt.Sprintf("http://%s:%d/proxy/latency", host, port)
+	latencyURL := proxyAPIURL(host, port, "/proxy/latency")
 
 	resp, err := client.Get(latencyURL)
 	if err != nil {
@@ -838,7 +907,7 @@ func runProxyPrefixStats(cmd *cobra.Command, args []string) {
 	host, port := resolveProxyHost(cmd)
 
 	client := &http.Client{Timeout: 5 * time.Second}
-	statsURL := fmt.Sprintf("http://%s:%d/proxy/prefix/stats", host, port)
+	statsURL := proxyAPIURL(host, port, "/proxy/prefix/stats")
 
 	resp, err := client.Get(statsURL)
 	if err != nil {
@@ -871,18 +940,64 @@ func runProxyPrefixStats(cmd *cobra.Command, args []string) {
 	fmt.Printf("  Unique servers:      %v\n", stats["unique_server_count"])
 }
 
+func runProxyPolicy(cmd *cobra.Command, args []string) {
+	host, port := resolveProxyHost(cmd)
+	client := &http.Client{Timeout: 5 * time.Second}
+	policyURL := proxyAPIURL(host, port, "/proxy/policy")
+
+	if len(args) == 0 {
+		// GET current policy
+		resp, err := client.Get(policyURL)
+		if err != nil {
+			fmt.Printf("Failed to connect: %v\n", err)
+			os.Exit(1)
+		}
+		defer resp.Body.Close()
+
+		var result map[string]interface{}
+		json.NewDecoder(resp.Body).Decode(&result)
+		fmt.Printf("Current routing policy: %v\n", result["current"])
+		if avail, ok := result["available"].([]interface{}); ok {
+			fmt.Printf("Available policies:     %v\n", avail)
+		}
+		return
+	}
+
+	// POST to switch policy
+	newPolicy := args[0]
+	body := fmt.Sprintf(`{"policy": %q}`, newPolicy)
+	resp, err := client.Post(policyURL, "application/json", strings.NewReader(body))
+	if err != nil {
+		fmt.Printf("Failed to connect: %v\n", err)
+		os.Exit(1)
+	}
+	defer resp.Body.Close()
+
+	var result map[string]interface{}
+	json.NewDecoder(resp.Body).Decode(&result)
+
+	if resp.StatusCode != http.StatusOK {
+		fmt.Printf("Failed to set policy: %v\n", result["error"])
+		os.Exit(1)
+	}
+
+	fmt.Printf("Routing policy changed: %v -> %v\n", result["old_policy"], result["new_policy"])
+}
+
 func runProxyDeploy(cmd *cobra.Command, args []string) {
 	instanceName := args[0]
 	listenPort, _ := cmd.Flags().GetInt("listen-port")
 	sglangPort, _ := cmd.Flags().GetInt("sglang-port")
+	policyName, _ := cmd.Flags().GetString("policy")
 	msPerToken, _ := cmd.Flags().GetFloat64("ms-per-token")
 	runningCostFactor, _ := cmd.Flags().GetFloat64("running-cost-factor")
 	skipBuild, _ := cmd.Flags().GetBool("skip-build")
 	autoAddServers, _ := cmd.Flags().GetBool("auto-add-servers")
 
-	apiToken := remote.GetAPIToken()
-	if apiToken == "" {
-		log.Fatal("LAMBDA_API_KEY not set")
+	_, providerType := remote.GetCloudProvider()
+	apiToken := remote.GetAPITokenForProvider(providerType)
+	if providerType != remote.CloudProviderModal && apiToken == "" {
+		log.Fatal("API token not set: set LAMBDA_API_KEY for Lambda, or use GOTONI_CLOUD=modal with Modal CLI auth (~/.modal)")
 	}
 
 	httpClient := remote.NewHTTPClient()
@@ -895,7 +1010,6 @@ func runProxyDeploy(cmd *cobra.Command, args []string) {
 	}
 
 	// Check provider type
-	_, providerType := remote.GetCloudProvider()
 	isModal := providerType == remote.CloudProviderModal
 
 	if isModal {
@@ -908,7 +1022,8 @@ func runProxyDeploy(cmd *cobra.Command, args []string) {
 	binaryPath := "/tmp/gotoni-linux"
 	if !skipBuild {
 		fmt.Println("\nBuilding gotoni for Linux...")
-		buildCmd := exec.Command("go", "build", "-o", binaryPath, ".")
+		// -ldflags=-s -w and -trimpath shrink the deploy binary; Modal FS also caps each Write RPC at 16 MiB (handled in UploadFile).
+		buildCmd := exec.Command("go", "build", "-trimpath", "-ldflags=-s -w", "-o", binaryPath, ".")
 		buildCmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS=linux", "GOARCH=amd64")
 		buildCmd.Stdout = os.Stdout
 		buildCmd.Stderr = os.Stderr
@@ -919,15 +1034,13 @@ func runProxyDeploy(cmd *cobra.Command, args []string) {
 	}
 
 	if isModal {
-		// Modal deployment path: use file upload API + exec
-		deployProxyToModal(proxyInstance, binaryPath, listenPort, msPerToken, runningCostFactor, autoAddServers, sglangPort, httpClient, apiToken)
+		deployProxyToModal(proxyInstance, binaryPath, listenPort, policyName, msPerToken, runningCostFactor, autoAddServers, sglangPort, httpClient, apiToken)
 	} else {
-		// Lambda/Orgo deployment path: use SSH
-		deployProxyToLambda(proxyInstance, binaryPath, listenPort, msPerToken, runningCostFactor, autoAddServers, sglangPort, httpClient, apiToken)
+		deployProxyToLambda(proxyInstance, binaryPath, listenPort, policyName, msPerToken, runningCostFactor, autoAddServers, sglangPort, httpClient, apiToken)
 	}
 }
 
-func deployProxyToLambda(proxyInstance *remote.RunningInstance, binaryPath string, listenPort int, msPerToken, runningCostFactor float64, autoAddServers bool, sglangPort int, httpClient *http.Client, apiToken string) {
+func deployProxyToLambda(proxyInstance *remote.RunningInstance, binaryPath string, listenPort int, policyName string, msPerToken, runningCostFactor float64, autoAddServers bool, sglangPort int, httpClient *http.Client, apiToken string) {
 	// Step 3: Get SSH key and connect
 	keyFile, err := remote.GetSSHKeyFileForInstance(proxyInstance)
 	if err != nil {
@@ -989,9 +1102,8 @@ echo "Cleanup complete"
 	fmt.Println("\nStarting proxy...")
 	time.Sleep(1 * time.Second)
 
-	// Start proxy (binary already executable from earlier step)
-	startCmd := fmt.Sprintf("nohup /home/ubuntu/gotoni proxy start --listen-port %d --ms-per-token %.4f --running-cost-factor %.2f > /tmp/proxy.log 2>&1 &",
-		listenPort, msPerToken, runningCostFactor)
+	startCmd := fmt.Sprintf("nohup /home/ubuntu/gotoni proxy start --listen-port %d --policy %s --ms-per-token %.4f --running-cost-factor %.2f > /tmp/proxy.log 2>&1 &",
+		listenPort, policyName, msPerToken, runningCostFactor)
 	if _, err := manager.ExecuteCommand(proxyInstance.IP, startCmd); err != nil {
 		log.Fatalf("Failed to start proxy: %v", err)
 	}
@@ -1064,7 +1176,7 @@ echo "Cleanup complete"
 	fmt.Printf("\nProxy endpoint: http://%s:%d\n", proxyInstance.IP, listenPort)
 }
 
-func deployProxyToModal(proxyInstance *remote.RunningInstance, binaryPath string, listenPort int, msPerToken, runningCostFactor float64, autoAddServers bool, sglangPort int, httpClient *http.Client, apiToken string) {
+func deployProxyToModal(proxyInstance *remote.RunningInstance, binaryPath string, listenPort int, policyName string, msPerToken, runningCostFactor float64, autoAddServers bool, sglangPort int, httpClient *http.Client, apiToken string) {
 	fmt.Println("\nDeploying to Modal sandbox...")
 
 	// Get provider for file operations
@@ -1107,8 +1219,8 @@ echo "CLEANED"
 
 	// Step 2: Start proxy
 	fmt.Println("\nStarting proxy...")
-	startCmd := fmt.Sprintf("nohup /home/ubuntu/gotoni proxy start --listen-port %d --ms-per-token %.4f --running-cost-factor %.2f > /tmp/proxy.log 2>&1 &",
-		listenPort, msPerToken, runningCostFactor)
+	startCmd := fmt.Sprintf("nohup /home/ubuntu/gotoni proxy start --listen-port %d --policy %s --ms-per-token %.4f --running-cost-factor %.2f > /tmp/proxy.log 2>&1 &",
+		listenPort, policyName, msPerToken, runningCostFactor)
 	_, err = provider.ExecuteBashCommand(proxyInstance.ID, startCmd)
 	if err != nil {
 		log.Fatalf("Failed to start proxy: %v", err)
@@ -1153,7 +1265,8 @@ echo "CLEANED"
 					}
 
 					body := fmt.Sprintf(`{"id": "%s", "ip": "%s", "port": %s}`, tunnelURL, parts[0], parts[1])
-					resp, err := client.Post("http://"+proxyTunnelURL+"/proxy/servers", "application/json", strings.NewReader(body))
+					postURL := proxyBaseURLFromHostPort(proxyTunnelURL) + "/proxy/servers"
+					resp, err := client.Post(postURL, "application/json", strings.NewReader(body))
 					if err != nil {
 						fmt.Printf("  Failed to add %s (%s): %v\n", inst.Name, tunnelURL, err)
 						continue
@@ -1172,7 +1285,11 @@ echo "CLEANED"
 	tunnelURL := getModalTunnelURL(proxyInstance, listenPort)
 	if tunnelURL != "" {
 		fmt.Printf("\nProxy tunnel URL: %s\n", tunnelURL)
-		fmt.Printf("Use: gotoni proxy status --host %s --port %d\n", strings.Split(tunnelURL, ":")[0], listenPort)
+		if th, tp, err := splitHostPortLast(tunnelURL); err == nil {
+			fmt.Printf("Use: gotoni proxy status --host %s --port %d\n", th, tp)
+		} else {
+			fmt.Printf("Use: gotoni proxy status --host %s --port %d\n", tunnelURL, listenPort)
+		}
 	} else {
 		fmt.Println("\nNote: No tunnel URL available yet. Tunnels may take a moment to provision.")
 		fmt.Printf("Sandbox ID: %s\n", proxyInstance.ID)
@@ -1198,7 +1315,7 @@ func runProxyMetricsExport(cmd *cobra.Command, args []string) {
 	}
 
 	client := &http.Client{Timeout: 30 * time.Second}
-	exportURL := fmt.Sprintf("http://%s:%d/proxy/metrics/export", host, port)
+	exportURL := proxyAPIURL(host, port, "/proxy/metrics/export")
 
 	fmt.Printf("Downloading metrics from %s:%d...\n", host, port)
 	resp, err := client.Get(exportURL)
@@ -1243,7 +1360,7 @@ func runProxyMetricsSummary(cmd *cobra.Command, args []string) {
 	port, _ := cmd.Flags().GetInt("port")
 
 	client := &http.Client{Timeout: 5 * time.Second}
-	summaryURL := fmt.Sprintf("http://%s:%d/proxy/metrics/summary", host, port)
+	summaryURL := proxyAPIURL(host, port, "/proxy/metrics/summary")
 
 	resp, err := client.Get(summaryURL)
 	if err != nil {
@@ -1284,7 +1401,7 @@ func runProxyMetricsClear(cmd *cobra.Command, args []string) {
 	port, _ := cmd.Flags().GetInt("port")
 
 	client := &http.Client{Timeout: 5 * time.Second}
-	clearURL := fmt.Sprintf("http://%s:%d/proxy/metrics/clear", host, port)
+	clearURL := proxyAPIURL(host, port, "/proxy/metrics/clear")
 
 	resp, err := client.Post(clearURL, "application/json", nil)
 	if err != nil {
@@ -1308,7 +1425,7 @@ func runProxyMetricsEnable(cmd *cobra.Command, args []string) {
 	enabled := args[0] == "true"
 
 	client := &http.Client{Timeout: 5 * time.Second}
-	enableURL := fmt.Sprintf("http://%s:%d/proxy/metrics/enable", host, port)
+	enableURL := proxyAPIURL(host, port, "/proxy/metrics/enable")
 
 	body := fmt.Sprintf(`{"enabled": %v}`, enabled)
 	resp, err := client.Post(enableURL, "application/json", strings.NewReader(body))

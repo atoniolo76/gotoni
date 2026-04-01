@@ -1,3 +1,4 @@
+certifi
 datasets
 pandas
 openai

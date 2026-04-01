@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -12,6 +14,11 @@ import (
 	"github.com/atoniolo76/gotoni/pkg/db"
 	"github.com/modal-labs/libmodal/modal-go"
 )
+
+// Modal sandbox filesystem writes are capped per gRPC request (see InvalidArgument "exceeds 16MiB limit").
+const modalSandboxWriteChunkSize = 8 << 20 // 8 MiB — stay under 16 MiB per Write
+
+var _ FileUploader = (*ModalProvider)(nil)
 
 type ModalProvider struct {
 	client *modal.Client
@@ -212,6 +219,44 @@ func (p *ModalProvider) LaunchAndWait(httpClient *http.Client, apiToken string, 
 		SSHKeyName: name,
 		SSHKeyFile: "",
 	}}, nil
+}
+
+// ResolveByNameOrID finds a running sandbox when ListRunningInstances did not include it (e.g. name mismatch)
+// or when the user passes sb-... directly. Accepts: sandbox id (sb-...), or sandbox Name within GOTONI_MODAL_APP.
+// Modal CLI "Container ID" values (ta-...) are task/container handles — use sandbox id from `modal shell` / sandbox_info.json instead.
+func (p *ModalProvider) ResolveByNameOrID(ctx context.Context, httpClient *http.Client, apiToken string, nameOrID string) (*RunningInstance, error) {
+	nameOrID = strings.TrimSpace(nameOrID)
+	if nameOrID == "" {
+		return nil, fmt.Errorf("empty instance name or id")
+	}
+	if strings.HasPrefix(nameOrID, "ta-") {
+		return nil, fmt.Errorf("Modal container/task id %q is not supported here; use sandbox id sb-... (see sandbox_info.json) or name e.g. proxy-us-east", nameOrID)
+	}
+	if strings.HasPrefix(nameOrID, "sb-") {
+		return p.GetInstance(httpClient, apiToken, nameOrID)
+	}
+
+	client, err := p.getClient()
+	if err != nil {
+		return nil, err
+	}
+
+	appName := os.Getenv("GOTONI_MODAL_APP")
+	if appName == "" {
+		appName = "gotoni-benchmark"
+	}
+	envName := os.Getenv("MODAL_ENVIRONMENT")
+	if envName == "" {
+		envName = "alessio-dev"
+	}
+
+	sandbox, err := client.Sandboxes.FromName(ctx, appName, nameOrID, &modal.SandboxFromNameParams{
+		Environment: envName,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("Modal FromName(%q, %q): %w", appName, nameOrID, err)
+	}
+	return p.GetInstance(httpClient, apiToken, sandbox.SandboxID)
 }
 
 func (p *ModalProvider) GetInstance(httpClient *http.Client, apiToken string, instanceID string) (*RunningInstance, error) {
@@ -561,6 +606,94 @@ func (p *ModalProvider) UpdateGlobalFirewallRules(httpClient *http.Client, apiTo
 
 func (p *ModalProvider) EnsurePortOpen(httpClient *http.Client, apiToken string, port int, protocol string, description string) error {
 	return nil
+}
+
+// UploadFile writes data to a path inside the Modal Sandbox filesystem (SDK Open/Write, same idea as Python copy_from_local).
+func (p *ModalProvider) UploadFile(instanceID string, remotePath string, content []byte) error {
+	if instanceID == "" {
+		return fmt.Errorf("empty sandbox id")
+	}
+	client, err := p.getClient()
+	if err != nil {
+		return err
+	}
+	ctx := context.Background()
+	sandbox, err := client.Sandboxes.FromID(ctx, instanceID)
+	if err != nil {
+		return fmt.Errorf("get sandbox %s: %w", instanceID, err)
+	}
+
+	dir := filepath.Dir(remotePath)
+	if dir != "." && dir != "/" {
+		if _, err := p.ExecuteBashCommand(instanceID, "mkdir -p "+shellQuote(dir)); err != nil {
+			return fmt.Errorf("mkdir for upload: %w", err)
+		}
+	}
+
+	f, err := sandbox.Open(ctx, remotePath, "w")
+	if err != nil {
+		return fmt.Errorf("open %q for write: %w", remotePath, err)
+	}
+	defer f.Close()
+
+	for offset := 0; offset < len(content); offset += modalSandboxWriteChunkSize {
+		end := offset + modalSandboxWriteChunkSize
+		if end > len(content) {
+			end = len(content)
+		}
+		chunk := content[offset:end]
+		for len(chunk) > 0 {
+			n, werr := f.Write(chunk)
+			if werr != nil {
+				return fmt.Errorf("write %q: %w", remotePath, werr)
+			}
+			chunk = chunk[n:]
+		}
+	}
+	if err := f.Flush(); err != nil {
+		return fmt.Errorf("flush %q: %w", remotePath, err)
+	}
+	return nil
+}
+
+// UploadFileFromPath reads a local file and uploads it to the sandbox.
+func (p *ModalProvider) UploadFileFromPath(instanceID string, localPath string, remotePath string) error {
+	data, err := os.ReadFile(localPath)
+	if err != nil {
+		return fmt.Errorf("read %s: %w", localPath, err)
+	}
+	return p.UploadFile(instanceID, remotePath, data)
+}
+
+// DownloadFile reads a remote path from the sandbox (SDK Open read, same idea as Python copy_to_local).
+func (p *ModalProvider) DownloadFile(instanceID string, remotePath string) ([]byte, error) {
+	if instanceID == "" {
+		return nil, fmt.Errorf("empty sandbox id")
+	}
+	client, err := p.getClient()
+	if err != nil {
+		return nil, err
+	}
+	ctx := context.Background()
+	sandbox, err := client.Sandboxes.FromID(ctx, instanceID)
+	if err != nil {
+		return nil, fmt.Errorf("get sandbox %s: %w", instanceID, err)
+	}
+	f, err := sandbox.Open(ctx, remotePath, "r")
+	if err != nil {
+		return nil, fmt.Errorf("open %q for read: %w", remotePath, err)
+	}
+	defer f.Close()
+	data, err := io.ReadAll(f)
+	if err != nil {
+		return nil, fmt.Errorf("read %q: %w", remotePath, err)
+	}
+	return data, nil
+}
+
+// shellQuote wraps s in single quotes for use in bash -c (no expansions).
+func shellQuote(s string) string {
+	return `'` + strings.ReplaceAll(s, `'`, `'\''`) + `'`
 }
 
 func (p *ModalProvider) ExecuteBashCommand(instanceID string, command string) (string, error) {
