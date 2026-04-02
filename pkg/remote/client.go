@@ -518,6 +518,20 @@ func ListRunningInstances(httpClient *http.Client, apiToken string) ([]RunningIn
 // If the input matches an instance ID, returns that instance
 // If no match is found, returns an error
 func ResolveInstance(httpClient *http.Client, apiToken string, nameOrID string) (*RunningInstance, error) {
+	provider, ptype := GetCloudProvider()
+
+	// Modal: resolve by name or sb-... first. Listing all sandboxes is very slow because
+	// ListRunningInstances fetches tunnels (long timeout) per sandbox.
+	if ptype == CloudProviderModal {
+		if mp, ok := provider.(*ModalProvider); ok {
+			inst, err := mp.ResolveByNameOrID(context.Background(), httpClient, apiToken, nameOrID)
+			if err == nil {
+				return inst, nil
+			}
+			return nil, err
+		}
+	}
+
 	runningInstances, err := ListRunningInstances(httpClient, apiToken)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list running instances: %w", err)
@@ -526,18 +540,6 @@ func ResolveInstance(httpClient *http.Client, apiToken string, nameOrID string) 
 	for _, instance := range runningInstances {
 		if instance.Name == nameOrID || instance.ID == nameOrID {
 			return &instance, nil
-		}
-	}
-
-	// Modal: resolve sb-... or named sandbox (e.g. proxy-us-east) via API when list snapshot missed it
-	provider, ptype := GetCloudProvider()
-	if ptype == CloudProviderModal {
-		if mp, ok := provider.(*ModalProvider); ok {
-			inst, err := mp.ResolveByNameOrID(context.Background(), httpClient, apiToken, nameOrID)
-			if err == nil {
-				return inst, nil
-			}
-			return nil, err
 		}
 	}
 

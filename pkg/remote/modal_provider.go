@@ -33,7 +33,8 @@ func (p *ModalProvider) getClient() (*modal.Client, error) {
 		return p.client, nil
 	}
 
-	client, err := modal.NewClient()
+	env := ModalEnvironmentOrDefault()
+	client, err := modal.NewClientWithOptions(&modal.ClientParams{Environment: env})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create Modal client: %w", err)
 	}
@@ -245,13 +246,8 @@ func (p *ModalProvider) ResolveByNameOrID(ctx context.Context, httpClient *http.
 	if appName == "" {
 		appName = "gotoni-benchmark"
 	}
-	envName := os.Getenv("MODAL_ENVIRONMENT")
-	if envName == "" {
-		envName = "alessio-dev"
-	}
-
 	sandbox, err := client.Sandboxes.FromName(ctx, appName, nameOrID, &modal.SandboxFromNameParams{
-		Environment: envName,
+		Environment: ModalEnvironmentOrDefault(),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("Modal FromName(%q, %q): %w", appName, nameOrID, err)
@@ -319,7 +315,9 @@ func (p *ModalProvider) ListRunningInstances(httpClient *http.Client, apiToken s
 
 	ctx := context.Background()
 
-	sandboxes, err := client.Sandboxes.List(ctx, &modal.SandboxListParams{})
+	sandboxes, err := client.Sandboxes.List(ctx, &modal.SandboxListParams{
+		Environment: ModalEnvironmentOrDefault(),
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to list Modal Sandboxes: %w", err)
 	}

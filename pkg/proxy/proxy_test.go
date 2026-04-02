@@ -11,6 +11,25 @@ import (
 	"time"
 )
 
+func TestBackendURL(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		host, path string
+		port       int
+		want       string
+	}{
+		{"10.0.0.1", "/metrics", 8080, "http://10.0.0.1:8080/metrics"},
+		{"h.example.modal.host", "/v1/chat/completions", 443, "https://h.example.modal.host:443/v1/chat/completions"},
+		{"h.r441.modal.host", "/health", 8080, "https://h.r441.modal.host:8080/health"},
+	}
+	for _, tc := range cases {
+		got := backendURL(tc.host, tc.port, tc.path)
+		if got != tc.want {
+			t.Errorf("backendURL(%q,%d,%q) = %q, want %q", tc.host, tc.port, tc.path, got, tc.want)
+		}
+	}
+}
+
 // =============================================================================
 // TEST HELPERS
 // =============================================================================

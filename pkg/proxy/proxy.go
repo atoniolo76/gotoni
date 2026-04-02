@@ -837,6 +837,16 @@ func (p *HttpProxy) calculateServerCost(server *SGLangServer, prompt string, req
 	return cost, queuedTokens, runningTokens
 }
 
+// backendURL builds the origin + path for an SGLang backend. Modal tunnels terminate TLS on 443
+// (*.modal.host); LAN/Lambda backends typically use plain HTTP.
+func backendURL(host string, port int, path string) string {
+	scheme := "http"
+	if port == 443 || strings.HasSuffix(strings.ToLower(host), ".modal.host") {
+		scheme = "https"
+	}
+	return fmt.Sprintf("%s://%s:%d%s", scheme, host, port, path)
+}
+
 // forwardToServer forwards a request to a specific server
 func (p *HttpProxy) forwardToServer(w http.ResponseWriter, r *http.Request, requestID string, server *SGLangServer, bodyBytes []byte, tokenCount int, prompt string, routing *routingMetrics) bool {
 	// Start timing for metrics
@@ -851,7 +861,7 @@ func (p *HttpProxy) forwardToServer(w http.ResponseWriter, r *http.Request, requ
 	}
 
 	// Build target URL
-	targetURL := fmt.Sprintf("http://%s:%d%s", server.IP, server.Port, r.URL.Path)
+	targetURL := backendURL(server.IP, server.Port, r.URL.Path)
 	if r.URL.RawQuery != "" {
 		targetURL += "?" + r.URL.RawQuery
 	}
@@ -1408,7 +1418,7 @@ func (p *HttpProxy) pollServerMetrics(server *SGLangServer) {
 	ctx, cancel := context.WithTimeout(p.ctx, p.config.MetricsTimeout)
 	defer cancel()
 
-	metricsURL := fmt.Sprintf("http://%s:%d%s", server.IP, server.Port, p.config.MetricsEndpoint)
+	metricsURL := backendURL(server.IP, server.Port, p.config.MetricsEndpoint)
 
 	start := time.Now()
 	req, err := http.NewRequestWithContext(ctx, "GET", metricsURL, nil)
@@ -1513,7 +1523,7 @@ func (p *HttpProxy) probeServerLatency(server *SGLangServer) {
 	defer cancel()
 
 	// Use lightweight endpoint for latency measurement
-	probeURL := fmt.Sprintf("http://%s:%d%s", server.IP, server.Port, p.config.LatencyProbeEndpoint)
+	probeURL := backendURL(server.IP, server.Port, p.config.LatencyProbeEndpoint)
 
 	// Measure round-trip time
 	start := time.Now()

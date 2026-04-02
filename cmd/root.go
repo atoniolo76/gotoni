@@ -6,8 +6,12 @@ package cmd
 import (
 	"os"
 
+	"github.com/atoniolo76/gotoni/pkg/remote"
 	"github.com/spf13/cobra"
 )
+
+// modalEnvFlag is bound to --modal-env (Modal workspace; see remote.ModalEnvironment).
+var modalEnvFlag string
 
 // rootCmd represents the base command when called without any subcommands
 var rootCmd = &cobra.Command{
@@ -29,6 +33,13 @@ Use "gotoni [command] --help" for more information about a command.`,
 	// Uncomment the following line if your bare application
 	// has an action associated with it:
 	// Run: func(cmd *cobra.Command, args []string) { },
+	PersistentPreRun: func(cmd *cobra.Command, args []string) {
+		// Use cmd.Flags (not rootCmd) to avoid init cycle on rootCmd literal.
+		f := cmd.Flags().Lookup("modal-env")
+		if f != nil && f.Changed {
+			remote.SetModalEnvironmentFromCLI(modalEnvFlag)
+		}
+	},
 }
 
 // Execute adds all child commands to the root command and sets flags appropriately.
@@ -44,6 +55,8 @@ func init() {
 	// Here you will define your flags and configuration settings.
 	// Cobra supports persistent flags, which, if defined here,
 	// will be global for your application.
+
+	rootCmd.PersistentFlags().StringVar(&modalEnvFlag, "modal-env", "", "Modal workspace environment (same idea as `modal -e` / MODAL_ENVIRONMENT). Takes precedence over GOTONI_MODAL_ENV and MODAL_ENVIRONMENT for this run.")
 
 	// rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default is $HOME/.gotoni.yaml)")
 
