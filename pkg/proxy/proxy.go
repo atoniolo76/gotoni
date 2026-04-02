@@ -413,6 +413,10 @@ func (p *HttpProxy) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Route management endpoints
 		switch r.URL.Path {
+		// OpenAI-compatible tooling (GuideLLM, etc.) probes GET /health on the server base URL.
+		case "/health":
+			p.handleHealthEndpoint(w, r)
+			return
 		case "/proxy/status":
 			p.handleStatusEndpoint(w, r)
 			return
