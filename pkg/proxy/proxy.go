@@ -19,6 +19,7 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/csv"
 	"encoding/json"
 	"fmt"
@@ -82,6 +83,11 @@ type ProxyConfig struct {
 
 	// Routing policy selection
 	RoutingPolicyName string `json:"routing_policy"` // "gorgo" (default), "least-load", "prefix-tree"
+
+	// TLS for outbound requests to backends (metrics, forwarding, latency probes).
+	// When false, uses the system default certificate pool (normal production behavior).
+	// Set true only when CA roots are missing in the runtime (some sandboxes) or for local dev.
+	TLSInsecureSkipVerify bool `json:"tls_insecure_skip_verify"`
 }
 
 // DefaultProxyConfig returns sensible defaults
@@ -99,7 +105,9 @@ func DefaultProxyConfig() *ProxyConfig {
 		MetricsEnabled:        true,
 		MetricsPollInterval:   500 * time.Millisecond,
 		MetricsEndpoint:       "/metrics",
-		MetricsTimeout:        500 * time.Millisecond,
+		// Cross-region Modal tunnels often exceed sub-second TLS + RTT; short timeouts
+		// mark backends unhealthy and cause queue timeouts despite healthy SGLang workers.
+		MetricsTimeout:        10 * time.Second,
 		UnhealthyThreshold:    3,
 		GPUCacheThreshold:     0.95,
 		// Latency probing - runs more frequently than metrics for accurate RTT
@@ -282,6 +290,17 @@ func NewHttpProxy(cfg *ProxyConfig) *HttpProxy {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.MaxIdleConnsPerHost = 100
+	transport.IdleConnTimeout = 90 * time.Second
+	if cfg.TLSInsecureSkipVerify {
+		transport.TLSClientConfig = &tls.Config{
+			MinVersion:         tls.VersionTLS12,
+			InsecureSkipVerify: true,
+		}
+		log.Printf("[Proxy] WARNING: TLS verification disabled for outbound HTTPS to backends (tls_insecure_skip_verify)")
+	}
+
 	proxy := &HttpProxy{
 		config:            cfg,
 		servers:           make([]*SGLangServer, 0),
@@ -290,11 +309,8 @@ func NewHttpProxy(cfg *ProxyConfig) *HttpProxy {
 		msPerToken:        cfg.MsPerToken,
 		runningCostFactor: cfg.RunningCostFactor,
 		httpClient: &http.Client{
-			Timeout: cfg.RequestTimeout,
-			Transport: &http.Transport{
-				MaxIdleConnsPerHost: 100,
-				IdleConnTimeout:     90 * time.Second,
-			},
+			Timeout:   cfg.RequestTimeout,
+			Transport: transport,
 		},
 		ctx:       ctx,
 		cancel:    cancel,

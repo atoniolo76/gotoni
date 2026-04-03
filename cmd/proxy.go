@@ -334,6 +334,7 @@ func init() {
 	proxyStartCmd.Flags().Duration("metrics-interval", 500*time.Millisecond, "Metrics polling interval")
 	proxyStartCmd.Flags().Duration("latency-interval", 100*time.Millisecond, "Latency probing interval")
 	proxyStartCmd.Flags().String("metrics-endpoint", "/metrics", "SGLang metrics endpoint")
+	proxyStartCmd.Flags().Bool("tls-insecure", false, "Disable TLS verification for outbound HTTPS to SGLang backends (dev/sandboxes; prefer proper CA bundle)")
 
 	// Flags for proxy stop
 	proxyStopCmd.Flags().String("pid-file", "/tmp/gotoni-proxy.pid", "Path to PID file")
@@ -376,6 +377,7 @@ func init() {
 	proxyDeployCmd.Flags().Float64("running-cost-factor", 0.5, "Weight for running requests (qhat)")
 	proxyDeployCmd.Flags().Bool("skip-build", false, "Skip building the binary (use existing /tmp/gotoni-linux)")
 	proxyDeployCmd.Flags().Bool("auto-add-servers", true, "Auto-discover and add SGLang servers from other instances")
+	proxyDeployCmd.Flags().Bool("tls-insecure", false, "Pass --tls-insecure to proxy start on the remote host (outbound HTTPS to backends). Also set if GOTONI_PROXY_TLS_INSECURE=1")
 
 	// Flags for proxy metrics subcommands
 	proxyMetricsExportCmd.Flags().String("host", "localhost", "Proxy host")
@@ -389,6 +391,12 @@ func init() {
 
 	proxyMetricsEnableCmd.Flags().String("host", "localhost", "Proxy host")
 	proxyMetricsEnableCmd.Flags().Int("port", 8000, "Proxy port")
+}
+
+// proxyTLSInsecureFromEnv mirrors runProxyStart: enable outbound TLS skip when deploying remotely.
+func proxyTLSInsecureFromEnv() bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("GOTONI_PROXY_TLS_INSECURE")))
+	return v == "1" || v == "true" || v == "yes"
 }
 
 // proxyBaseURL is the origin for proxy HTTP APIs. Modal tunnels expose HTTPS on port 443.
@@ -539,6 +547,12 @@ func runProxyStart(cmd *cobra.Command, args []string) {
 	}
 	if cmd.Flags().Changed("policy") {
 		cfg.RoutingPolicyName, _ = cmd.Flags().GetString("policy")
+	}
+	if proxyTLSInsecureFromEnv() {
+		cfg.TLSInsecureSkipVerify = true
+	}
+	if cmd.Flags().Changed("tls-insecure") {
+		cfg.TLSInsecureSkipVerify, _ = cmd.Flags().GetBool("tls-insecure")
 	}
 
 	// Write PID file
@@ -1033,14 +1047,19 @@ func runProxyDeploy(cmd *cobra.Command, args []string) {
 		fmt.Printf("Built %s\n", binaryPath)
 	}
 
+	tlsInsecure := proxyTLSInsecureFromEnv()
+	if cmd.Flags().Changed("tls-insecure") {
+		tlsInsecure, _ = cmd.Flags().GetBool("tls-insecure")
+	}
+
 	if isModal {
-		deployProxyToModal(proxyInstance, binaryPath, listenPort, policyName, msPerToken, runningCostFactor, autoAddServers, sglangPort, httpClient, apiToken)
+		deployProxyToModal(proxyInstance, binaryPath, listenPort, policyName, msPerToken, runningCostFactor, autoAddServers, sglangPort, tlsInsecure, httpClient, apiToken)
 	} else {
-		deployProxyToLambda(proxyInstance, binaryPath, listenPort, policyName, msPerToken, runningCostFactor, autoAddServers, sglangPort, httpClient, apiToken)
+		deployProxyToLambda(proxyInstance, binaryPath, listenPort, policyName, msPerToken, runningCostFactor, autoAddServers, sglangPort, tlsInsecure, httpClient, apiToken)
 	}
 }
 
-func deployProxyToLambda(proxyInstance *remote.RunningInstance, binaryPath string, listenPort int, policyName string, msPerToken, runningCostFactor float64, autoAddServers bool, sglangPort int, httpClient *http.Client, apiToken string) {
+func deployProxyToLambda(proxyInstance *remote.RunningInstance, binaryPath string, listenPort int, policyName string, msPerToken, runningCostFactor float64, autoAddServers bool, sglangPort int, tlsInsecure bool, httpClient *http.Client, apiToken string) {
 	// Step 3: Get SSH key and connect
 	keyFile, err := remote.GetSSHKeyFileForInstance(proxyInstance)
 	if err != nil {
@@ -1102,10 +1121,13 @@ echo "Cleanup complete"
 	fmt.Println("\nStarting proxy...")
 	time.Sleep(1 * time.Second)
 
-	startCmd := fmt.Sprintf("nohup /home/ubuntu/gotoni proxy start --listen-port %d --policy %s --ms-per-token %.4f --running-cost-factor %.2f > /tmp/proxy.log 2>&1 &",
-		listenPort, policyName, msPerToken, runningCostFactor)
+	startCmd := fmt.Sprintf("nohup /home/ubuntu/gotoni proxy start --listen-port %d --policy %s --ms-per-token %.4f --running-cost-factor %.2f%s > /tmp/proxy.log 2>&1 &",
+		listenPort, policyName, msPerToken, runningCostFactor, proxyStartTLSFlag(tlsInsecure))
 	if _, err := manager.ExecuteCommand(proxyInstance.IP, startCmd); err != nil {
 		log.Fatalf("Failed to start proxy: %v", err)
+	}
+	if tlsInsecure {
+		fmt.Println("Remote proxy started with --tls-insecure (outbound HTTPS to backends)")
 	}
 
 	// Wait for proxy to start
@@ -1176,7 +1198,15 @@ echo "Cleanup complete"
 	fmt.Printf("\nProxy endpoint: http://%s:%d\n", proxyInstance.IP, listenPort)
 }
 
-func deployProxyToModal(proxyInstance *remote.RunningInstance, binaryPath string, listenPort int, policyName string, msPerToken, runningCostFactor float64, autoAddServers bool, sglangPort int, httpClient *http.Client, apiToken string) {
+// proxyStartTLSFlag returns a suffix for `gotoni proxy start` when TLS verification to backends should be disabled.
+func proxyStartTLSFlag(tlsInsecure bool) string {
+	if tlsInsecure {
+		return " --tls-insecure"
+	}
+	return ""
+}
+
+func deployProxyToModal(proxyInstance *remote.RunningInstance, binaryPath string, listenPort int, policyName string, msPerToken, runningCostFactor float64, autoAddServers bool, sglangPort int, tlsInsecure bool, httpClient *http.Client, apiToken string) {
 	fmt.Println("\nDeploying to Modal sandbox...")
 
 	// Get provider for file operations
@@ -1219,11 +1249,14 @@ echo "CLEANED"
 
 	// Step 2: Start proxy
 	fmt.Println("\nStarting proxy...")
-	startCmd := fmt.Sprintf("nohup /home/ubuntu/gotoni proxy start --listen-port %d --policy %s --ms-per-token %.4f --running-cost-factor %.2f > /tmp/proxy.log 2>&1 &",
-		listenPort, policyName, msPerToken, runningCostFactor)
+	startCmd := fmt.Sprintf("nohup /home/ubuntu/gotoni proxy start --listen-port %d --policy %s --ms-per-token %.4f --running-cost-factor %.2f%s > /tmp/proxy.log 2>&1 &",
+		listenPort, policyName, msPerToken, runningCostFactor, proxyStartTLSFlag(tlsInsecure))
 	_, err = provider.ExecuteBashCommand(proxyInstance.ID, startCmd)
 	if err != nil {
 		log.Fatalf("Failed to start proxy: %v", err)
+	}
+	if tlsInsecure {
+		fmt.Println("Remote proxy started with --tls-insecure (outbound HTTPS to backends)")
 	}
 
 	time.Sleep(2 * time.Second)
